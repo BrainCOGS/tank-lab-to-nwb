@@ -1,11 +1,13 @@
 """Authors: Ben Dichter, Cody Baker."""
 
-import os
+import warnings
 import sys
+import subprocess
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from shutil import which
+from tempfile import TemporaryDirectory
 
 import numpy as np
 from pynwb import NWBFile
@@ -240,60 +242,58 @@ def convert_function_handle_to_str(mat_file_path):
     quit;
     """
 
-    with Path("Choice.m").open("w") as f:
-        f.write(matlab_class)
-
     metadata = {}
-    convert_script_code = f"filePath = '{mat_file_path}';\nload(filePath);{matlab_code}"
-    convert_script_path = Path("convert_function_to_txt.m")
 
-    with convert_script_path.open("w") as f:
-        f.write(convert_script_code)
-
-    if "win" in sys.platform and sys.platform != "darwin":
-        matlab_cmd = """
-                     #!/bin/bash
-                     matlab -nosplash -wait -log -r convert_function_to_txt
-                     """
-    else:
-        matlab_cmd = """
-                     #!/bin/bash
-                     matlab -nosplash -nodisplay -log -batch convert_function_to_txt
-                     """
-
-    if which("matlab") is not None:
-        try:
-            os.system(matlab_cmd)
-
-            with open("code_version.txt", "r") as f:
-                version = f.readline()
-            with open("protocol.txt", "r") as f:
-                protocol = f.readline()
-            with open("trial_choice.txt", "r") as f:
-                trial_choice = f.read().splitlines()
-            with open("trial_type.txt", "r") as f:
-                trial_type = f.read().splitlines()
-
-            metadata["experiment_name"] = version
-            metadata["protocol_name"] = protocol
-            metadata["trial_choice"] = trial_choice
-            metadata["trial_type"] = trial_type
-
-            os.remove("code_version.txt")
-            os.remove("protocol.txt")
-            os.remove("trial_choice.txt")
-            os.remove("trial_type.txt")
-
-        except Exception as e:
-            print(f"There was an error while trying to execute {convert_script_path}:\n{e}")
-    else:
-        raise Exception(
-            "A working matlab version was not found. "
-            "Code version, animal protocol, type of trial, and choice could not be saved to NWB."
+    if which("matlab") is None:
+        # Every value this function produces (experiment_name, protocol_name,
+        # trial_choice, trial_type) is optional to its caller, which already
+        # falls back to "" for each. Raising here took down the entire
+        # conversion on any host without MATLAB, including headless export
+        # servers that have no reason to have it installed.
+        warnings.warn(
+            "MATLAB was not found on PATH. Code version, animal protocol, trial type "
+            "and choice will be omitted from the NWB file; everything else converts "
+            "normally. Install MATLAB on this host if you need those four fields."
         )
+        return metadata
 
-    os.remove("Choice.m")
-    os.remove("convert_function_to_txt.m")
+    # Everything below runs inside a scratch directory. It used to run in the
+    # process's cwd, writing (and then unlinking) Choice.m,
+    # convert_function_to_txt.m and four .txt files there. That litters whatever
+    # directory the conversion was launched from, and silently deletes any file
+    # already sitting there under one of those six fairly ordinary names.
+    with TemporaryDirectory(prefix="tank_lab_to_nwb_matlab_") as scratch_dir:
+        scratch = Path(scratch_dir)
+        (scratch / "Choice.m").write_text(matlab_class)
+
+        convert_script_path = scratch / "convert_function_to_txt.m"
+        convert_script_path.write_text(f"filePath = '{mat_file_path}';\nload(filePath);{matlab_code}")
+
+        if "win" in sys.platform and sys.platform != "darwin":
+            matlab_argv = ["matlab", "-nosplash", "-wait", "-log", "-r", "convert_function_to_txt"]
+        else:
+            matlab_argv = ["matlab", "-nosplash", "-nodisplay", "-log", "-batch", "convert_function_to_txt"]
+
+        try:
+            # cwd=scratch is what puts the generated .m files on MATLAB's path
+            # and keeps its output files out of the caller's directory.
+            subprocess.run(matlab_argv, cwd=scratch, check=True)
+
+            outputs = {
+                "experiment_name": ("code_version.txt", "line"),
+                "protocol_name": ("protocol.txt", "line"),
+                "trial_choice": ("trial_choice.txt", "lines"),
+                "trial_type": ("trial_type.txt", "lines"),
+            }
+            for key, (filename, mode) in outputs.items():
+                text = (scratch / filename).read_text()
+                metadata[key] = text.splitlines()[0] if mode == "line" else text.splitlines()
+
+        except (subprocess.SubprocessError, OSError) as e:
+            warnings.warn(
+                f"There was an error while trying to execute {convert_script_path}: {e}. "
+                f"Code version, animal protocol, trial type and choice will be omitted."
+            )
 
     return metadata
 

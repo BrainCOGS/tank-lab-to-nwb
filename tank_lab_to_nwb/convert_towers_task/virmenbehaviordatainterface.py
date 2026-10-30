@@ -74,25 +74,36 @@ class VirmenDataInterface(BaseTemporalAlignmentInterface):
             epochs: list[dict] = metadata_copy["log"]["block"]
 
         trials = [trial for epoch in epochs for trial in epoch["trial"] if not np.isnan(trial["start"])]
-        epoch_start_dts = [array_to_dt(epoch["start"]).replace(tzinfo=ZoneInfo("America/New_York")) for epoch in epochs]
+        # array_to_dt returns a naive datetime while _get_session_start_time is
+        # tz-aware, so the subtraction below raised TypeError. It only ever
+        # surfaced when get_original_timestamps() actually ran, which a caller
+        # supplying sync_timestamps skips — imaging-only sessions do not supply
+        # one, so they hit it immediately.
+        session_tz = session_start_time.tzinfo
+        epoch_start_dts = [array_to_dt(epoch["start"]).replace(tzinfo=session_tz) for epoch in epochs]
         epoch_start_nwb: list[float] = [
             (epoch_start_dt - session_start_time).total_seconds() for epoch_start_dt in epoch_start_dts
         ]
 
-        # trial_starts = [trial["start"] + epoch_start_nwb[0] for trial in trials]
+        # One offset for every block, not one per block. trial["start"] is
+        # vr.timeElapsed (ExperimentLog.m:501), which the engine zeroes once at
+        # firstTic (virmenEngine.m:124) and never resets -- obj.blockStart is
+        # recorded per block but only ever read to compute block.duration. So
+        # trial starts already run on a single session-wide clock, and the only
+        # correction needed is that clock's zero (~block 1 start) against
+        # session.start.
+        #
+        # Adding epoch_start_nwb[epoch_idx] instead double-counted: a second
+        # block beginning 10 minutes in pushed its frames 600 s into the future,
+        # away from both the trials table and any imaging series (which use
+        # epoch_start_nwb[0], below and at :414).
+        session_offset = epoch_start_nwb[0]
 
-        frame_starts = [trial["start"] + epoch_start_nwb[0] + time for trial in trials for time in trial["time"]]
-
-        # Calculate absolute timestamps for each frame across all trials and epochs
-        # Each frame timestamp is eelative to session start time
         frame_timestamps = []
-        for epoch_idx, epoch in enumerate(epochs):
-            epoch_offset = epoch_start_nwb[epoch_idx]
+        for epoch in epochs:
             for trial in epoch["trial"]:
                 if not np.isnan(trial["start"]):
-                    # Each frame's timestamp = epoch_start + trial_start + frame_time
-                    trial_frame_times = trial["start"] + epoch_offset + trial["time"]
-                    frame_timestamps.extend(trial_frame_times)
+                    frame_timestamps.extend(trial["start"] + session_offset + trial["time"])
 
         frame_starts = frame_timestamps
 
