@@ -101,6 +101,16 @@ class TestOrganize:
         organize_for_dandi(staging, tmp_path / "dandiset", files_mode="move")
         assert not source.exists()
 
+    def test_a_file_of_another_session_is_kept(self, staging, tmp_path):
+        _write_nwb(staging / "a.nwb", subject_id="a", session_id="20260101")
+        organize_for_dandi(staging, tmp_path / "dandiset")
+        (staging / "a.nwb").unlink()
+        _write_nwb(staging / "b.nwb", subject_id="a", session_id="20260102")
+        organize_for_dandi(staging, tmp_path / "dandiset")
+        assert sorted(p.name for p in (tmp_path / "dandiset").rglob("*.nwb")) == [
+            "sub-a_ses-20260101_behavior.nwb", "sub-a_ses-20260102_behavior.nwb"
+        ]
+
     def test_empty_staging_fails(self, staging, tmp_path):
         with pytest.raises(ValueError, match="no NWB files"):
             organize_for_dandi(staging, tmp_path / "dandiset")

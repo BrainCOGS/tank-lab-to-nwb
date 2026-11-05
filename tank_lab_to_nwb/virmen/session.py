@@ -609,7 +609,6 @@ class _Normalizer:
                     self.fail(f"log.version({number}).mazes", "differ from log.version(1), which the file can't represent")
 
     def _series(self, rows, start_times):
-        columns = {}
         frame_stamps, all_stamps = [], []
         for row, trial in enumerate(rows):
             n_frames = trial["position"].shape[0]
@@ -643,7 +642,7 @@ class _Normalizer:
         if "position" in present:
             field = self.registry[TRIAL + "position"]
             data = stacked(field, 3, by_frames)
-            series.append(Series("position", data[:, :2], frames, "cm", "Position in the virtual maze (x, y).", "frames", "Position", True))
+            series.append(Series("position", data[:, :2], frames, "centimeters", "Position in the virtual maze (x, y).", "frames", "Position", True))
             # A plain TimeSeries: the angle is unwrapped, and a radian SpatialSeries may not pass 2*pi.
             series.append(Series("view_angle", data[:, 2], frames, "radians", "View angle, unwrapped.", "frames"))
             self.coverage.written[field.path] = ["position", "view_angle"]

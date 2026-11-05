@@ -68,6 +68,9 @@ class TestFrameTimes:
         assert _series(session, "SensorDots").data.shape == (5, 5)
         assert len(_series(session, "SensorDots").timestamps) == 5
 
+    def test_position_uses_the_unit_name_nwb_inspector_accepts(self):
+        assert _series(_normalize(make_log()), "position").unit == "centimeters"
+
     def test_view_angle_and_angular_velocity_get_their_own_series_in_radians(self):
         session = _normalize(make_log())
         assert _series(session, "view_angle").unit == "radians"

@@ -101,6 +101,13 @@ class TestPipeline:
         assert (output / "staging" / "a.coverage.json").exists()
         assert (output / "dandiset" / "dandiset.yaml").exists()
 
+    def test_converting_again_replaces_the_organized_files(self, source, tmp_path):
+        output = tmp_path / "nwb"
+        first = convert_folder(source, output)
+        second = convert_folder(source, output)
+        assert first == second
+        assert len(list((output / "dandiset").rglob("*.nwb"))) == 2
+
     def test_only_selected_logs_are_converted(self, source, tmp_path):
         organized = convert_folder(source, tmp_path / "nwb", only=["a.mat"])
         assert [p.name for p in organized] == ["sub-user-a_ses-20260715_behavior.nwb"]

@@ -79,8 +79,7 @@ def test_trials_and_epochs_use_the_subtypes(written):
 def test_series_share_one_clock_per_frame_rate(written):
     with h5py.File(written[1], "r") as f:
         behavior = f["processing/behavior"]
-        position = behavior["Position/position"]
-        assert position.attrs["unit"] if "unit" in position.attrs else position["data"].attrs["unit"] == "cm"
+        assert behavior["Position/position/data"].attrs["unit"] == "centimeters"
         assert behavior["view_angle/data"].attrs["unit"] == "radians"
         assert behavior["AngularVelocity/data"].attrs["unit"] == "radians/s"
 

@@ -5,7 +5,9 @@ the session is added to any name that lacks it, because organize drops it for a 
 """
 
 import re
+import shutil
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from dandi.organize import FileOperationMode, organize
 from pynwb import NWBHDF5IO
@@ -48,17 +50,25 @@ def _read_session_id(path):
 
 
 def organize_for_dandi(staging_dir, dandiset_dir, files_mode="copy"):
-    """Organize the NWB files of a flat folder into `dandiset_dir` and return the organized paths."""
+    """Organize the NWB files of a flat folder into `dandiset_dir` and return the organized paths.
+
+    organize runs in a fresh folder beside `dandiset_dir`, because it renames files to avoid any it finds already there.
+    Each result then replaces the file of the same name, so converting again doesn't leave duplicates.
+    """
     staging_dir, dandiset_dir = Path(staging_dir), Path(dandiset_dir)
     if not list(staging_dir.glob("*.nwb")):
         raise ValueError(f"{staging_dir}: no NWB files to organize")
     dandiset_dir.mkdir(parents=True, exist_ok=True)
     write_stub_dandiset_yaml(dandiset_dir)
-    organize(paths=[str(staging_dir)], dandiset_path=str(dandiset_dir), files_mode=FileOperationMode(files_mode))
     organized = []
-    for path in sorted(dandiset_dir.rglob("*.nwb")):
-        target = path.with_name(insert_session_id(path.name, _read_session_id(path)))
-        if target != path:
-            path.rename(target)
-        organized.append(target)
+    with TemporaryDirectory(dir=dandiset_dir.parent, prefix=".organizing-") as fresh:
+        fresh = Path(fresh)
+        shutil.copy(dandiset_dir / "dandiset.yaml", fresh / "dandiset.yaml")
+        organize(paths=[str(staging_dir)], dandiset_path=str(fresh), files_mode=FileOperationMode(files_mode))
+        for path in sorted(fresh.rglob("*.nwb")):
+            name = insert_session_id(path.name, _read_session_id(path))
+            target = dandiset_dir / path.parent.relative_to(fresh) / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            path.replace(target)
+            organized.append(target)
     return organized
