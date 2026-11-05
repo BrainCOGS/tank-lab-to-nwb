@@ -1,6 +1,6 @@
 """Wall-clock conversion and the session timeline. All differences are computed in UTC."""
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np

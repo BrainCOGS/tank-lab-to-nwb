@@ -26,6 +26,12 @@ def test_file_without_a_log_fails(monkeypatch, tmp_path):
         loader.load_log(tmp_path / "session.mat")
 
 
+def test_canonical_empty_is_an_empty_array():
+    from matio.utils.matclass import MatlabCanonicalEmpty
+
+    assert decode(MatlabCanonicalEmpty()).size == 0
+
+
 def test_empty_char_is_an_empty_string():
     assert decode(np.array([], dtype="<U1")) == ""
 
