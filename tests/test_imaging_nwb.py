@@ -294,3 +294,33 @@ def test_frames_table_holds_the_pipeline_labels(written):
     assert set(block[numbered].tolist()) == {1} and set(trial[numbered].tolist()) == {1}
     assert np.all(np.diff(iteration[numbered]) >= 0)
     assert iteration[numbered[0]] == 1
+
+
+def test_the_file_describes_its_method_well_enough_to_reproduce(written):
+    _, path, *_ = written
+    with h5py.File(path, "r") as file:
+        table = file["processing/scanimage/alignment"]
+        values = dict(zip(table["key"].asstr()[()], table["value"].asstr()[()]))
+        meanings = dict(zip(table["key"].asstr()[()], table["meaning"].asstr()[()]))
+    for detail in ("least squares", "median", "1.4826", "refit"):
+        assert detail in values["fit.method"]
+    assert "not frame-time error" in meanings["fit.kept_std_ms"]
+
+
+def test_the_send_latency_claims_no_bound_the_source_does_not_give(written):
+    _, path, *_ = written
+    with h5py.File(path, "r") as file:
+        table = file["processing/scanimage/alignment"]
+        meaning = dict(zip(table["key"].asstr()[()], table["meaning"].asstr()[()]))["fit.send_latency"]
+    assert "no upper bound" in meaning
+    assert "12 ms" not in meaning
+
+
+def test_the_label_columns_explain_their_limits(written):
+    _, path, *_ = written
+    with h5py.File(path, "r") as file:
+        frames = file["processing/scanimage/frames"]
+        block = frames["behavior_block"].attrs["description"]
+        trial = frames["behavior_trial"].attrs["description"]
+    assert "just before the trial began" in block and "late" in block
+    assert "running when the log was saved" in trial

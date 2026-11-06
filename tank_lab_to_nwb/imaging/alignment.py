@@ -141,8 +141,8 @@ def frame_labels(acquisition, trials_per_block):
 
     This follows the canonical MATLAB: the first packet of each frame, interior frames with no packet repeating the last
     frame that had one, nothing before the first or after the last packet, and frames of a trial absent from the log (the
-    one running when ViRMEn stopped) cleared. These labels mark which header received a packet, so they run up to a frame
-    late at trial onsets. Use the frame timestamps to decide which frames fall in a trial.
+    one running when ViRMEn stopped) cleared. These labels mark which header received a packet, so at a trial's onset the first
+    labelled frame can have started just before the trial or run up to a frame late. Use the frame timestamps to decide which frames fall in a trial.
     """
     n_frames = acquisition.frames["frame_number"].size
     labels = np.zeros((3, n_frames), dtype="int64")

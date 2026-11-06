@@ -35,12 +35,13 @@ _CHUNK_BYTES = 10_000_000
 _BUFFER_BYTES = 1_000_000_000
 
 METHOD = (
-    "Robust straight line from I2C packet time on the ScanImage clock to the logged time of the same iteration on ViRMEn's "
-    "elapsed clock. Excludes each trial's first iteration, then rejects packets more than max(5 MADs, 5 ms) from the line."
+    "A straight line from each packet's logged iteration time on ViRMEn's elapsed clock to its arrival on the ScanImage clock. Each trial's "
+    "first iteration is excluded. Start with ordinary least squares. Then reject packets further from the median residual than max(5 x MAD, "
+    "5 ms), with MAD scaled by 1.4826 and taken over the kept packets, refit by least squares on the rest, and repeat until the kept set stops changing."
 )
 SEND_LATENCY = (
-    "A constant, not corrected: the fit can't see the delay between the logged iteration time and the packet's arrival, "
-    "so frame times run early by that delay. Estimated from the code as a few ms, up to about one iteration (~12 ms); not measured."
+    "A constant, not corrected: the fit can't see the delay between the logged iteration time and the packet's arrival, so frame times run early by "
+    "that delay. It wasn't measured, and the ViRMEn source sets no upper bound, because packets go out from a separate thread after the iteration's work."
 )
 PLACEHOLDER_IMAGING = dict(
     indicator="PLACEHOLDER: indicator not recorded here.",
@@ -155,7 +156,7 @@ def _alignment_rows(prepared):
         ("fit.residual_p50_ms", repr(fit.residual_ms["p50"]), "Median packet residual, over all packets."),
         ("fit.residual_p99_ms", repr(fit.residual_ms["p99"]), "99th percentile of packet residuals, over all packets."),
         ("fit.residual_max_ms", repr(fit.residual_ms["max"]), "Highest packet residual, over all packets. Packets are sent late, not early, so this says how late, not how wrong the frame times are."),
-        ("fit.kept_std_ms", repr(fit.kept_std_ms), "Standard deviation of the residuals of the fit packets."),
+        ("fit.kept_std_ms", repr(fit.kept_std_ms), "Standard deviation of the residuals of the fit packets. Residuals show how far packets sit from the line, not frame-time error."),
         ("fit.within_5ms_fraction", repr(fit.within_5ms_fraction), "Fraction of all packets within 5 ms of the line."),
         ("fit.send_latency", "not measured", SEND_LATENCY),
         ("fit.frame_time_meaning", "start of frame", "Each timestamp marks the start of a frame; later lines in it were scanned up to one frame period later. The animal saw each iteration after a display delay that isn't measured."),
@@ -182,8 +183,8 @@ def _add_scanimage_tables(nwbfile, prepared, session_time_kept=None):
         ("end_of_acquisition", "endOfAcquisition.", _small(frames["end_of_acquisition"])),
         ("end_of_acquisition_mode", "endOfAcquisitionMode.", _small(frames["end_of_acquisition_mode"])),
         ("dc_over_voltage", "dcOverVoltage.", _small(frames["dc_over_voltage"])),
-        ("behavior_block", "Behavior block as the pipeline's SyncImagingBehavior labels this frame, 0 for none. Marks which header got a packet, so it can run up to a frame late at trial onsets; use the timestamps to find a trial's frames.", _small(prepared.labels["block"])),
-        ("behavior_trial", "Behavior trial as the pipeline labels this frame, 0 for none, including the trial missing from the log.", _small(prepared.labels["trial"])),
+        ("behavior_block", "Behavior block as the pipeline's SyncImagingBehavior labels this frame, 0 for none. These labels mark which header got a packet: at a trial's onset, the first labelled frame can have started just before the trial began, or can run up to a frame late. Use the timestamps to find a trial's frames.", _small(prepared.labels["block"])),
+        ("behavior_trial", "Behavior trial as the pipeline labels this frame. 0 for none, which includes the frames of the trial running when the log was saved, because the pipeline clears that trial. Its packets are in the i2c_packets table.", _small(prepared.labels["trial"])),
         ("behavior_iteration", "Per-trial iteration as the pipeline labels this frame, 0 for none.", _small(prepared.labels["iteration"])),
     ]))
     module.add(_table("i2c_packets", "Every I2C packet from ViRMEn, as stored in the frame headers.", [

@@ -21,8 +21,9 @@ One straight line per acquisition, from elapsed time to ScanImage time:
 
 1. Match every packet to a logged iteration. A packet that isn't in the log stops the conversion: it's probably the wrong log.
 2. Leave out each trial's first iteration. Trial setup runs between logging its time and sending its packet.
-3. Fit, reject packets more than max(5 MADs, 5 ms) from the line, and repeat until the set of kept packets stops changing.
-   This removes the one packet per trial that end-of-trial work delays by hundreds of milliseconds.
+3. Fit by least squares. Reject packets further from the median residual than max(5 x MAD, 5 ms), with MAD scaled by 1.4826, refit,
+   and repeat until the kept set stops changing. This removes the one packet per trial that end-of-trial work delays by hundreds of
+   milliseconds.
 4. A frame's time is then `(frameTimestamps_sec - intercept) / slope + clock_offset`.
 
 The conversion stops if the clocks differ by over 100 ppm, over 5% of packets are rejected, the 1st or 99th percentile of the
@@ -48,9 +49,9 @@ as `derived.session_start_shift_seconds` and `derived.virmen_session_start`. `de
 
 | Source of error | Size | Seen in the file as |
 |---|---|---|
-| Packet scatter | about 1 ms | `fit.kept_std_ms`, `fit.residual_*` |
+| Packet scatter | about 1 ms. This is how far packets sit from the line, not frame-time error | `fit.kept_std_ms`, `fit.residual_*` |
 | Clock rate difference | about 5 ppm, corrected by the slope | `fit.slope` |
-| Delay from the logged time to the packet's arrival | A constant, thought to be a few ms up to about one iteration. Not measured, so frame times run early by it | `fit.send_latency` |
+| Delay from the logged time to the packet's arrival | A constant. Not measured, and the ViRMEn source sets no upper bound. Frame times run early by it | `fit.send_latency` |
 | Time within a frame | A timestamp marks the frame's start, and scanning it takes up to one frame period | `fit.frame_time_meaning` |
 | Display delay | The logged time and the packet come before the display updates, by an unmeasured amount | `fit.frame_time_meaning` |
 | When the session started | Inherited from the behavior clock, and can be an upper bound. Moves frames and trials together, so it doesn't change their alignment | `derived.clock_anchor` |
@@ -65,8 +66,9 @@ of each frame's first packet, repeated across interior frames with no packet, an
 `processing/scanimage/frames` holds these as `behavior_block`, `behavior_trial` and `behavior_iteration`, so its results can be
 compared.
 
-Those labels say which header received a packet, not when the iteration happened, so they run up to a frame late at trial onsets.
-To find a trial's frames, compare the frame timestamps with the trial's start and stop times.
+Those labels say which header received a packet, not when the iteration happened. At a trial's onset, the first labelled frame can
+have started just before the trial or run up to a frame late. To find a trial's frames, compare the frame timestamps with the trial's
+start and stop times.
 
 ## What the converter refuses for now
 
