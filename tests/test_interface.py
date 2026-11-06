@@ -37,7 +37,7 @@ def test_metadata_comes_from_the_log(interface):
 
 
 def test_original_timestamps_are_every_logged_frame(interface):
-    np.testing.assert_array_equal(interface.get_original_timestamps(), [0.5 + i * 0.5 for i in range(5)])
+    np.testing.assert_array_equal(interface.get_original_timestamps(), [11.0 + i * 0.5 for i in range(5)])
 
 
 def test_timestamps_default_to_the_original(interface):
@@ -64,6 +64,35 @@ def test_aligned_timestamps_move_series_trials_and_epochs(interface, tmp_path):
         behavior = nwbfile.processing["behavior"]
         assert behavior["SensorDots"].timestamps[0] == aligned[0]
         assert behavior["Position"]["position"].timestamps[0] == aligned[0]
+
+
+def test_times_past_the_last_frame_keep_their_distance_instead_of_clamping(interface):
+    # Regression: np.interp silently moved a stop_time past the last frame onto the last frame.
+    original = interface.get_original_timestamps()
+    interface.set_aligned_timestamps(original + 100.0)
+    session = interface._aligned_session()
+    stops = next(c for c in session.epochs if c.name == "stop_time")
+    source = next(c for c in interface.session.epochs if c.name == "stop_time")
+    assert source.data[-1] > original[-1]
+    assert stops.data[-1] == source.data[-1] + 100.0
+
+
+def test_times_before_the_first_frame_keep_their_distance(interface):
+    original = interface.get_original_timestamps()
+    interface.set_aligned_timestamps(original + 100.0)
+    interface.session.epochs[0].data[0] = original[0] - 2.0
+    assert interface._aligned_session().epochs[0].data[0] == original[0] + 98.0
+
+
+def test_aligned_timestamps_stretch_between_frames(interface):
+    original = interface.get_original_timestamps()
+    interface.set_aligned_timestamps(original * 2.0)
+    assert interface._aligned_session().trials[0].data[0] == original[0] * 2.0
+
+
+def test_aligned_timestamps_that_run_backwards_fail(interface):
+    with pytest.raises(ValueError, match="backwards"):
+        interface.set_aligned_timestamps(interface.get_original_timestamps()[::-1])
 
 
 @pytest.mark.parametrize("length_change", [-1, 1])

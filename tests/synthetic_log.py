@@ -118,7 +118,7 @@ def make_log(blocks=None, **extra):
     blocks = blocks if blocks is not None else [make_block(make_trial())]
     n_trials = sum(len(b["trial"]) if isinstance(b["trial"], list) else 1 for b in blocks)
     log = dict(
-        session=dict(start=np.array([[2026, 7, 15, 12, 0, 0.5]]), end=np.array([[2026, 7, 15, 13, 0, 0.5]]), blocks=np.array([[1.0, 1.0]])),
+        session=dict(start=np.array([[2026, 7, 15, 11, 59, 50.0]]), end=np.array([[2026, 7, 15, 12, 0, 11.0]]), blocks=np.array([[1.0, 1.0]])),
         animal=dict(
             name="mouse_1",
             protocol=FunctionHandle("protocol"),

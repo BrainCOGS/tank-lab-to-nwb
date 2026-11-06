@@ -12,7 +12,7 @@ from ndx_tank_metadata.registry import Field, load_registry
 
 from .coerce import LossyConversionError, coerce
 from .loader import Enum, FunctionHandle, records
-from .timebase import clock_offsets, datevec_to_datetime, seconds_between
+from .timebase import BLOCK_STAMP, SESSION_END, ClockAnchorError, ClockMap, datevec_to_datetime, map_clock, seconds_between
 
 TRIAL = "log.block.trial."
 BLOCK = "log.block."
@@ -62,6 +62,7 @@ class Coverage:
     omitted: dict = dataclass_field(default_factory=dict)
     structural: list = dataclass_field(default_factory=list)
     unregistered: list = dataclass_field(default_factory=list)
+    clock: dict = dataclass_field(default_factory=dict)
 
     def as_dict(self):
         return {
@@ -71,6 +72,7 @@ class Coverage:
             "omitted": dict(sorted(self.omitted.items())),
             "structural": sorted(set(self.structural)),
             "unregistered": sorted(set(self.unregistered)),
+            "clock": self.clock,
         }
 
 
@@ -99,6 +101,10 @@ def _resolve(record, subpath):
             return ABSENT
         value = value[part]
     return value
+
+
+# Beyond this, a block's end and session.end disagree by more than shutdown code explains (0.7 s at most in the 37 logs).
+END_MISS_FOR_REVIEW = 1.0
 
 
 def _is_empty(value):
@@ -394,7 +400,7 @@ class _Normalizer:
         """The typed value of an attribute, or ABSENT to leave it out."""
         if value is ABSENT:
             return ABSENT
-        if field.transform == "empty_to_missing" and _is_empty(value):
+        if _is_empty(value) and (field.transform == "empty_to_missing" or (field.transform == "datevec" and not field.required)):
             return ABSENT
         if field.dtype == "isodatetime":
             return datevec_to_datetime(value)
@@ -440,12 +446,13 @@ class _Normalizer:
         self._unregistered_series = []
         trial_rows = [trial for _, _, trial in trials]
 
-        offsets = self._clock_offsets(blocks, start)
+        clock = self._clock(blocks, session, start)
+        offsets = clock.offsets
         trial_columns = self._trial_columns(trials, trial_rows, offsets)
         pairs, region = self._stimulus_pairs(blocks, trials, trial_columns)
         if region is not None:
             trial_columns.append(region)
-        epoch_columns = self._epoch_columns(blocks, start)
+        epoch_columns = self._epoch_columns(blocks, start, clock)
         series = self._series(trial_rows, next(c for c in trial_columns if c.name == "start_time").data)
 
         # The settings walk accounts for the rest of each maze.
@@ -457,8 +464,7 @@ class _Normalizer:
 
         self.collect_settings()
         self._check_later_versions(versions)
-        self.settings.append(("derived.clock_offset", json.dumps([float(offset) for offset in offsets]),
-                              "Seconds added to ViRMEn's elapsed clock in each block to get seconds since session_start_time."))
+        self._record_clock(clock, session, start, epoch_columns)
         subject_field = self.registry["log.animal.name"]
         self.coverage.written[subject_field.path] = [subject_field.name]
         self.coverage.written["log.session.start"] = ["session_start_time"]
@@ -468,9 +474,9 @@ class _Normalizer:
             lab_meta=lab_meta, settings=self.settings, series=series, coverage=self.coverage,
         )
 
-    def _clock_offsets(self, blocks, session_start):
-        """One offset per block: blocks without trials take the running one."""
-        starts, firsts, ends, used = [], [], [], []
+    def _clock(self, blocks, session, session_start):
+        """The clock map, one entry per block: a block without trials takes the running offset and has no reading."""
+        starts, firsts, ends, durations, used = [], [], [], [], []
         previous_end = None
         for index, block in enumerate(blocks):
             block_trials = records(block["trial"])
@@ -482,15 +488,61 @@ class _Normalizer:
             starts.append(seconds_between(session_start, datevec_to_datetime(block["start"])))
             firsts.append(float(block_trials[0]["start"].item()))
             ends.append(previous_end)
+            durations.append(float(block["duration"].item()))
             used.append(index)
             last = block_trials[-1]
             previous_end = float(last["start"].item()) + float(np.asarray(last["time"], dtype="float64").ravel()[-1])
-        computed = dict(zip(used, clock_offsets(starts, firsts, ends)))
-        offsets, running = [], computed[used[0]] if used else 0.0
+        try:
+            found = map_clock(starts, firsts, ends, durations, self._seconds_since(session_start, session.get("end")), self._elapsed_zero(session_start))
+        except ClockAnchorError as error:
+            self.fail(BLOCK + "start", str(error))
+        where = {index: position for position, index in enumerate(used)}
+        offsets, readings, anchors, max_errors = [], [], [], []
+        position = 0
         for index in range(len(blocks)):
-            running = computed.get(index, running)
-            offsets.append(running)
-        return offsets
+            position = where.get(index, position)
+            has_trials = index in where
+            offsets.append(found.offsets[position] if used else 0.0)
+            readings.append(found.block_start_readings[position] if has_trials else None)
+            anchors.append(found.anchors[position] if used else BLOCK_STAMP)
+            max_errors.append(found.max_errors[position] if used else None)
+        return ClockMap(offsets, readings, anchors, max_errors)
+
+    @staticmethod
+    def _seconds_since(session_start, datevec):
+        return None if _is_empty(datevec) else seconds_between(session_start, datevec_to_datetime(datevec))
+
+    def _elapsed_zero(self, session_start):
+        """When the elapsed clock read zero, from the engine's own timer. Only sessions that recorded video save the second."""
+        engine_start = self._seconds_since(session_start, self.log.get("initialTimestamp"))
+        until_zero = self.log.get("timeElapsedFirstTrial")
+        return None if engine_start is None or _is_empty(until_zero) else engine_start + float(np.asarray(until_zero).item())
+
+    def _record_clock(self, clock, session, session_start, epoch_columns):
+        """Say in the file and the coverage report how its times were found, and whether a person should check them."""
+        session_end = self._seconds_since(session_start, session.get("end"))
+        stops = next(c for c in epoch_columns if c.name == "stop_time").data
+        end_miss = None if session_end is None or not len(stops) else float(session_end - stops[-1])
+        rows = (
+            ("derived.clock_offset", [float(offset) for offset in clock.offsets],
+             "Seconds added to ViRMEn's elapsed clock in each block to get seconds since session_start_time."),
+            ("derived.clock_anchor", clock.anchors,
+             "How each block's offset was found: block_stamp, its wall-clock stamp paired with its first trial; engine_timestamps, initialTimestamp + "
+             "timeElapsedFirstTrial; session_end_upper_bound, session.end - block duration, because the block was stamped during setup and those weren't saved."),
+            ("derived.clock_max_error", clock.max_errors,
+             "How far too late each block's offset could be, in seconds, or null if its anchor isn't a bound. To be checked against other evidence."),
+            ("derived.clock_session_end_minus_block_end", end_miss,
+             "Seconds between the last block's end on the session clock and session.end, which is read after the session's shutdown code."),
+        )
+        self.settings.extend((key, json.dumps(value), meaning) for key, value, meaning in rows)
+        errors = [error for error in clock.max_errors if error is not None]
+        self.coverage.clock = dict(
+            anchors=clock.anchors,
+            offsets=[float(offset) for offset in clock.offsets],
+            session_end_minus_block_end=end_miss,
+            max_error_seconds=max(errors) if errors else None,
+            needs_review=SESSION_END in clock.anchors or (end_miss is not None and abs(end_miss) > END_MISS_FOR_REVIEW),
+        )
 
     def _trial_columns(self, trials, rows, offsets):
         special = {TRIAL + "start"}
@@ -505,14 +557,17 @@ class _Normalizer:
         self.coverage.written[start_field.path] = ["start_time", "stop_time"]
         return columns
 
-    def _epoch_columns(self, blocks, session_start):
+    def _epoch_columns(self, blocks, session_start, clock):
         columns = self.table(blocks, BLOCK, "epoch_column", special={BLOCK + "start"})
         field = self.registry[BLOCK + "start"]
-        start_time = np.array([seconds_between(session_start, datevec_to_datetime(block["start"])) for block in blocks], dtype="float64")
+        stamps = np.array([seconds_between(session_start, datevec_to_datetime(block["start"])) for block in blocks], dtype="float64")
+        # A block's elapsed start plus the shared offset; a block without trials has only its stamp.
+        start_time = np.array([stamp if reading is None else reading + offset for stamp, reading, offset in zip(stamps, clock.block_start_readings, clock.offsets)], dtype="float64")
         duration = np.array([float(block["duration"].item()) for block in blocks], dtype="float64")
+        columns.append(Column(field.name, "float64", field.doc, stamps))
         columns.insert(0, Column("stop_time", "float64", "End of the block, in seconds since session_start_time.", start_time + duration))
-        columns.insert(0, Column("start_time", "float64", field.doc, start_time))
-        self.coverage.written[field.path] = ["start_time", "stop_time"]
+        columns.insert(0, Column("start_time", "float64", "Start of the block, in seconds since session_start_time, on the same clock as the trials.", start_time))
+        self.coverage.written[field.path] = [field.name]
         return columns
 
     def _stimulus_pairs(self, blocks, trials, trial_columns):
@@ -656,7 +711,6 @@ class _Normalizer:
             ("collision", "n.a.", "frames", by_frames, 1),
             ("frictionEngagedVec", "n.a.", "frames", by_frames, 1),
             ("sensorDots", "dots", "all", by_time, 5),
-            ("rawBallInput", "n.a.", "frames", by_frames, 2),
         ):
             if leaf not in present:
                 continue
@@ -672,18 +726,10 @@ class _Normalizer:
         return series
 
     def _frame_value(self, field, value, expected, row):
-        """Check a per-frame array's row count. rawBallInput is indexed by iteration into a preallocated array that can
-        be longer or shorter than the trial, so it is trimmed of its unused rows or padded with NaN to one row per frame."""
-        if value.shape[0] == expected:
-            return value
-        if field.path != TRIAL + "rawBallInput":
+        """Check a per-frame array's row count."""
+        if value.shape[0] != expected:
             self.fail(field.path, f"has {value.shape[0]} rows where {expected} are expected", row)
-        if value.shape[0] > expected:
-            if not np.isnan(value[expected:]).all():
-                self.fail(field.path, f"holds data past the trial's {expected} rows", row)
-            return value[:expected]
-        padding = np.full((expected - value.shape[0], value.shape[1]), np.nan, dtype=value.dtype)
-        return np.concatenate([value, padding])
+        return value
 
 
 def _plain(value):

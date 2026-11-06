@@ -48,6 +48,8 @@ class VirmenDataInterface(BaseTemporalAlignmentInterface):
         aligned_timestamps = np.asarray(aligned_timestamps, dtype="float64")
         if aligned_timestamps.size != self.get_original_timestamps().size:
             raise ValueError(f"expected {self.get_original_timestamps().size} aligned timestamps, got {aligned_timestamps.size}")
+        if np.any(np.diff(aligned_timestamps) < 0):
+            raise ValueError("aligned timestamps run backwards")
         self._aligned = aligned_timestamps
 
     def _aligned_session(self):
@@ -55,7 +57,13 @@ class VirmenDataInterface(BaseTemporalAlignmentInterface):
         original = self.get_original_timestamps()
 
         def move(times):
-            return np.interp(times, original, self._aligned)
+            # np.interp clamps outside the frames, and a block or trial can end after the last frame.
+            times = np.asarray(times, dtype="float64")
+            moved = np.interp(times, original, self._aligned)
+            before, after = times < original[0], times > original[-1]
+            moved[before] = times[before] + self._aligned[0] - original[0]
+            moved[after] = times[after] + self._aligned[-1] - original[-1]
+            return moved
 
         def move_table(columns):
             return [replace(c, data=move(c.data)) if c.name in ("start_time", "stop_time") else c for c in columns]

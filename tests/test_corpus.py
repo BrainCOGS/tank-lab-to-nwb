@@ -3,6 +3,7 @@
 Set VIRMEN_CORPUS to the folder of logs to run these; the logs aren't in this repository.
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -112,3 +113,61 @@ def test_loader_agrees_with_scipy_on_every_plain_value(path):
             if theirs.size or ours.size:
                 np.testing.assert_array_equal(np.asarray(theirs, dtype="float64"), np.asarray(ours, dtype="float64"), err_msg=key)
     assert compared > 100
+
+
+# ---- the session clock ----
+
+# Sorted-path indexes of the logs whose first block was stamped during setup, and how each is anchored. A new index here
+# means another log hit the fallback: see docs/virmen-timing.md.
+SETUP_STAMPED = {0: "engine_timestamps", 1: "session_end_upper_bound", 2: "session_end_upper_bound"}
+TIME_TOLERANCE = 0.001  # trial times are logged in single precision: about 0.24 ms at an hour
+
+
+def _column(table, name):
+    return next(c for c in table if c.name == name).data
+
+
+@each_log
+def test_clock_anchor_is_the_expected_one(path):
+    anchors = set(normalize_log(load_log(path), file=path).coverage.clock["anchors"])
+    assert anchors == {SETUP_STAMPED.get(LOGS.index(path), "block_stamp")}
+
+
+@each_log
+def test_session_clock_is_consistent(path):
+    session = normalize_log(load_log(path), file=path)
+    starts, stops = _column(session.trials, "start_time"), _column(session.trials, "stop_time")
+    assert np.all(np.diff(starts) > 0)
+    assert np.all(starts[1:] >= stops[:-1] - TIME_TOLERANCE), "trials overlap"
+    for series in session.series:
+        assert np.all(np.diff(series.timestamps) >= 0), f"{series.name} steps backwards"
+    epoch_starts, epoch_stops = _column(session.epochs, "start_time"), _column(session.epochs, "stop_time")
+    assert np.all(epoch_starts >= 0)
+    assert np.all(epoch_starts[1:] >= epoch_stops[:-1] - TIME_TOLERANCE), "epochs overlap"
+    for start, stop in zip(starts, stops):
+        assert np.any((start >= epoch_starts - TIME_TOLERANCE) & (stop <= epoch_stops + TIME_TOLERANCE)), f"trial at {start} is outside every epoch"
+
+
+@each_log
+def test_block_end_matches_the_session_end(path):
+    clock = normalize_log(load_log(path), file=path).coverage.clock
+    # Stopping and deleting the video runs before session.end is read in the one log that recorded it.
+    limit = 0.75 if LOGS.index(path) == 0 else 0.25
+    if LOGS.index(path) in (1, 2):
+        assert clock["session_end_minus_block_end"] == pytest.approx(0.0, abs=1e-9)  # the fallback defines it
+    assert abs(clock["session_end_minus_block_end"]) <= limit
+    assert clock["needs_review"] is (LOGS.index(path) in (1, 2))
+
+
+@each_log
+def test_raw_trial_start_can_be_recovered_exactly(path):
+    log = load_log(path)
+    session = normalize_log(log, file=path)
+    offsets = json.loads(next(value for key, value, _ in session.settings if key == "derived.clock_offset"))
+    raw, shift = [], []
+    for block, offset in zip(records(log["block"]), offsets):
+        for trial in records(block["trial"]):
+            raw.append(float(trial["start"].item()))
+            shift.append(offset)
+    recovered = (_column(session.trials, "start_time") - np.array(shift)).astype("float32")
+    np.testing.assert_array_equal(recovered, np.array(raw, dtype="float32"))

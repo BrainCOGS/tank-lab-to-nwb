@@ -36,15 +36,13 @@ class TestFrameTimes:
             make_block(make_trial(start=12.0), start=(2026, 7, 15, 12, 0, 10.5)),
         ]
         session = _normalize(make_log(blocks))
-        starts = _column(session.trials, "start_time").data
-        np.testing.assert_array_equal(starts, [0.0, 10.0])
-        timestamps = _series(session, "position").timestamps
-        np.testing.assert_array_equal(timestamps, [0.0, 0.5, 1.0, 10.0, 10.5, 11.0])
+        np.testing.assert_array_equal(_column(session.trials, "start_time").data, [10.5, 20.5])
+        np.testing.assert_array_equal(_series(session, "position").timestamps, [10.5, 11.0, 11.5, 20.5, 21.0, 21.5])
 
     def test_first_trial_starts_at_its_block_wall_clock(self):
         session = _normalize(make_log([make_block(make_trial(start=2.5), start=(2026, 7, 15, 12, 0, 1.0))]))
-        assert _column(session.trials, "start_time").data[0] == 0.5
-        assert _column(session.epochs, "start_time").data[0] == 0.5
+        assert _column(session.trials, "start_time").data[0] == 11.0
+        assert _column(session.epochs, "start_time").data[0] == 11.0
 
     def test_clock_reset_keeps_later_blocks_after_earlier_ones(self):
         # Regression: a second log.version restarts the clock, so block 2 overlapped block 1.
@@ -54,13 +52,14 @@ class TestFrameTimes:
         ]
         session = _normalize(make_log(blocks, version=[make_version(), make_version()]))
         starts = _column(session.trials, "start_time").data
-        assert starts[2] == 600.0 and starts[1] < starts[2]
+        assert starts[2] == 610.5 and starts[1] < starts[2]
         assert np.all(np.diff(_series(session, "position").timestamps) > 0)
 
     def test_offsets_are_recorded_so_the_elapsed_clock_can_be_recovered(self):
         session = _normalize(make_log([make_block(make_trial(start=2.5), start=(2026, 7, 15, 12, 0, 1.0))]))
         rows = {key: value for key, value, _ in session.settings}
-        assert json.loads(rows["derived.clock_offset"]) == [-2.0]
+        assert json.loads(rows["derived.clock_offset"]) == [8.5]
+        assert _column(session.trials, "start_time").data[0] - 8.5 == 2.5
 
     def test_position_stops_before_the_iti_and_sensor_dots_keep_it(self):
         session = _normalize(make_log([make_block(make_trial(n_frames=3, n_iti=2))]))
@@ -87,24 +86,103 @@ class TestFrameTimes:
         with pytest.raises(ConversionError, match="start"):
             _normalize(make_log([make_block(make_trial(start=np.nan))]))
 
-    def test_raw_ball_input_keeps_real_rows_and_trims_preallocation(self):
-        raw = np.full((10, 2), np.nan, dtype="float32")
-        raw[:3] = 1.0
-        session = _normalize(make_log([make_block(make_trial(rawBallInput=raw))]))
-        assert _series(session, "RawBallInput").data.shape == (3, 2)
+    @pytest.mark.parametrize("rows", [1, 3, 10])
+    def test_raw_ball_input_is_a_recorded_drop_whatever_its_length(self, rows):
+        session = _normalize(make_log([make_block(make_trial(rawBallInput=np.ones((rows, 2), dtype="float32")))]))
+        assert "RawBallInput" not in {s.name for s in session.series}
+        assert "log.block.trial.rawBallInput" in session.coverage.dropped
 
-    def test_raw_ball_input_shorter_than_the_trial_is_padded_to_one_row_per_frame(self):
-        # It's indexed by iteration, and its preallocated size can be smaller than the trial.
-        raw = np.array([[1.0, 2.0]], dtype="float32")
-        data = _series(_normalize(make_log([make_block(make_trial(rawBallInput=raw))])), "RawBallInput").data
-        assert data.shape == (3, 2) and data[0].tolist() == [1.0, 2.0] and np.isnan(data[1:]).all()
-        assert data.dtype == np.float32
+    def test_other_per_frame_fields_with_the_wrong_row_count_still_fail(self):
+        with pytest.raises(ConversionError, match="collision"):
+            _normalize(make_log([make_block(make_trial(collision=np.zeros((2, 1), dtype=bool)))]))
 
-    def test_raw_ball_input_with_data_past_the_trial_fails(self):
-        raw = np.full((10, 2), np.nan, dtype="float32")
-        raw[5] = 1.0
-        with pytest.raises(ConversionError, match="rawBallInput"):
-            _normalize(make_log([make_block(make_trial(rawBallInput=raw))]))
+
+def _setup_stamped_log(**extra):
+    """One block kept from setup: stamped 0.05 s after the session start, duration counted from elapsed 0."""
+    trials = [make_trial(start=2.5, duration=single(5.0)), make_trial(start=7.5, duration=single(92.5))]
+    block = make_block(trials, start=(2026, 7, 15, 11, 59, 50.05), duration=scalar(100.0))
+    session = dict(start=np.array([[2026, 7, 15, 11, 59, 50.0]]), end=np.array([[2026, 7, 15, 12, 1, 32.0]]), blocks=np.array([[1.0, 1.0]]))
+    return make_log([block], session=session, **extra)
+
+
+def _settings(session):
+    return {key: value for key, value, _ in session.settings}
+
+
+class TestClockAnchor:
+    def test_ordinary_block_uses_its_stamp_and_needs_no_review(self):
+        session = _normalize(make_log())
+        assert json.loads(_settings(session)["derived.clock_anchor"]) == ["block_stamp"]
+        assert session.coverage.clock["needs_review"] is False
+
+    def test_epoch_starts_with_its_first_trial_when_blocks_share_an_offset(self):
+        # The second stamp is 30 ms late: keeping one offset, the epoch still starts with its own first trial.
+        blocks = [
+            make_block(make_trial(start=2.0), start=(2026, 7, 15, 12, 0, 0.0), duration=scalar(10.0)),
+            make_block(make_trial(start=12.0), start=(2026, 7, 15, 12, 0, 10.03), duration=scalar(10.0)),
+        ]
+        session = _normalize(make_log(blocks))
+        np.testing.assert_array_equal(_column(session.epochs, "start_time").data, _column(session.trials, "start_time").data)
+        np.testing.assert_array_equal(_column(session.epochs, "stop_time").data, [20.0, 30.0])
+
+    def test_wall_clock_stamp_is_kept_exactly_in_its_own_column(self):
+        session = _normalize(make_log([make_block(make_trial(start=2.0), start=(2026, 7, 15, 12, 0, 0.25))]))
+        assert _column(session.epochs, "wall_clock_start").data[0] == 10.25
+        assert session.coverage.written["log.block.start"] == ["wall_clock_start"]
+
+    def test_empty_block_keeps_its_stamp_as_its_start(self):
+        blocks = [make_block(make_trial(start=2.0), start=(2026, 7, 15, 12, 0, 0.0)), make_block([], start=(2026, 7, 15, 12, 0, 30.0))]
+        session = _normalize(make_log(blocks))
+        assert _column(session.epochs, "start_time").data[1] == 40.0
+
+    def test_setup_stamp_with_engine_timestamps_is_exact(self):
+        # The engine started 10.5 s before the session object and the clock started 11.5 s after the engine: 1.0 s.
+        log = _setup_stamped_log(initialTimestamp=np.array([[2026, 7, 15, 11, 59, 39.5]]), timeElapsedFirstTrial=scalar(11.5))
+        session = _normalize(log)
+        assert _column(session.trials, "start_time").data[0] == 3.5
+        assert _column(session.epochs, "start_time").data[0] == 1.0
+        assert _column(session.epochs, "stop_time").data[0] == 101.0
+        assert _column(session.epochs, "wall_clock_start").data[0] == pytest.approx(0.05)
+        assert _series(session, "position").timestamps[0] == 3.5
+        rows = _settings(session)
+        assert json.loads(rows["derived.clock_anchor"]) == ["engine_timestamps"]
+        assert json.loads(rows["derived.clock_offset"]) == [1.0]
+        assert json.loads(rows["derived.clock_session_end_minus_block_end"]) == pytest.approx(1.0)
+        assert session.coverage.clock["needs_review"] is False
+
+    def test_setup_stamp_without_engine_timestamps_is_marked_for_review(self):
+        session = _normalize(_setup_stamped_log())
+        assert _column(session.trials, "start_time").data[0] == 4.5
+        assert _column(session.epochs, "start_time").data[0] == 2.0
+        rows = _settings(session)
+        assert json.loads(rows["derived.clock_anchor"]) == ["session_end_upper_bound"]
+        assert json.loads(rows["derived.clock_max_error"]) == [pytest.approx(1.95)]
+        assert session.coverage.clock["needs_review"] is True
+        assert session.coverage.clock["max_error_seconds"] == pytest.approx(1.95)
+
+    @pytest.mark.parametrize("missing", [dict(timeElapsedFirstTrial=np.zeros((0, 0))), dict(initialTimestamp=np.zeros((0, 0)))])
+    def test_empty_engine_field_falls_back_to_session_end(self, missing):
+        fields = dict(initialTimestamp=np.array([[2026, 7, 15, 11, 59, 39.5]]), timeElapsedFirstTrial=scalar(11.5))
+        session = _normalize(_setup_stamped_log(**{**fields, **missing}))
+        assert json.loads(_settings(session)["derived.clock_anchor"]) == ["session_end_upper_bound"]
+
+    def test_setup_stamp_with_no_session_end_fails(self):
+        log = _setup_stamped_log()
+        log["session"]["end"] = np.zeros((0, 0))
+        with pytest.raises(ConversionError, match="setup"):
+            _normalize(log)
+
+    def test_block_end_far_from_the_session_end_is_marked_for_review(self):
+        log = make_log()
+        log["session"]["end"] = np.array([[2026, 7, 15, 12, 0, 20.0]])
+        session = _normalize(log)
+        assert json.loads(_settings(session)["derived.clock_session_end_minus_block_end"]) == pytest.approx(9.0)
+        assert session.coverage.clock["needs_review"] is True
+
+    def test_clock_details_reach_the_coverage_report(self):
+        report = _normalize(make_log()).coverage.as_dict()
+        assert report["clock"]["anchors"] == ["block_stamp"]
+        json.dumps(report)
 
 
 class TestOptionalFields:
