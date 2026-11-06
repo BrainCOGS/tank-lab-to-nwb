@@ -30,6 +30,7 @@ dependencies = [
     "pandas>=3",
     "pynwb>=4.2",
     "spikeinterface>=0.102.1",
+    "tifffile",
 ]
 
 requires-python = ">=3.12,<3.14"
