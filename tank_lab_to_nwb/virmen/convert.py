@@ -86,7 +86,7 @@ def build_nwbfile(session, metadata=None):
     metadata = {**PLACEHOLDER_METADATA, **(metadata or {})}
     subject = Subject(subject_id=session.subject_id, **metadata["subject"])
     nwbfile = NWBFile(
-        session_description=f"ViRMEn behavior session of {session.lab_meta.get('experiment_name', 'an unnamed experiment')}.",
+        session_description=metadata.get("session_description", f"ViRMEn behavior session of {session.lab_meta.get('experiment_name', 'an unnamed experiment')}."),
         identifier=str(uuid4()),
         session_start_time=session.session_start_time,
         session_id=session.session_id,
