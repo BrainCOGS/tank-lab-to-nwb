@@ -288,3 +288,29 @@ def test_inventory_includes_matlab_fields_and_excluded_movie_reason(run):
     assert inventory["plane0/Fall.mat"]["fields"]["redcell"]["shape"] == [0, 0]
     assert inventory["plane0/Fall.mat"]["fields"]["F"]["matlab_class"] == "single"
     assert inventory["plane0/data.bin"]["storage"].startswith("excluded:")
+
+
+def test_bidiphase_decision_and_version_are_visible_without_unpickling(tmp_path, log, tiffs, run):
+    from tank_lab_to_nwb.imaging.suite2p import convert_suite2p
+
+    path = tmp_path / "settings.nwb"
+    convert_suite2p(log, tiffs, run, path, file="session.mat")
+    with h5py.File(path) as f:
+        table = f["processing/ophys/suite2p_settings"]
+        keys = list(table["key"].asstr()[()])
+        values = list(table["value"].asstr()[()])
+        assert values[keys.index("plane0.registration.do_bidiphase")] == "false"
+        assert values[keys.index("plane0.version")] == '"1.1.0"'
+        assert "open decision" in table.attrs["description"]
+
+
+@pytest.mark.parametrize("dataset", ["processing/ophys/Plane0_xoff", "processing/ophys/SummaryImages0/meanImg"])
+def test_readback_refuses_missing_derived_interfaces(tmp_path, log, tiffs, run, dataset):
+    from tank_lab_to_nwb.imaging.suite2p import convert_suite2p, verify_suite2p
+
+    path = tmp_path / "missing.nwb"
+    prepared = convert_suite2p(log, tiffs, run, path, file="session.mat")
+    with h5py.File(path, "r+") as f:
+        del f[dataset]
+    with pytest.raises(ValueError, match="missing"):
+        verify_suite2p(prepared, path, run, tiffs)

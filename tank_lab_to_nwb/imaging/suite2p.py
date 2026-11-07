@@ -226,6 +226,28 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None):
                         description=f"Suite2p registration {key}, unchanged; bad frames remain in all traces and timestamps.",
                     )
                 )
+    setting_rows = []
+
+    def add_settings(prefix, values):
+        for key, value in values.items():
+            name = f"{prefix}.{key}"
+            if isinstance(value, dict):
+                add_settings(name, value)
+            else:
+                setting_rows.append((name, _json_value(value)))
+
+    for plane, data in enumerate(planes):
+        add_settings(f"plane{plane}", data["settings"])
+    module.add(
+        _table(
+            "suite2p_settings",
+            "Suite2p settings and version as recorded, without changing any value. registration.do_bidiphase on a bidirectional rig is an open decision. fs is processing provenance, not the source of timestamps.",
+            [
+                ("key", "Plane and original setting path.", np.array([r[0] for r in setting_rows], dtype=object)),
+                ("value", "Original value as JSON.", np.array([r[1] for r in setting_rows], dtype=object)),
+            ],
+        )
+    )
     if image_coordinates:
         module.add(
             _table(
@@ -313,7 +335,9 @@ def verify_suite2p(prepared, output, root, tiffs):
 
     def equal(actual, expected, label):
         actual, expected = np.asarray(actual), np.asarray(expected)
-        if actual.shape != expected.shape or not np.array_equal(actual, expected, equal_nan=True):
+        if actual.shape != expected.shape or not np.array_equal(
+            actual, expected, equal_nan=actual.dtype.kind in "fc" and expected.dtype.kind in "fc"
+        ):
             raise RoundTripError(f"{label}: differs from source")
 
     verify_round_trip(prepared.session, output)
@@ -390,14 +414,22 @@ def verify_suite2p(prepared, output, root, tiffs):
             for source in ("reg_outputs", "detect_outputs"):
                 meta = np.load(folder / f"{source}.npy", allow_pickle=True).item()
                 for key, value in meta.items():
-                    if f"Plane{plane}_{key}" in o:
+                    if key in ("xoff", "yoff", "corrXY", "xoff1", "yoff1", "corrXY1", "badframes", "badframes0"):
+                        if f"Plane{plane}_{key}" not in o:
+                            raise RoundTripError("missing registration " + key)
                         equal(o[f"Plane{plane}_{key}/data"][()], value, key)
                         equal(
                             o[f"Plane{plane}_{key}/timestamps"][()],
                             session_times[(numbers - 1) % prepared.acquisition.layout.n_planes == plane],
                             key + " times",
                         )
-                    if f"SummaryImages{plane}/{key}" in o:
+                    if (
+                        isinstance(value, np.ndarray)
+                        and value.ndim == 2
+                        and key in ("meanImg", "meanImgE", "max_proj", "Vcorr", "refImg", "meanImg_crop")
+                    ):
+                        if f"SummaryImages{plane}/{key}" not in o:
+                            raise RoundTripError("missing summary image " + key)
                         equal(o[f"SummaryImages{plane}/{key}"][()], value.T, key)
                         table = o["summary_image_coordinates"]
                         row = list(table["image"].asstr()[()]).index(f"SummaryImages{plane}/{key}")
@@ -407,6 +439,15 @@ def verify_suite2p(prepared, output, root, tiffs):
                             [*origin, value.shape[1], value.shape[0]],
                             "summary image coordinates",
                         )
+        table = o["suite2p_settings"]
+        for key, text in zip(table["key"].asstr()[()], table["value"].asstr()[()]):
+            plane_name, *parts = key.split(".")
+            original = np.load(Path(root) / plane_name / "settings.npy", allow_pickle=True).item()
+            for part in parts:
+                original = original[part]
+            import json
+
+            equal(json.loads(text), original, "Suite2p setting " + key)
         inventory = o["source_inventory"]
         sources = _sources(root)
         if list(inventory["path"].asstr()[()]) != [str(p.relative_to(root)) for p in sources]:

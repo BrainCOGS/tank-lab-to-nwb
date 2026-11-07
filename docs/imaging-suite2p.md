@@ -62,6 +62,7 @@ coordinates; images are not silently padded or masks shifted.
 Registration series preserve `xoff`, `yoff`, `corrXY`, `xoff1`, `yoff1`, `corrXY1`, `badframes` and `badframes0`, each with
 its plane's timestamps. `meanImg`, `meanImgE`, `refImg`, `meanImg_crop`, `max_proj` and `Vcorr` are also standard images.
 The source inventory records the original relative path, SHA256 and scratch dataset of every nonmovie artifact.
+`suite2p_settings` also exposes every original setting and version as text, including the unchanged bidiphase decision.
 
 Every source artifact except per-plane `data.bin` is stored **byte-for-byte** as compressed `uint8` scratch data. This
 includes all NPY files, every `Fall.mat`, root metadata and logs, and the whole `combined/` folder. Combined is retained
