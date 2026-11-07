@@ -36,7 +36,7 @@ along the same line.
 
 ViRMEn saves the log with the running trial still unfinished, so its packets have no row in `log.block.trial`. It's in
 `log.currentTrial`, with `log.currentIt` saying how many iterations are real, so those packets can be matched too. Its
-per-iteration data goes in `processing/in_progress_trial` at full precision, because finished trials are rounded to single
+per-iteration data goes in `processing/behavior` at full precision, because finished trials are rounded to single
 precision and this one isn't. It has no row in the trials table.
 
 ## Time zero
@@ -63,7 +63,7 @@ disagreed by 0.15 to 0.96 s, with the sign changing between days.
 
 The lab's pipeline, `SyncImagingBehavior` in U19-pipeline-matlab, stores labels rather than a clock: the block, trial and iteration
 of each frame's first packet, repeated across interior frames with no packet, and cleared for the trial missing from the log.
-`processing/scanimage/frames` holds these as `behavior_block`, `behavior_trial` and `behavior_iteration`, so its results can be
+`processing/ophys/scanimage_frames` holds these as `behavior_block`, `behavior_trial` and `behavior_iteration`, so its results can be
 compared.
 
 Those labels say which header received a packet, not when the iteration happened. At a trial's onset, the first labelled frame can
@@ -86,4 +86,4 @@ reaching `numVolumes` is refused too, and would need a person to check it.
 A session's raw and processed files are separate NWB files in one dandiset, told apart by name:
 `sub-<subject>_ses-<session>_desc-rawtiff_behavior+ophys.nwb` and `..._desc-suite2p_behavior+ophys.nwb`. Pass `description` to
 `organize_for_dandi` to name them. They share a `subject_id`, a `session_id`, and `acquisition.id` in
-`processing/scanimage/alignment`, a fingerprint of the acquisition itself.
+`processing/ophys/scanimage_alignment`, a fingerprint of the acquisition itself.

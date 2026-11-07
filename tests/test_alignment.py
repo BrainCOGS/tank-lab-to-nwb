@@ -221,11 +221,11 @@ def test_in_progress_series_cuts_preallocated_rows_at_full_precision():
     log = _two_trials_log(**_in_progress())
     series, record = in_progress_series(log, offset=1.0)
     by_name = {item.name: item for item in series}
-    assert set(by_name) == {"collision", "position", "sensorDots", "time", "velocity"}
-    np.testing.assert_array_equal(by_name["position"].data, [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
-    assert by_name["position"].data.dtype == np.float64
-    assert by_name["sensorDots"].data.dtype == np.int16
-    np.testing.assert_array_equal(by_name["position"].timestamps, [31.0, 31.25])
+    assert set(by_name) == {"in_progress_collision", "in_progress_position", "in_progress_sensorDots", "in_progress_time", "in_progress_velocity"}
+    np.testing.assert_array_equal(by_name["in_progress_position"].data, [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
+    assert by_name["in_progress_position"].data.dtype == np.float64
+    assert by_name["in_progress_sensorDots"].data.dtype == np.int16
+    np.testing.assert_array_equal(by_name["in_progress_position"].timestamps, [31.0, 31.25])
     assert record["block"] == 1 and record["trial"] == 3 and record["saved_iterations"] == 2
     assert record["viStart"] == 9
 

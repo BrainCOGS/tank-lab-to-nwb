@@ -85,7 +85,7 @@ def check_scanimage_tables(scanimage, prepared, headers):
     """Every column of processing/scanimage against the TIFF headers and the alignment, shared by every view of a session."""
     columns, packets = headers["columns"], headers["packets"]
     numbers = columns["frame_number"]
-    frames = scanimage["frames"]
+    frames = scanimage["scanimage_frames"]
     for name, values in columns.items():
         _equal(frames[name][()], values, f"frames.{name}")
     _equal(frames["plane"][()], (numbers - 1) % prepared.acquisition.layout.n_planes, "frame planes")
@@ -93,16 +93,16 @@ def check_scanimage_tables(scanimage, prepared, headers):
     _equal(frames["behavior_block"][()], prepared.labels["block"], "behavior_block")
     _equal(frames["behavior_trial"][()], prepared.labels["trial"], "behavior_trial")
     _equal(frames["behavior_iteration"][()], prepared.labels["iteration"], "behavior_iteration")
-    table = scanimage["i2c_packets"]
+    table = scanimage["scanimage_i2c_packets"]
     _check_packets(table, packets)
     _equal(table["elapsed"][()], prepared.packet_elapsed, "packet elapsed times")
     _equal(table["session_time"][()], prepared.packet_times, "packet session times")
     _equal(table["used_in_fit"][()], prepared.fit.used, "used_in_fit")
-    files = scanimage["files"]
+    files = scanimage["scanimage_files"]
     for name in ("file_name", "software", "artist"):
         _equal(files[name].asstr()[()], np.array([file[name] for file in headers["files"]], dtype=object), f"files.{name}")
     _equal(files["n_frames"][()], [file["n_frames"] for file in headers["files"]], "files.n_frames")
-    alignment = scanimage["alignment"]
+    alignment = scanimage["scanimage_alignment"]
     rows = alignment_rows(prepared)
     for position, name in enumerate(("key", "value", "meaning")):
         _equal(alignment[name].asstr()[()], np.array([row[position] for row in rows], dtype=object), f"alignment.{name}")
@@ -148,11 +148,11 @@ def verify_imaging(prepared, nwbfile_path, tiff_paths, max_frames_per_plane=None
         raise RoundTripError("frame numbers in the TIFFs aren't 1, 2, 3...")
     n_planes = prepared.acquisition.layout.n_planes
     with h5py.File(nwbfile_path, "r", rdcc_nbytes=_CACHE_BYTES) as file:
-        scanimage = file["processing/scanimage"]
+        scanimage = file["processing/ophys"]
         check_scanimage_tables(scanimage, prepared, headers)
 
         # The timestamps again, from the line as the file itself records it.
-        values = _alignment_values(scanimage["alignment"])
+        values = _alignment_values(scanimage["scanimage_alignment"])
         slope, intercept, offset = (float(values[f"fit.{name}"]) for name in ("slope", "intercept", "clock_offset"))
         recomputed = (times - intercept) / slope + offset
         for plane in range(n_planes):
@@ -164,6 +164,6 @@ def verify_imaging(prepared, nwbfile_path, tiff_paths, max_frames_per_plane=None
             if stored.size > 1 and np.any(np.diff(stored) <= 0):
                 raise RoundTripError(f"plane {plane}: timestamps don't always increase")
         for series in prepared.in_progress:
-            _check_series(file["processing/in_progress_trial"], series)
+            _check_series(file["processing/behavior"], series)
         checked = _check_pixels(file, tiff_paths, numbers, n_planes, max_frames_per_plane)
     return dict(frames_checked=checked, frames_in_tiffs=int(numbers.size), packets_checked=len(headers["packets"]))

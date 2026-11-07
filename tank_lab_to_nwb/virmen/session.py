@@ -276,6 +276,7 @@ class _Normalizer:
             kept = [column for column in new if column.index is None or column.data.size]
             if len(kept) < len(new):
                 self.coverage.omitted[field.path] = "Every cell of " + ", ".join(c.name for c in new if c not in kept) + " is empty in this session."
+            kept = self._without_all_nan(field, kept)
             columns += kept
             if kept:
                 self.coverage.written[field.path] = [column.name for column in kept]
@@ -283,6 +284,17 @@ class _Normalizer:
             for name in names:
                 self._account_for(prefix + name, rows, name, columns, prefix)
         return columns
+
+    def _without_all_nan(self, field, columns):
+        """Leave out a float column with no value in this session, and say so."""
+        kept = []
+        for column in columns:
+            data = np.asarray(column.data)
+            if column.index is None and data.dtype.kind == "f" and data.size and np.isnan(data).all():
+                self.coverage.omitted[field.path] = f"Every value of {column.name} is NaN in this session."
+            else:
+                kept.append(column)
+        return kept
 
     def _account_for(self, path, rows, name, columns, prefix):
         field = self.registry.get(path)

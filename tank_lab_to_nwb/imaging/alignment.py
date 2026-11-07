@@ -244,7 +244,7 @@ def in_progress_series(log, offset):
                 raise AlignmentError(f"currentTrial.{name} has values past iteration {count}, the saved count")
             unit, description = _IN_PROGRESS_FIELDS[name]
             data = value[:count, 0] if value.ndim == 2 and value.shape[1] == 1 else value[:count]
-            series.append(Series(name, data, timestamps, unit, description, "in_progress"))
+            series.append(Series(f"in_progress_{name}", data, timestamps, unit, description, "in_progress"))
         elif np.size(value) if not isinstance(value, str) else value:
             other[name] = value.item() if isinstance(value, np.ndarray) and value.size == 1 and value.dtype != object else value
         else:
@@ -258,7 +258,7 @@ def in_progress_series(log, offset):
 
 def in_progress_settings(record):
     """Settings rows describing the trial in progress, one per field."""
-    meaning = "The trial running when ViRMEn saved the log. It isn't in the trials table; its per-iteration data is in processing/in_progress_trial."
+    meaning = "The trial running when ViRMEn saved the log. It isn't in the trials table; its per-iteration data is in processing/behavior, in the in_progress_* series."
     return [(f"derived.in_progress_trial.{name}", encode_setting(value), meaning) for name, value in record.items()]
 
 

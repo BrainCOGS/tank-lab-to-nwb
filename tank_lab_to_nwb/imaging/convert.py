@@ -13,7 +13,7 @@ from pynwb.device import Device
 from pynwb.ophys import OpticalChannel, TwoPhotonSeries
 
 from ..virmen.coerce import coerce
-from ..virmen.convert import PLACEHOLDER_METADATA, build_nwbfile
+from ..virmen.convert import KEYWORDS, PLACEHOLDER_METADATA, build_nwbfile
 from ..virmen.loader import load_log, records
 from ..virmen.session import NormalizedSession, normalize_log
 from .alignment import (
@@ -137,9 +137,9 @@ def _int32(data, field):
 
 def _add_scanimage_tables(nwbfile, prepared):
     acquisition, frames, packets = prepared.acquisition, prepared.acquisition.frames, prepared.acquisition.packets
-    module = nwbfile.create_processing_module("scanimage", "ScanImage's per-frame headers and the I2C packets that align frames to behavior.")
-    module.add(_table("frames", "One row per TIFF page, in acquisition order.", [
-        ("file_index", "Row of the files table this page is in.", _int32(frames["file_index"], "file_index")),
+    module = nwbfile.create_processing_module("ophys", "ScanImage's per-frame headers, the I2C packets that align frames to behavior, and any processed results.")
+    module.add(_table("scanimage_frames", "One row per TIFF page, in acquisition order.", [
+        ("file_index", "Row of the scanimage_files table this page is in.", _int32(frames["file_index"], "file_index")),
         ("page_index", "0-based page within its file.", _int32(frames["page_index"], "page_index")),
         ("frame_number", "frameNumbers.", _int32(frames["frame_number"], "frame_number")),
         ("acquisition_number", "acquisitionNumbers.", _int32(frames["acquisition_number"], "acquisition_number")),
@@ -153,11 +153,11 @@ def _add_scanimage_tables(nwbfile, prepared):
         ("end_of_acquisition_mode", "endOfAcquisitionMode.", _int32(frames["end_of_acquisition_mode"], "end_of_acquisition_mode")),
         ("dc_over_voltage", "dcOverVoltage.", _int32(frames["dc_over_voltage"], "dc_over_voltage")),
         ("behavior_block", "Behavior block as the pipeline's SyncImagingBehavior labels this frame, 0 for none. These labels mark which header got a packet: at a trial's onset, the first labelled frame can have started just before the trial began, or can run up to a frame late. Use the timestamps to find a trial's frames.", _int32(prepared.labels["block"], "behavior_block")),
-        ("behavior_trial", "Behavior trial as the pipeline labels this frame. 0 for none, which includes the frames of the trial running when the log was saved, because the pipeline clears that trial. Its packets are in the i2c_packets table.", _int32(prepared.labels["trial"], "behavior_trial")),
+        ("behavior_trial", "Behavior trial as the pipeline labels this frame. 0 for none, which includes the frames of the trial running when the log was saved, because the pipeline clears that trial. Its packets are in the scanimage_i2c_packets table.", _int32(prepared.labels["trial"], "behavior_trial")),
         ("behavior_iteration", "Per-trial iteration as the pipeline labels this frame, 0 for none.", _int32(prepared.labels["iteration"], "behavior_iteration")),
     ]))
-    module.add(_table("i2c_packets", "Every I2C packet from ViRMEn, as stored in the frame headers.", [
-        ("frame_index", "0-based row of the frames table whose header holds this packet. It can be the frame after the one the packet's time falls in.", _int32(packets["frame_index"], "frame_index")),
+    module.add(_table("scanimage_i2c_packets", "Every I2C packet from ViRMEn, as stored in the frame headers.", [
+        ("frame_index", "0-based row of the scanimage_frames table whose header holds this packet. It can be the frame after the one the packet's time falls in.", _int32(packets["frame_index"], "frame_index")),
         ("timestamp", "Arrival time in seconds on the ScanImage clock.", packets["timestamp"]),
         ("block", "1-based block.", _int32(packets["block"], "block")),
         ("trial", "1-based trial within the block.", _int32(packets["trial"], "trial")),
@@ -166,14 +166,14 @@ def _add_scanimage_tables(nwbfile, prepared):
         ("session_time", "The packet's arrival mapped to this file's time, in seconds since session_start_time.", prepared.packet_times),
         ("used_in_fit", "Whether this packet was used in the fit.", prepared.fit.used),
     ]))
-    module.add(_table("files", "The source TIFFs and their full ScanImage metadata.", [
+    module.add(_table("scanimage_files", "The source TIFFs and their full ScanImage metadata.", [
         ("file_name", "File name.", np.array([file.name for file in acquisition.files], dtype=object)),
         ("n_frames", "Pages in this file.", _int32([file.n_frames for file in acquisition.files], "n_frames")),
         ("software", "The first page's Software tag: all ScanImage settings.", np.array([file.software for file in acquisition.files], dtype=object)),
         ("artist", "The first page's Artist tag: the ROI groups, as JSON.", np.array([file.artist for file in acquisition.files], dtype=object)),
     ]))
     rows = alignment_rows(prepared)
-    module.add(_table("alignment", "How frames were aligned to behavior, and how far to trust it.", [
+    module.add(_table("scanimage_alignment", "How frames were aligned to behavior, and how far to trust it.", [
         ("key", "Name of the value.", np.array([row[0] for row in rows], dtype=object)),
         ("value", "The value, as text.", np.array([row[1] for row in rows], dtype=object)),
         ("meaning", "What the value means.", np.array([row[2] for row in rows], dtype=object)),
@@ -183,11 +183,11 @@ def _add_scanimage_tables(nwbfile, prepared):
 def _add_in_progress(nwbfile, prepared):
     if not prepared.in_progress:
         return
-    module = nwbfile.create_processing_module("in_progress_trial", "The trial running when ViRMEn saved the log, which isn't in the trials table. Unrounded values, per iteration.")
+    module = nwbfile.processing["behavior"]
     clock = None
     for series in prepared.in_progress:
         timing = {"timestamps": clock} if clock is not None else {"timestamps": _compressed(series.timestamps)}
-        built = TimeSeries(name=series.name, data=_compressed(series.data), unit=series.unit, description=series.description, **timing)
+        built = TimeSeries(name=series.name, data=_compressed(series.data), unit=series.unit, description=f"The trial running when ViRMEn saved the log, which isn't in the trials table. Unrounded, per iteration. {series.description}", **timing)
         module.add(built)
         clock = clock or built
 
@@ -224,7 +224,7 @@ def _add_planes(nwbfile, prepared, imaging, max_frames_per_plane):
             dimension=[columns, rows],
             field_of_view=[size * 1e-6 for size in layout.field_of_view_um],
             scan_line_rate=1 / layout.line_period,
-            description=f"Raw frames of plane {plane}, exactly as saved by ScanImage: (time, x, y), where x runs along a scan line. See processing/scanimage/alignment for how far to trust the timestamps.",
+            description=f"Raw frames of plane {plane}, exactly as saved by ScanImage: (time, x, y), where x runs along a scan line. See processing/ophys/scanimage_alignment for how far to trust the timestamps.",
         ))
 
 
@@ -232,6 +232,7 @@ def build_imaging_nwbfile(prepared, metadata=None, imaging=None, max_frames_per_
     """The NWB file for raw imaging with behavior, ready to write. Pixels stream from the TIFFs when it's written."""
     placeholder = {
         **PLACEHOLDER_METADATA,
+        "keywords": [*KEYWORDS, "two-photon calcium imaging", "ScanImage"],
         "experiment_description": "PLACEHOLDER: ViRMEn behavior with raw two-photon imaging. Experimenter, institution, lab and imaging details are not real yet.",
         "session_description": f"ViRMEn behavior with raw two-photon imaging of {prepared.session.lab_meta.get('experiment_name', 'an unnamed experiment')}, aligned frame by frame.",
     }
