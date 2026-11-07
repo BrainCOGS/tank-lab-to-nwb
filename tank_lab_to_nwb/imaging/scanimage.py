@@ -20,7 +20,8 @@ import tifffile
 _FILE_NAME = re.compile(r"^(?P<stem>.*)_(?P<number>\d{5})\.tif$")
 _SPLIT_NAME = re.compile(r"^(?P<stem>.*)_ROI(?P<roi>\d+)_z(?P<depth>\d+)_(?P<number>\d{5})\.tif$")
 _SPLIT_FOLDER_GLOB = "ROI*_z*"
-# The splitter writes times with num2str, to four decimals, so two ROIs' frame times can differ by up to this from a fixed lag.
+# The splitter writes times with num2str, to four decimals. Each stamp is off by up to half of this, so two ROIs' difference
+# can swing over twice this while their lag is fixed.
 _SPLIT_ROUNDING_SECONDS = 1e-4
 STACK_SOURCE = "ScanImage TIFFs, as saved"
 SPLIT_SOURCE = "split per-ROI TIFFs, not the original stack"
@@ -128,6 +129,7 @@ class Acquisition:
     fields: tuple = ()
     source: str = STACK_SOURCE
     completeness: str = "complete"
+    split_packet_changes: int = 0  # I2C packets the splitter changed, because they shared their frame's time
 
     def plane_frames(self, plane):
         """The frame indices of one plane, in time order. A partial last volume gives planes of different lengths."""
@@ -190,13 +192,21 @@ def _common_settings(values, where):
     return n_planes, zs
 
 
-def _scanfield(roi):
-    scanfield = roi["scanfields"]
-    return scanfield[0] if isinstance(scanfield, list) else scanfield
+def _scanfield(roi, where):
+    """A ROI's one scanfield. Several that differ mean its size or place changes with depth, which isn't handled yet."""
+    scanfields = roi["scanfields"]
+    if not isinstance(scanfields, list):
+        return scanfields
+    shared = ("pixelResolutionXY", "sizeXY", "centerXY", "rotationDegrees")
+    if any(any(other.get(key) != scanfields[0].get(key) for key in shared) for other in scanfields[1:]):
+        raise ScanImageError(f"{where}: ROI {roi.get('name')} has scanfields that differ by depth, which isn't handled yet")
+    return scanfields[0]
 
 
-def _geometry(scanfield, z, degrees_to_um):
-    """(size, pixel size, top-left origin) of a scanfield, in micrometers, with the plane's z in the origin."""
+def _geometry(scanfield, z, degrees_to_um, where):
+    """(size, pixel size, origin) of a scanfield, in micrometers. The origin is the outer corner of its first pixel, with the plane's z."""
+    if scanfield.get("rotationDegrees", 0):
+        raise ScanImageError(f"{where}: a scanfield is rotated by {scanfield['rotationDegrees']} degrees, which the stored geometry can't express")
     columns, rows = (int(v) for v in scanfield["pixelResolutionXY"])
     size_x, size_y = (float(v) * degrees_to_um for v in scanfield["sizeXY"])
     center_x, center_y = (float(v) * degrees_to_um for v in scanfield.get("centerXY", (0.0, 0.0)))
@@ -217,7 +227,7 @@ def _stack_rois(raw_rois, zs, page_shape, degrees_to_um, where):
         if not here:
             raise ScanImageError(f"{where}: plane {plane} at z = {z:g} has no ROI")
         used.update(number for number, _ in here)
-        heights = [int(_scanfield(roi)["pixelResolutionXY"][1]) for _, roi in here]
+        heights = [int(_scanfield(roi, where)["pixelResolutionXY"][1]) for _, roi in here]
         spare = page_rows - sum(heights)
         gaps = len(here) - 1
         if spare < 0 or (gaps and spare % gaps) or (not gaps and spare):
@@ -225,10 +235,10 @@ def _stack_rois(raw_rois, zs, page_shape, degrees_to_um, where):
         gap = spare // gaps if gaps else 0
         row, plane_flyback = 0, []
         for (number, roi), height in zip(here, heights):
-            scanfield = _scanfield(roi)
+            scanfield = _scanfield(roi, where)
             if int(scanfield["pixelResolutionXY"][0]) != page_columns:
                 raise ScanImageError(f"{where}: ROI {number} is {scanfield['pixelResolutionXY'][0]} pixels wide on a {page_columns}-column page")
-            size, pixel, origin = _geometry(scanfield, z, degrees_to_um)
+            size, pixel, origin = _geometry(scanfield, z, degrees_to_um, where)
             placed.append(Roi(number, roi.get("name") or f"ROI{number:02d}", plane, (row, row + height), size, pixel, origin))
             row += height
             if len(plane_flyback) < gaps:
@@ -251,14 +261,14 @@ def _layout(software, artist, where, page_shape=None):
         raise ScanImageError(f"{where}: {len(raw_rois)} ROIs in one page, but mroiEnable is off, so the rows can't be placed")
     degrees_to_um = _number(values, "objectiveResolution", where)
     if len(raw_rois) == 1:
-        scanfield = _scanfield(raw_rois[0])
+        scanfield = _scanfield(raw_rois[0], where)
         columns, rows = (int(v) for v in scanfield["pixelResolutionXY"])
         if rows != int(_number(values, "hRoiManager.linesPerFrame", where)):
             raise ScanImageError(f"{where}: hRoiManager.linesPerFrame disagrees with the ROI's {rows} lines")
         if columns != int(_number(values, "hRoiManager.pixelsPerLine", where)):
             raise ScanImageError(f"{where}: hRoiManager.pixelsPerLine disagrees with the ROI's {columns} pixels")
         rois = tuple(
-            Roi(1, raw_rois[0].get("name") or "ROI01", plane, (0, rows), *_geometry(scanfield, z, degrees_to_um)) for plane, z in enumerate(zs)
+            Roi(1, raw_rois[0].get("name") or "ROI01", plane, (0, rows), *_geometry(scanfield, z, degrees_to_um, where)) for plane, z in enumerate(zs)
         )
         flyback = {plane: () for plane in range(n_planes)}
         frame_shape = (rows, columns)
@@ -322,6 +332,8 @@ def _read_file(path, need_metadata=True):
         tif.pages.cache = False
         tif.pages.useframes = False
         file_size = path.stat().st_size
+        if not len(tif.pages):
+            raise ScanImageError(f"{path.name}: no pages")
         first = tif.pages[0]
         tags = first.tags
         if need_metadata and ("Software" not in tags or "Artist" not in tags):
@@ -373,14 +385,18 @@ def _sorted_files(paths):
     return [path for _, _, path in numbered]
 
 
-def _completeness(files, layout, allow_incomplete):
-    """Whether every file of the acquisition is here. A full last file may have had more after it, unless every requested
-    volume is already here. ScanImage's end-of-acquisition field reads 0 on the frames of the data seen so far, so it can't settle this."""
-    if files[-1].n_frames < layout.frames_per_file:
-        return "complete: the last file is short, so the acquisition ended in it"
-    if sum(file.n_frames for file in files) == layout.n_volumes * layout.n_planes:
+def _completeness(total, last_name, last_is_short, layout, allow_incomplete):
+    """What these files can say about being the whole acquisition. ScanImage's end-of-acquisition field reads 0 on the last
+    frame of the data seen so far, so nothing marks the end: a short last file fits an acquisition stopped early, but it would
+    also fit one cut off on a page boundary or with later files removed. A full one may have had more after it."""
+    requested = layout.n_volumes * layout.n_planes
+    if total > requested:
+        raise ScanImageError(f"{total} frames, but the header requested {requested:g}, so these aren't one acquisition's files")
+    if total == requested:
         return "complete: every requested volume is here"
-    reason = f"{files[-1].name} is full, with {files[-1].n_frames} frames, and fewer volumes than requested are here, so later files may be missing"
+    if last_is_short:
+        return "no gap found: frames run in order and the last file is short, as when an acquisition is stopped early. That's not proof, since nothing in the files marks the end."
+    reason = f"{last_name} is full, and fewer volumes than requested are here, so later files may be missing"
     if not allow_incomplete:
         raise ScanImageError(f"{reason}. Pass allow_incomplete to convert what's here anyway.")
     return f"not confirmed: {reason}"
@@ -453,7 +469,7 @@ def _read_stack(paths, allow_incomplete):
         packet_rows.extend((frame + offset, *rest) for frame, *rest in packets)
         frame_rows.extend(rows)
         files.append(SourceFile(path=path, n_frames=len(rows), software=software, artist=artist))
-    completeness = _completeness(files, layout, allow_incomplete)
+    completeness = _completeness(len(frame_rows), files[-1].name, files[-1].n_frames < layout.frames_per_file, layout, allow_incomplete)
     frames = _frame_table(frame_rows)
     return Acquisition(
         files=files, frames=frames, packets=_packet_table(packet_rows), epoch=epoch, layout=layout, dtype=np.dtype(dtype),
@@ -535,11 +551,30 @@ def _check_same_frames(first, other):
     for name in _SHARED_COLUMNS:
         if [row[name] for row in other.rows] != [row[name] for row in first.rows]:
             raise ScanImageError(f"{other.label} and {first.label} disagree about {name}")
-    if other.packets != first.packets:
-        raise ScanImageError(f"{other.label} and {first.label} disagree about the I2C data")
     differences = np.array([b["timestamp"] - a["timestamp"] for a, b in zip(first.rows, other.rows)])
-    if differences.size and differences.max() - differences.min() > _SPLIT_ROUNDING_SECONDS + 1e-9:
+    if differences.size and differences.max() - differences.min() > 2 * _SPLIT_ROUNDING_SECONDS + 1e-9:
         raise ScanImageError(f"{other.label}'s frame times don't follow {first.label}'s by a fixed lag")
+    return _changed_packets(first, other)
+
+
+def _changed_packets(first, other):
+    """How many I2C packets differ in time only because the splitter's replace also caught them.
+
+    It replaces the frame's old time anywhere in the header, so a packet stamped with exactly that time takes each ROI's new
+    frame time. Anything else that differs is real disagreement.
+    """
+    if len(other.packets) != len(first.packets):
+        raise ScanImageError(f"{other.label} and {first.label} disagree about the I2C data: {len(other.packets)} and {len(first.packets)} packets")
+    changed = 0
+    for mine, theirs in zip(first.packets, other.packets):
+        same_packet = mine[0] == theirs[0] and mine[2:] == theirs[2:]
+        if same_packet and mine[1] == theirs[1]:
+            continue
+        caught = same_packet and mine[1] == first.rows[mine[0]]["timestamp"] and theirs[1] == other.rows[theirs[0]]["timestamp"]
+        if not caught:
+            raise ScanImageError(f"{other.label} and {first.label} disagree about the I2C data at frame {first.rows[mine[0]]['frame_number']}")
+        changed += 1
+    return changed
 
 
 def _split_rois(groups, software, artist, where):
@@ -547,10 +582,17 @@ def _split_rois(groups, software, artist, where):
     if not software or not artist:
         return {key: Roi(key[1], f"ROI{key[1]:02d}", key[0] - 1, (0, group.shape[0])) for key, group in groups.items()}, None
     values = _header_values(software)
-    n_planes, _ = _common_settings(values, where)
+    _, zs = _common_settings(values, where)
     raw_rois = _rois(artist, where)
     degrees_to_um = _number(values, "objectiveResolution", where)
+    # The splitter numbers its depth folders in ascending z, while frames cycle through the planes in the header's order.
     depths = sorted({z for roi in raw_rois for z in _roi_zs(roi)})
+    if tuple(depths) != tuple(zs):
+        raise ScanImageError(f"{where}: the depth folders run in ascending z, {depths}, but the header's planes are {list(zs)}, so they can't be matched")
+    for depth, z in enumerate(depths, start=1):
+        for number, raw in enumerate(raw_rois, start=1):
+            if z in _roi_zs(raw) and (depth, number) not in groups:
+                raise ScanImageError(f"{where}: the ScanImage settings have ROI {number} at depth {depth}, but no files were given for it")
     rois = {}
     for key, group in groups.items():
         depth, number = key
@@ -560,11 +602,11 @@ def _split_rois(groups, software, artist, where):
         z = depths[depth - 1]
         if z not in _roi_zs(raw):
             raise ScanImageError(f"{group.label}: ROI {number} isn't at depth {depth}, z = {z:g}")
-        scanfield = _scanfield(raw)
+        scanfield = _scanfield(raw, group.label)
         columns, rows = (int(v) for v in scanfield["pixelResolutionXY"])
         if (rows, columns) != tuple(group.shape):
             raise ScanImageError(f"{group.label}: pages are {group.shape}, but the ROI is {rows} rows by {columns} pixels wide, so it may have been summed when split")
-        rois[key] = Roi(number, raw.get("name") or f"ROI{number:02d}", depth - 1, (0, rows), *_geometry(scanfield, z, degrees_to_um))
+        rois[key] = Roi(number, raw.get("name") or f"ROI{number:02d}", depth - 1, (0, rows), *_geometry(scanfield, z, degrees_to_um, group.label))
     return rois, values
 
 
@@ -607,9 +649,14 @@ def _read_split(paths, allow_incomplete):
     first_at_depth = {}
     for (depth, _), group in groups.items():
         first_at_depth.setdefault(depth, group)
+    n_depths = len(first_at_depth)
+    changed_packets = 0
     for (depth, _), group in groups.items():
+        for row in group.rows:
+            if (row["frame_number"] - 1) % n_depths != depth - 1:
+                raise ScanImageError(f"{group.label}: frame {row['frame_number']} belongs to depth {(row['frame_number'] - 1) % n_depths + 1} of {n_depths}, so this folder's depth is wrong")
         if group is not first_at_depth[depth]:
-            _check_same_frames(first_at_depth[depth], group)
+            changed_packets = max(changed_packets, _check_same_frames(first_at_depth[depth], group))
     frame_rows, packet_rows = [], []
     for group in first_at_depth.values():
         frame_rows.extend(group.rows)
@@ -628,21 +675,14 @@ def _read_split(paths, allow_incomplete):
     layout = _split_layout(groups, rois, values, where, first_times)
     frames = _frame_table(frame_rows)
     if values is None:
-        reason = "these split files kept no ScanImage settings, so nothing says how many files there should be"
+        reason = "these split files kept no ScanImage settings, so nothing says how many files there should be or which ROIs there were"
         if not allow_incomplete:
             raise ScanImageError(f"{reason}. Pass allow_incomplete to convert what's here anyway.")
         completeness = f"not confirmed: {reason}"
     else:
-        any_group = next(iter(first_at_depth.values()))
-        depth_files = [SourceFile(path=files[index].path, n_frames=count, software="", artist="") for index, count in zip(sorted({row["file_index"] for row in any_group.rows}), any_group.page_counts)]
-        total = frames["frame_number"].size
-        last_short = depth_files[-1].n_frames * layout.n_planes < layout.frames_per_file
-        if last_short or total == layout.n_volumes * layout.n_planes:
-            completeness = "complete: the last file is short, or every requested volume is here"
-        elif allow_incomplete:
-            completeness = f"not confirmed: {depth_files[-1].name} is full, so later files may be missing"
-        else:
-            raise ScanImageError(f"{depth_files[-1].name} is full, and fewer volumes than requested are here, so later files may be missing. Pass allow_incomplete to convert what's here anyway.")
+        last_group = next(iter(first_at_depth.values()))
+        last_file = sorted({row["file_index"] for row in last_group.rows})[-1]
+        completeness = _completeness(frames["frame_number"].size, files[last_file].name, last_group.page_counts[-1] * layout.n_planes < layout.frames_per_file, layout, allow_incomplete)
     several = len({number for _, number in groups}) > 1
     fields = []
     for key, group in groups.items():
@@ -660,7 +700,7 @@ def _read_split(paths, allow_incomplete):
         ))
     return Acquisition(
         files=files, frames=frames, packets=_packet_table(packet_rows), epoch=epochs.pop(), layout=layout, dtype=np.dtype(dtypes.pop()),
-        fields=tuple(fields), source=SPLIT_SOURCE, completeness=completeness,
+        fields=tuple(fields), source=SPLIT_SOURCE, completeness=completeness, split_packet_changes=changed_packets,
     )
 
 

@@ -162,7 +162,10 @@ def split_stack(paths, folder, rois, zs=(10,), lag=0.001, keep_tags=False, softw
                     for position, page in enumerate(pages):
                         text = page.description
                         old = text.split("frameTimestamps_sec = ")[1].split("\n")[0]
-                        text = text.replace(old, _matlab_number(float(old) + lag * lag_steps))
+                        new = _matlab_number(float(old) + lag * lag_steps)
+                        head, packets = text.split("I2CData = ")
+                        # A whole number would also hit fields like nextFileMarker = -1.000000000, which real times don't.
+                        text = head.replace(f"frameTimestamps_sec = {old}", f"frameTimestamps_sec = {new}") + "I2CData = " + packets.replace(old, new)
                         pixels = np.clip(page.asarray()[row : row + roi["rows"]], 0, None).astype("uint16")
                         options = {}
                         if keep_tags and position == 0:

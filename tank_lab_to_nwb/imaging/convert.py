@@ -216,6 +216,8 @@ def _add_field(nwbfile, prepared, field, channel, device, imaging, limit):
     depth = layout.zs_um[field.plane]
     place = f"ROI {field.name}, on plane {field.plane} of {layout.n_planes}" if field.label != f"Plane{field.plane}" else f"Plane {field.plane} of {layout.n_planes}"
     at = "at an unknown z, because the split files kept no ScanImage settings" if np.isnan(depth) else f"at ScanImage z = {depth:g} um"
+    if field.origin_um is not None and field.label != f"Plane{field.plane}":
+        at += ". origin_coords is the outer corner of the first pixel, in ScanImage's reference space, not a measured brain position"
     plane_options = {}
     if field.pixel_size_um is not None:
         plane_options.update(grid_spacing=list(field.pixel_size_um), grid_spacing_unit="micrometers")

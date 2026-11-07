@@ -534,10 +534,19 @@ class TestReviewFindings:
 
     def test_a_file_boundary_inside_a_volume_is_refused_when_the_splitter_restarted_its_cycle(self, tmp_path):
         rois = [dict(rows=3, z=10), dict(rows=3, z=50)]
-        stack = write_stack(tmp_path, 7, rois, zs=(10, 50), page_rows=3, frames_per_file=3)
+        stack = write_stack(tmp_path, 8, rois, zs=(10, 50), page_rows=3, frames_per_file=3)
         parts = split_stack(stack, tmp_path / "split", rois, zs=(10, 50), file_local_depth=True)
         with pytest.raises(ScanImageError, match="depth|frame"):
             read_acquisition(parts, allow_incomplete=True)
+
+    def test_a_tiff_with_no_pages_is_an_error_not_a_crash(self, tmp_path):
+        import tifffile
+
+        path = tmp_path / "mouse_00001_00001.tif"
+        with tifffile.TiffWriter(path):
+            pass
+        with pytest.raises(ScanImageError, match="no pages"):
+            read_acquisition([path])
 
     def test_settings_whose_depths_are_not_ascending_are_refused_for_split_files(self, tmp_path):
         rois = [dict(rows=3, z=50), dict(rows=3, z=10)]
