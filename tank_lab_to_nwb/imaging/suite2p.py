@@ -110,18 +110,53 @@ def _companion_rows(companion):
     ] if companion else []
 
 
+def _recorded_values(file):
+    """What ScanImage and the session recorded that pins down one acquisition, as stored in an NWB file."""
+    from datetime import datetime
+
+    from .verify import _alignment_values
+
+    ophys = file["processing/ophys"]
+    return {
+        "session_start_time": datetime.fromisoformat(file["session_start_time"].asstr()[()]),
+        "scanimage.epoch": _alignment_values(ophys["scanimage_alignment"]).get("scanimage.epoch"),
+        "file_name": list(ophys["scanimage_files/file_name"].asstr()[()]),
+        "n_frames": ophys["scanimage_files/n_frames"][()].tolist(),
+        "frame_number": ophys["scanimage_frames/frame_number"][()],
+        "timestamp": ophys["scanimage_frames/timestamp"][()],
+    }
+
+
+def _expected_values(prepared):
+    acquisition = prepared.acquisition
+    return {
+        "session_start_time": prepared.session.session_start_time,
+        "scanimage.epoch": acquisition.epoch,
+        "file_name": [file.name for file in acquisition.files],
+        "n_frames": [file.n_frames for file in acquisition.files],
+        "frame_number": acquisition.frames["frame_number"],
+        "timestamp": acquisition.frames["timestamp"],
+    }
+
+
+def _same(stored, expected):
+    if isinstance(expected, np.ndarray):
+        return stored.shape == expected.shape and np.array_equal(stored, expected)
+    return stored == expected
+
+
 def read_companion(raw_nwb, prepared):
     """What ties a raw TIFF file to this one. Refuses a file from another acquisition or on another clock."""
     import h5py
 
-    from .alignment import AlignmentError, acquisition_id
-    from .verify import _alignment_values
+    from .alignment import AlignmentError
 
     with h5py.File(raw_nwb, "r") as file:
-        scanimage = file["processing/ophys"]
-        if _alignment_values(scanimage["scanimage_alignment"]).get("acquisition.id") != acquisition_id(prepared.acquisition):
-            raise AlignmentError(f"{raw_nwb}: this file comes from another acquisition")
-        if not np.array_equal(scanimage["scanimage_frames/session_time"][()], prepared.frame_times):
+        stored = _recorded_values(file)
+        for name, expected in _expected_values(prepared).items():
+            if not _same(stored[name], expected):
+                raise AlignmentError(f"{raw_nwb}: its {name} differs, so it comes from another acquisition")
+        if not np.array_equal(file["processing/ophys/scanimage_frames/session_time"][()], prepared.frame_times):
             raise AlignmentError(f"{raw_nwb}: its frame times differ, so the two files aren't on the same clock")
         identifier = file["identifier"].asstr()[()]
     digest = hashlib.sha256()
@@ -131,7 +166,8 @@ def read_companion(raw_nwb, prepared):
     return dict(
         identifier=identifier,
         sha256=digest.hexdigest(),
-        relation="Raw frames of the same acquisition, on the same clock: acquisition.id and every frame time were checked against that file when this one was written.",
+        relation="Raw frames of the same acquisition, on the same clock. When this file was written, that file's session_start_time, "
+        "scanimage.epoch, TIFF names and page counts, and every frame's number, ScanImage time and session time matched this one's.",
     )
 
 
@@ -164,7 +200,8 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
         "Per-plane Suite2p folders define lengths; combined contains padded display traces. "
         "Original Suite2p artifacts except data.bin are preserved byte-for-byte in scratch; object NPY files require a trusted pickle reader. "
         f"registration.do_bidiphase is {planes[0]['settings']['registration'].get('do_bidiphase')} in the Suite2p settings. "
-        "Files of this acquisition share acquisition.id in that table; processing/ophys/scanimage_alignment names the raw file in its companion rows, when it was given."
+        "Files of this acquisition share session_start_time, scanimage.epoch, the scanimage_files names and page counts, and the scanimage_frames numbers and times; "
+        "processing/ophys/scanimage_alignment names the raw file in its companion rows, when it was given."
     )
     _add_scanimage_tables(nwb, prepared, _companion_rows(companion))
     _add_in_progress(nwb, prepared)

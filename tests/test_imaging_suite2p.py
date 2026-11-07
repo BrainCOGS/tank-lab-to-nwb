@@ -367,7 +367,8 @@ def test_the_raw_file_it_goes_with_is_recorded(tmp_path, log, tiffs, run, raw_fi
     output = tmp_path / "s2p.nwb"
     convert_suite2p(log, tiffs, run, output, file="session.mat", raw_nwb=raw_file)
     values = _alignment(output)
-    assert values["acquisition.id"] == _alignment(raw_file)["acquisition.id"]
+    assert not any(key.startswith("acquisition.id") for key in values)
+    assert values["scanimage.epoch"] == _alignment(raw_file)["scanimage.epoch"]
     with h5py.File(raw_file, "r") as raw, h5py.File(output, "r") as file:
         assert values["companion.rawtiff.identifier"] == raw["identifier"].asstr()[()]
         assert values["companion.rawtiff.identifier"] != file["identifier"].asstr()[()]
@@ -380,12 +381,33 @@ def test_no_raw_file_means_no_companion_rows(tmp_path, log, tiffs, run):
     assert not [key for key in _alignment(output) if key.startswith("companion.")]
 
 
-def test_a_raw_file_from_another_acquisition_is_refused(tmp_path, log, tiffs, run, raw_file):
+def _set_alignment(file, key, value):
+    table = file["processing/ophys/scanimage_alignment"]
+    table["value"][list(table["key"].asstr()[()]).index(key)] = value
+
+
+def _bump(dataset, position, step):
+    dataset[position] = dataset[position] + step
+
+
+ANOTHER_ACQUISITION = {
+    "scanimage.epoch": lambda file: _set_alignment(file, "scanimage.epoch", "[2026 1 1 0 0 0]"),
+    "file_name": lambda file: _bump(file["processing/ophys/scanimage_files/file_name"], 0, b"x"),
+    "n_frames": lambda file: _bump(file["processing/ophys/scanimage_files/n_frames"], 0, 1),
+    "frame_number": lambda file: _bump(file["processing/ophys/scanimage_frames/frame_number"], 3, 1),
+    "timestamp": lambda file: _bump(file["processing/ophys/scanimage_frames/timestamp"], 3, 1e-9),
+    "session_start_time": lambda file: file["session_start_time"].write_direct(
+        np.array(file["session_start_time"].asstr()[()].replace(":00", ":01", 1).encode(), dtype=file["session_start_time"].dtype)),
+}
+
+
+@pytest.mark.parametrize("value", sorted(ANOTHER_ACQUISITION))
+def test_a_raw_file_from_another_acquisition_is_refused(tmp_path, log, tiffs, run, raw_file, value):
     with h5py.File(raw_file, "r+") as file:
-        table = file["processing/ophys/scanimage_alignment"]
-        keys = list(table["key"].asstr()[()])
-        table["value"][keys.index("acquisition.id")] = "another"
-    with pytest.raises(AlignmentError, match="another acquisition"):
+        before = file["session_start_time"].asstr()[()]
+        ANOTHER_ACQUISITION[value](file)
+        assert value != "session_start_time" or file["session_start_time"].asstr()[()] != before
+    with pytest.raises(AlignmentError, match=f"its {value} differs.*another acquisition"):
         convert_suite2p(log, tiffs, run, tmp_path / "s2p.nwb", file="session.mat", raw_nwb=raw_file)
 
 

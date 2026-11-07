@@ -12,10 +12,11 @@ The output is `OUTPUT_DIR/staging/suite2p.nwb`, with a report beside it. Organiz
 `virmen.layout.organize_for_dandi(staging, dandiset, description="suite2p")` before local DANDI validation. It can share a
 dandiset with the raw file, named with `description="rawtiff"`: the two get the same subject and session and differ by `desc-`.
 
-The two files are tied together in three ways. Both carry the same `subject_id` and `session_id`, and the same `acquisition.id`
-in `processing/ophys/scanimage_alignment`. With `--raw-nwb`, this converter also checks that the raw file has that `acquisition.id` and
-exactly the same frame times, refusing it otherwise, and records its NWB identifier and SHA256 in
-its `companion.rawtiff.*` rows. The raw file can't name this one, because it's written first.
+The two files are tied together by what was recorded, not by a derived ID. Both carry the same `subject_id`, `session_id` and
+`session_start_time`, and the same ScanImage record in `processing/ophys`: `scanimage.epoch`, the TIFF names and page counts, and
+every frame's number and time. With `--raw-nwb`, this converter checks all of those against the raw file, plus every frame's
+session time, refusing the file if any differs, and records its NWB identifier and SHA256 in its `companion.rawtiff.*` rows.
+The raw file can't name this one, because it's written first.
 
 ## Alignment and what it means
 
