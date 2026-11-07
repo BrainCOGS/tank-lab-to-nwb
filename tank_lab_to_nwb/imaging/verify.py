@@ -71,12 +71,6 @@ def _read_headers(tiff_paths):
     return dict(columns={name: np.array(values) for name, values in columns.items()}, packets=packets, epochs=epochs, files=files)
 
 
-def _read_sources(tiff_paths):
-    """Frame numbers, times and packets, parsed here from the raw descriptions."""
-    headers = _read_headers(tiff_paths)
-    return headers["columns"]["frame_number"], headers["columns"]["timestamp"], headers["packets"]
-
-
 def _check_packets(table, packets):
     stored = np.column_stack([table[name][()] for name in ("frame_index", "timestamp", "block", "trial", "iteration")]) if packets else np.zeros((0, 5))
     expected = np.array(packets, dtype="float64") if packets else np.zeros((0, 5))
