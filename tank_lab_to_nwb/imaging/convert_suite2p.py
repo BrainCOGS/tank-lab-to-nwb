@@ -47,7 +47,7 @@ def artifact_inventory(root):
 
             entry["fields"] = {name: dict(shape=list(shape), matlab_class=kind) for name, shape, kind in whosmat(path)}
         result[str(path.relative_to(root))] = entry
-    for path in sorted(Path(root).glob("plane*/data.bin")):
+    for path in sorted(Path(root).rglob("data.bin")):
         result[str(path.relative_to(root))] = dict(
             bytes=path.stat().st_size,
             storage="excluded: registered movie stays external; sampled reconstruction evidence stored in NWB",

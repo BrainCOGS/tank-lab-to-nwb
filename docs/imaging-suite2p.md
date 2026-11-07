@@ -45,6 +45,11 @@ border replication. The final integer conversion truncates toward zero. Normaliz
 an intensity scaling of saved frames. NumPy/SciPy reconstruction can differ from CUDA interpolation at integer rounding
 boundaries; its RMSE is measured separately from the byte-exact NWB round trip.
 
+The same samples tie the traces to those frames. `F.npy` at frame `i` must equal what Suite2p's extraction gives on registered frame
+`i`: each ROI's normalized `lam` over its pixels, leaving out `overlap` pixels unless `allow_overlap` is set. The RMSE must be at
+most 0.01, and registered frames `i-1` and `i+1` must be more than ten times worse. A sampled frame where no ROI has a value isn't
+measured. `Fneu` and `spks` aren't recomputed; they're tied to `F` only by order and length.
+
 For each sampled registered frame, neighboring raw pages **within that plane** (`i-1` and `i+1`) are transformed with
 the same target-frame offsets. Each available control must have more than ten times the reconstruction RMSE (with a
 0.01-unit floor), and the reconstruction RMSE must be at most two intensity units. Failure stops conversion. This is

@@ -46,11 +46,41 @@ def reconstruct_frame(raw, registration, settings, index):
     return interpolated.astype("int16")  # torch.short truncates toward zero
 
 
-def prove_frame_mapping(acquisition, root, samples_per_file=3):
-    """Check each plane's first/last pages of every file and interior samples, with ±1 controls.
+def is_separated(errors, limit):
+    """Whether the match in errors["0"] is within `limit` and every neighbor is more than ten times worse."""
+    return errors["0"] <= limit and all(value > 10 * max(errors["0"], 0.01) for key, value in errors.items() if key != "0")
 
-    Returns per-sample evidence. Refuses mapping if reconstruction RMSE exceeds 2
-    intensity units or either valid neighboring-page control is less than 10x worse.
+
+def predict_traces(frame, stat, allow_overlap):
+    """What Suite2p's extraction gives for each ROI on one registered frame: normalized weights over its pixels."""
+    traces = np.zeros(len(stat), dtype="float32")
+    for index, roi in enumerate(stat):
+        keep = np.ones(len(roi["xpix"]), dtype=bool) if allow_overlap or "overlap" not in roi else ~np.asarray(roi["overlap"], dtype=bool)
+        weights = np.asarray(roi["lam"], dtype="float32")[keep]
+        if weights.size:
+            traces[index] = np.asarray(frame[roi["ypix"][keep], roi["xpix"][keep]], dtype="float32") @ (weights / weights.sum())
+    return traces
+
+
+def _trace_errors(movie, trace_at_frame, stat, allow_overlap, frame):
+    """RMSE of the saved traces at this frame against those predicted from it and its neighbors, or None if none has a value."""
+    finite = np.isfinite(trace_at_frame)
+    if not finite.any():
+        return None
+    errors = {}
+    for delta in (-1, 0, 1):
+        if 0 <= frame + delta < len(movie):
+            predicted = predict_traces(movie[frame + delta], stat, allow_overlap)
+            errors[str(delta)] = float(np.sqrt(np.mean((predicted[finite].astype("float64") - trace_at_frame[finite]) ** 2)))
+    return errors
+
+
+def prove_frame_mapping(acquisition, root):
+    """Check each plane's first, middle and last pages of every file, with ±1 controls, in two links.
+
+    TIFF page to registered frame: reconstruction RMSE at most 2 intensity units. Registered frame to F.npy: traces
+    recomputed from the frame within 0.01. In both, each neighboring frame must be more than ten times worse, or the
+    conversion is refused. Returns per-sample evidence. Fneu and spks aren't recomputed; they share F's order and length.
     This is sampled evidence across every file, not an assertion that every pixel was checked.
     """
     from pathlib import Path
@@ -61,7 +91,11 @@ def prove_frame_mapping(acquisition, root, samples_per_file=3):
     for plane in range(acquisition.layout.n_planes):
         folder = root / f"plane{plane}"
         reg = np.load(folder / "reg_outputs.npy", allow_pickle=True).item()
-        settings = np.load(folder / "settings.npy", allow_pickle=True).item()["registration"]
+        all_settings = np.load(folder / "settings.npy", allow_pickle=True).item()
+        settings = all_settings["registration"]
+        allow_overlap = all_settings.get("extraction", {}).get("allow_overlap", False)
+        stat = np.load(folder / "stat.npy", allow_pickle=True)
+        traces = np.load(folder / "F.npy", mmap_mode="r")
         indices = acquisition.plane_frames(plane)
         movie = np.memmap(
             folder / "data.bin", mode="r", dtype="int16", shape=(len(indices), *acquisition.layout.frame_shape)
@@ -71,7 +105,8 @@ def prove_frame_mapping(acquisition, root, samples_per_file=3):
         positions = []
         for file in range(len(acquisition.files)):
             inside = np.flatnonzero(acquisition.frames["file_index"][indices] == file)
-            positions.extend(np.linspace(inside[0], inside[-1], max(3, samples_per_file), dtype=int))
+            if inside.size:  # a recording can stop before reaching this plane in the last file
+                positions.extend(np.linspace(inside[0], inside[-1], 3, dtype=int))
         for i in sorted(set(positions)):
             errors = {}
             for delta in (-1, 0, 1):
@@ -81,10 +116,11 @@ def prove_frame_mapping(acquisition, root, samples_per_file=3):
                 predicted = reconstruct_frame(raw, reg, settings, i)
                 diff = predicted.astype("float64") - movie[i]
                 errors[str(delta)] = float(np.sqrt(np.mean(diff**2)))
-            if errors["0"] > 2 or any(
-                value <= 10 * max(errors["0"], 0.01) for key, value in errors.items() if key != "0"
-            ):
+            if not is_separated(errors, limit=2):
                 raise ValueError(f"plane {plane}, frame {i}: frame mapping not demonstrated: {errors}")
+            trace_errors = _trace_errors(movie, np.asarray(traces[:, i]), stat, allow_overlap, i) if len(stat) else None
+            if trace_errors is not None and not is_separated(trace_errors, limit=0.01):
+                raise ValueError(f"plane {plane}, frame {i}: traces don't match the registered movie: {trace_errors}")
             evidence.append(
                 dict(
                     plane=plane,
@@ -93,6 +129,7 @@ def prove_frame_mapping(acquisition, root, samples_per_file=3):
                     file_index=int(acquisition.frames["file_index"][indices[i]]),
                     page_index=int(acquisition.frames["page_index"][indices[i]]),
                     rmse=errors,
+                    trace_rmse=trace_errors,
                 )
             )
     return evidence

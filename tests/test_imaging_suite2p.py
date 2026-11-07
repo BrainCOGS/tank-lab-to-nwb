@@ -453,7 +453,7 @@ def test_traces_that_do_not_match_the_registered_movie_are_refused(tmp_path, log
 
 def test_the_evidence_records_trace_errors_with_controls(log, tiffs, run):
     evidence = prove_frame_mapping(prepare_session(log, tiffs, file="session.mat").acquisition, run)
-    middle = next(sample for sample in evidence if sample["frame"] == 200)
+    middle = next(sample for sample in evidence if sample["plane"] == 0 and sample["frame"] > 0)
     assert middle["trace_rmse"]["0"] == 0
     assert middle["trace_rmse"]["-1"] > 1 and middle["trace_rmse"]["1"] > 1
 
@@ -471,7 +471,7 @@ def test_predicted_traces_use_normalized_weights_and_leave_out_overlaps():
     frame = np.arange(12, dtype="int16").reshape(3, 4)
     roi = dict(xpix=np.array([0, 1, 2]), ypix=np.array([1, 1, 1]), lam=np.array([1.0, 3.0, 8.0], dtype="float32"), overlap=np.array([False, False, True]))
     assert predict_traces(frame, [roi], allow_overlap=False).tolist() == [(4 * 1 + 5 * 3) / 4]
-    assert predict_traces(frame, [roi], allow_overlap=True).tolist() == [(4 * 1 + 5 * 3 + 6 * 8) / 12]
+    assert predict_traces(frame, [roi], allow_overlap=True).tolist() == pytest.approx([(4 * 1 + 5 * 3 + 6 * 8) / 12], rel=1e-6)  # float32, as in Suite2p
 
 
 def test_a_roi_without_overlap_recorded_counts_every_pixel():

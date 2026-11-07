@@ -1,5 +1,7 @@
 """Read per-plane Suite2p results without importing Suite2p or torch."""
 
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -64,8 +66,6 @@ def load_suite2p(root, prepared):
 
 
 def _json_value(value):
-    import json
-
     def numeric(item):
         if isinstance(item, np.ndarray):
             return item.tolist()
@@ -81,6 +81,20 @@ def _sources(root):
     return sorted(p for p in Path(root).rglob("*") if p.is_file() and p.name != "data.bin")
 
 
+def _artifact_bytes(path):
+    """A file's bytes without reading it all into memory. A zero-byte file can't be memory-mapped."""
+    return np.memmap(path, mode="r", dtype="uint8") if path.stat().st_size else np.zeros(0, dtype="uint8")
+
+
+def _flatten_settings(prefix, value):
+    """Every leaf of a nested settings dictionary, named by its path."""
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            yield from _flatten_settings(f"{prefix}.{key}", inner)
+    else:
+        yield prefix, value
+
+
 _COMPANION_COLUMNS = {
     "desc": "The file's desc- value in its DANDI name.",
     "identifier": "That file's NWB identifier.",
@@ -92,7 +106,6 @@ _COMPANION_COLUMNS = {
 def read_companion(raw_nwb, prepared):
     """What ties a raw TIFF file to this one. Refuses a file from another acquisition or on another clock."""
     import h5py
-    import hashlib
 
     from .alignment import AlignmentError, acquisition_id
     from .verify import _alignment_values
@@ -118,7 +131,6 @@ def read_companion(raw_nwb, prepared):
 
 def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion=None):
     """Build ophys interfaces plus a byte-exact source archive for fields without an NWB equivalent."""
-    import hashlib
     from hdmf.backends.hdf5.h5_utils import H5DataIO
     from hdmf.common import ElementIdentifiers
     from pynwb import TimeSeries
@@ -144,7 +156,7 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
         "session-start shift and frame-time fit. Raw pixels are external and are not duplicated here. "
         "Per-plane Suite2p folders define lengths; combined contains padded display traces. "
         "Original Suite2p artifacts except data.bin are preserved byte-for-byte in scratch; object NPY files require a trusted pickle reader. "
-        "registration.do_bidiphase is False, as configured, on this bidirectionally scanned rig. "
+        f"registration.do_bidiphase is {planes[0]['settings']['registration'].get('do_bidiphase')} in the Suite2p settings. "
         "Files of this acquisition share acquisition.id in processing/scanimage/alignment; processing/scanimage/companion_files names the raw file when it was given."
     )
     _add_scanimage_tables(nwb, prepared)
@@ -205,7 +217,7 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
         stat_keys = sorted(set().union(*(set(roi) for roi in data["stat"])))
         for key in stat_keys:
             ps.add_column(
-                f"stat_{key}", f"Original stat.{key} as JSON; NaN remains NaN; see native source archive for dtype."
+                f"stat_{key}", f"Original stat.{key} as JSON; NaN remains NaN; empty text means this ROI has no such key; see native source archive for dtype."
             )
         for index, roi in enumerate(data["stat"]):
             # Explicit integer fields and float32 weights avoid HDMF silently casting tuple floats to uint32.
@@ -215,7 +227,7 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
                 pixel_mask=[(np.uint32(x), np.uint32(y), np.float32(w)) for x, y, w in mask],
                 iscell=bool(data["iscell"][index, 0]),
                 cell_probability=float(data["iscell"][index, 1]),
-                **{f"stat_{k}": _json_value(roi[k]) if k in roi else "null" for k in stat_keys},
+                **{f"stat_{k}": _json_value(roi[k]) if k in roi else "" for k in stat_keys},
             )
         times = prepared.frame_times[prepared.acquisition.plane_frames(plane)]
         if len(data["stat"]):
@@ -289,7 +301,7 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
     module.add(
         _table(
             "suite2p_settings",
-            "Suite2p settings and version as recorded, without changing any value. registration.do_bidiphase on a bidirectional rig is an open decision. fs is processing provenance, not the source of timestamps.",
+            "Suite2p settings and version as recorded, without changing any value. fs is processing provenance, not the source of timestamps.",
             [
                 ("key", "Plane and original setting path.", np.array([r[0] for r in setting_rows], dtype=object)),
                 ("value", "Original value as JSON.", np.array([r[1] for r in setting_rows], dtype=object)),
@@ -320,8 +332,6 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
             )
         )
     if mapping is not None:
-        import json
-
         nwb.add_scratch(
             json.dumps(mapping),
             name="suite2p_frame_mapping",
@@ -330,11 +340,11 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
     inventory = []
     for index, path in enumerate(_sources(root)):
         relative = str(path.relative_to(root))
-        blob = np.memmap(path, mode="r", dtype="uint8")
+        blob = _artifact_bytes(path)
         name = f"suite2p_source_{index:04d}"
         nwb.add_scratch(
             ScratchData(
-                data=H5DataIO(blob, **COMPRESSION),
+                data=H5DataIO(blob, **COMPRESSION) if blob.size else blob,
                 name=name,
                 description=f"Original artifact bytes: {relative}. SHA256 {hashlib.sha256(blob).hexdigest()}. No interpretation or dtype conversion.",
             )
@@ -371,14 +381,13 @@ def convert_suite2p(log, tiffs, root, output, file=None, metadata=None, raw_nwb=
     companion = read_companion(raw_nwb, prepared) if raw_nwb is not None else None
     with NWBHDF5IO(str(output), "w") as io:
         io.write(build_suite2p_nwbfile(prepared, root, metadata, mapping, companion))
-    verify_suite2p(prepared, output, root, tiffs, companion=companion)
+    verify_suite2p(prepared, output, root, tiffs, companion=companion, mapping=mapping)
     return prepared
 
 
-def verify_suite2p(prepared, output, root, tiffs, companion=None):
+def verify_suite2p(prepared, output, root, tiffs, companion=None, mapping=None):
     """Compare HDF5 against fresh NumPy files and independently parsed TIFF headers, exactly."""
     import h5py
-    import hashlib
     from ..virmen.verify import verify_round_trip, _check_series
     from .verify import RoundTripError, _alignment_values, _read_headers, check_scanimage_tables
 
@@ -403,6 +412,8 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None):
             for name, value in companion.items():
                 if scan[f"companion_files/{name}"].asstr()[0] != value:
                     raise RoundTripError(f"companion_files.{name} differs from the raw file")
+        if mapping is not None and json.loads(f["scratch/suite2p_frame_mapping"].asstr()[()]) != mapping:
+            raise RoundTripError("the stored frame mapping evidence differs from what was measured")
         for series in prepared.in_progress:
             _check_series(f["processing/in_progress_trial"], series)
         o = f["processing/ophys"]
@@ -424,10 +435,11 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None):
                 equal(mask["y"], roi["ypix"], "mask y")
                 equal(mask["weight"], roi["lam"], "mask weights")
                 cursor = end
-                import json
-
                 for key, value in roi.items():
                     equal(json.loads(ps[f"stat_{key}"].asstr()[i]), value, f"stat.{key}")
+                for column in ps:
+                    if column.startswith("stat_") and column.removeprefix("stat_") not in roi and ps[column].asstr()[i] != "":
+                        raise RoundTripError(f"{column}: ROI {i} has no such key, but the file holds a value")
             for name, key in [("Fluorescence", "F"), ("Neuropil", "Fneu"), ("Deconvolved", "spks")]:
                 source = np.load(folder / f"{key}.npy", mmap_mode="r")
                 if len(stat):
@@ -435,6 +447,10 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None):
                     if series["data"].dtype != np.float32:
                         raise RoundTripError(key + " dtype differs")
                     equal(series["data"][()], source.T, key)
+                    table = f[series["rois"].attrs["table"]].name
+                    if table != f"/processing/ophys/ImageSegmentation/PlaneSegmentation{plane}":
+                        raise RoundTripError(f"{name}/Plane{plane}: rois point at {table}")
+                    equal(series["rois"][()], np.arange(len(stat)), f"{key} rois")
                     equal(
                         series["timestamps"][()],
                         session_times[(numbers - 1) % prepared.acquisition.layout.n_planes == plane],
@@ -469,20 +485,21 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None):
                             "summary image coordinates",
                         )
         table = o["suite2p_settings"]
-        for key, text in zip(table["key"].asstr()[()], table["value"].asstr()[()]):
-            plane_name, *parts = key.split(".")
-            original = np.load(Path(root) / plane_name / "settings.npy", allow_pickle=True).item()
-            for part in parts:
-                original = original[part]
-            import json
-
-            equal(json.loads(text), original, "Suite2p setting " + key)
+        stored = dict(zip(table["key"].asstr()[()], table["value"].asstr()[()]))
+        expected = {}
+        for plane in range(prepared.acquisition.layout.n_planes):
+            original = np.load(Path(root) / f"plane{plane}" / "settings.npy", allow_pickle=True).item()
+            expected.update(_flatten_settings(f"plane{plane}", original))
+        if set(stored) != set(expected):
+            raise RoundTripError(f"Suite2p settings differ: {sorted(set(stored) ^ set(expected))}")
+        for key, value in expected.items():
+            equal(json.loads(stored[key]), value, "Suite2p setting " + key)
         inventory = o["source_inventory"]
         sources = _sources(root)
         if list(inventory["path"].asstr()[()]) != [str(p.relative_to(root)) for p in sources]:
             raise RoundTripError("source archive inventory differs")
         for index, (path, name) in enumerate(zip(sources, inventory["scratch_name"].asstr()[()])):
-            source = np.memmap(path, mode="r", dtype="uint8")
+            source = _artifact_bytes(path)
             if inventory["sha256"].asstr()[index] != hashlib.sha256(source).hexdigest():
                 raise RoundTripError("source archive hash differs")
             dataset = f[f"scratch/{name}"]
