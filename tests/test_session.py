@@ -273,7 +273,8 @@ class TestLossless:
 
     def test_track_lengths_parse_nan_and_inf(self):
         maze = make_maze(variable={"lStart": "NaN", "lCue": "Inf", "lMemory": "0"})
-        session = _normalize(make_log(version=make_version(mazes=[maze])))
+        other = make_maze(variable={"lStart": "1", "lCue": "2", "lMemory": "3"})  # a column of only NaN is left out
+        session = _normalize(make_log(version=make_version(mazes=[maze, other])))
         assert np.isnan(_column(session.mazes, "lStart").data[0])
         assert np.isinf(_column(session.mazes, "lCue").data[0])
         assert _column(session.mazes, "lMemory").data[0] == 0
@@ -621,3 +622,34 @@ def test_session_with_no_trials():
     session = _normalize(make_log([make_block([])]))
     assert len(_column(session.trials, "start_time").data) == 0
     assert _series(session, "position").data.shape == (0, 2)
+
+
+class TestAllNanColumns:
+    """A float column with no value in this session is left out and listed, not written as a column of NaN."""
+
+    def _session(self, **trial_fields):
+        trial = make_trial(**trial_fields)
+        return normalize_log(make_log([make_block([trial, make_trial(start=9.0, **trial_fields)])]), file="x.mat")
+
+    def test_an_all_nan_float_column_is_left_out_and_listed(self):
+        session = self._session(trialID=np.array([[np.nan]], dtype="float32"))
+        assert "trialID" not in [column.name for column in session.trials]
+        assert "NaN" in session.coverage.omitted["log.block.trial.trialID"]
+        assert "log.block.trial.trialID" not in session.coverage.written
+
+    def test_a_partly_nan_column_stays(self):
+        first = make_trial(trialID=np.array([[np.nan]], dtype="float32"))
+        second = make_trial(start=9.0, trialID=np.array([[3.0]], dtype="float32"))
+        session = normalize_log(make_log([make_block([first, second])]), file="x.mat")
+        column = next(column for column in session.trials if column.name == "trialID")
+        assert np.isnan(column.data[0]) and column.data[1] == 3.0
+        assert "log.block.trial.trialID" not in session.coverage.omitted
+
+    def test_an_all_zero_column_stays(self):
+        session = self._session(trialID=np.array([[0.0]], dtype="float32"))
+        assert "trialID" in [column.name for column in session.trials]
+
+    def test_an_all_nan_maze_column_is_left_out_and_listed(self):
+        session = _normalize(make_log(version=make_version(mazes=[make_maze(variable={"lStart": "NaN", "lCue": "Inf", "lMemory": "0"})])))
+        assert "lStart" not in [column.name for column in session.mazes]
+        assert any("lStart" in reason for reason in session.coverage.omitted.values())

@@ -94,3 +94,74 @@ def write_acquisition(folder, n_frames, frames_per_file=4, *, packets=None, soft
                 writer.write(frame_pixels(number, rows, cols), **options)
         paths.append(path)
     return paths
+
+
+FLYBACK_ROWS = 2
+
+
+def mroi_artist(rois):
+    """The ROI group for `rois`, a list of dicts with rows, and optionally name, z, center and cols."""
+    built = []
+    for number, roi in enumerate(rois, start=1):
+        built.append({
+            "name": roi.get("name", f"area{number}"),
+            "zs": roi.get("z", 10),
+            "scanfields": {"pixelResolutionXY": [roi.get("cols", 4), roi["rows"]], "sizeXY": [8.0, 8.0], "centerXY": roi.get("center", [float(number), 0.0])},
+        })
+    return json.dumps({"RoiGroups": {"imagingRoiGroup": {"rois": built}}})
+
+
+def mroi_software(zs=(10,), page_rows=8, **overrides):
+    many = len(zs) > 1
+    return software(**{
+        "SI.hRoiManager.mroiEnable": "1",
+        "SI.hRoiManager.linesPerFrame": "3",
+        "SI.hStackManager.actualNumSlices": str(len(zs)),
+        "SI.hStackManager.numFramesPerVolumeWithFlyback": str(len(zs)),
+        "SI.hStackManager.zs": ("[" + " ".join(map(str, zs)) + "]") if many else str(zs[0]),
+        **overrides,
+    })
+
+
+def write_stack(folder, n_frames, rois, zs=(10,), page_rows=None, frames_per_file=4, software_text=None, stem="mouse_00001", **options):
+    """A multi-ROI acquisition as ScanImage saves it: each page stacks its plane's ROIs with flyback rows between them."""
+    first_plane = [roi for roi in rois if roi.get("z", 10) == zs[0]]
+    page_rows = page_rows or sum(roi["rows"] for roi in first_plane) + FLYBACK_ROWS * (len(first_plane) - 1)
+    return write_acquisition(
+        folder, n_frames, frames_per_file=frames_per_file, software_text=software_text or mroi_software(zs), artist_text=mroi_artist(rois), rows=page_rows, cols=rois[0].get("cols", 4), stem=stem, **options
+    )
+
+
+def _matlab_number(value):
+    """num2str: four decimals at most, with trailing zeros gone."""
+    return f"{value:.4f}".rstrip("0").rstrip(".")
+
+
+def split_stack(paths, folder, rois, zs=(10,), lag=0.001, keep_tags=False, software_text=None, artist_text=None):
+    """What the lab's ScanInfo splitter does to a stack: one folder per ROI and depth, negatives clipped into uint16,
+    each ROI's frame time moved by a fixed lag and rounded, and in older runs no Software or Artist tags."""
+    written = []
+    for depth, z in enumerate(zs, start=1):
+        row, lag_steps = 0, 0
+        plane_rois = [(number, roi) for number, roi in enumerate(rois, start=1) if roi.get("z", 10) == z]
+        for number, roi in plane_rois:
+            where = folder / f"ROI{number:02d}_z{depth}"
+            where.mkdir(parents=True, exist_ok=True)
+            for path in paths:
+                stem, file_number = path.stem.rsplit("_", 1)
+                out = where / f"{stem}_ROI{number:02d}_z{depth}_{file_number}.tif"
+                with tifffile.TiffFile(path) as source, tifffile.TiffWriter(out, bigtiff=False) as writer:
+                    pages = [page for page in source.pages if (int(page.description.split("\n")[0].split(" = ")[1]) - 1) % len(zs) == depth - 1]
+                    for position, page in enumerate(pages):
+                        text = page.description
+                        old = float(text.split("frameTimestamps_sec = ")[1].split("\n")[0])
+                        text = text.replace(f"frameTimestamps_sec = {old:.9f}", f"frameTimestamps_sec = {_matlab_number(old + lag * lag_steps)}")
+                        pixels = np.clip(page.asarray()[row : row + roi["rows"]], 0, None).astype("uint16")
+                        options = {}
+                        if keep_tags and position == 0:
+                            options = dict(software=software_text, extratags=[(315, "s", 0, artist_text, True)])
+                        writer.write(pixels, description=text, contiguous=False, metadata=None, **options)
+                written.append(out)
+            lag_steps += 1
+            row += roi["rows"] + FLYBACK_ROWS
+    return written

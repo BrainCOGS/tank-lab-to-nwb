@@ -107,16 +107,16 @@ class TestPipeline:
     def source(self, tmp_path, monkeypatch):
         folder = tmp_path / "behavior"
         (folder / "user" / "user_a" / "20260715_g0").mkdir(parents=True)
-        (folder / "user" / "user_b" / "20260716_g0").mkdir(parents=True)
+        (folder / "user" / "user_b" / "20260715_g0").mkdir(parents=True)
         (folder / "user" / "user_a" / "20260715_g0" / "a.mat").touch()
-        (folder / "user" / "user_b" / "20260716_g0" / "b.mat").touch()
+        (folder / "user" / "user_b" / "20260715_g0" / "b.mat").touch()
 
         def fake_log(path):
             log = make_log([make_block(make_trial())])
             log["animal"]["name"] = "user_a" if path.name == "a.mat" else "user_b"
             return log
 
-        monkeypatch.setattr(convert, "load_log", fake_log)
+        monkeypatch.setattr("tank_lab_to_nwb.virmen.convert_folder.load_log", fake_log)
         return folder
 
     def test_flat_staging_then_organized_names(self, source, tmp_path):
