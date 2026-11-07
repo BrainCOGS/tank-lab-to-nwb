@@ -314,3 +314,16 @@ def test_readback_refuses_missing_derived_interfaces(tmp_path, log, tiffs, run, 
         del f[dataset]
     with pytest.raises(ValueError, match="missing"):
         verify_suite2p(prepared, path, run, tiffs)
+
+
+def test_numpy_scalars_nested_in_stat_lists_roundtrip(tmp_path, log, tiffs, run):
+    from tank_lab_to_nwb.imaging.suite2p import convert_suite2p
+
+    source = run / "plane0/stat.npy"
+    stat = np.load(source, allow_pickle=True)
+    stat[0]["med"] = [np.int64(1), np.int64(2)]
+    np.save(source, stat)
+    path = tmp_path / "nested.nwb"
+    convert_suite2p(log, tiffs, run, path, file="session.mat")
+    with h5py.File(path) as f:
+        assert f["processing/ophys/ImageSegmentation/PlaneSegmentation0/stat_med"].asstr()[0] == "[1, 2]"

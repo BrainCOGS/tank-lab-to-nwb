@@ -66,10 +66,14 @@ def load_suite2p(root, prepared):
 def _json_value(value):
     import json
 
-    return json.dumps(
-        value.tolist() if isinstance(value, np.ndarray) else value.item() if isinstance(value, np.generic) else value,
-        allow_nan=True,
-    )
+    def numeric(item):
+        if isinstance(item, np.ndarray):
+            return item.tolist()
+        if isinstance(item, np.generic):
+            return item.item()
+        raise TypeError(f"Unsupported source value: {type(item).__name__}")
+
+    return json.dumps(value, default=numeric, allow_nan=True)
 
 
 def _sources(root):
