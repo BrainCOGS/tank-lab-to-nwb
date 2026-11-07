@@ -251,3 +251,29 @@ def test_cropped_summary_image_has_explicit_full_frame_origin(tmp_path, log, tif
         assert (t["x_origin"][row], t["y_origin"][row]) == (1, 1)
         # Full-frame ROI (2,1) is crop coordinate (1,0), the very same image pixel.
         assert o["SummaryImages0/max_proj"][1, 0] == o["SummaryImages0/meanImg"][2, 1] == 6
+
+
+def test_combined_is_only_tiling_and_padding(run):
+    from tank_lab_to_nwb.imaging.convert_suite2p import verify_combined
+
+    combined = run / "combined"
+    combined.mkdir()
+    for key in ("F", "Fneu", "spks"):
+        a = np.load(run / "plane0" / f"{key}.npy")
+        b = np.load(run / "plane1" / f"{key}.npy")
+        np.save(combined / f"{key}.npy", np.concatenate([a, np.pad(b, ((0, 0), (0, 1)))]))
+    np.save(combined / "iscell.npy", np.concatenate([np.load(run / f"plane{p}/iscell.npy") for p in range(2)]))
+    stat = []
+    for plane in range(2):
+        roi = np.load(run / f"plane{plane}/stat.npy", allow_pickle=True)[0]
+        roi["xpix"] += 4 * plane
+        roi["med"][1] += 4 * plane
+        roi["iplane"] = plane
+        stat.append(roi)
+    np.save(combined / "stat.npy", stat)
+    assert verify_combined(run)["roi_values_match"]
+    trace = np.load(combined / "F.npy")
+    trace[1, -1] = 1
+    np.save(combined / "F.npy", trace)
+    with pytest.raises(ValueError, match="padding"):
+        verify_combined(run)

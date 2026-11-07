@@ -86,3 +86,19 @@ A mismatch raises rather than being rounded away.
 ## Session measurements
 
 Measurements and validation results will be recorded here after the clean run and final conversion complete.
+
+### Why the pre-existing run was not reused
+
+The initial plane-0/frame-0 reconstruction had RMSE **607.127904** intensity units; mapping its next same-plane raw
+page with the same offsets gave **662.818332**. Suite2p's own transform on CPU independently gave **607.127844** for
+the correct raw page, while the independent reconstruction differed from that CPU result by only **0.015729** RMSE.
+The earlier 541.98 CPU number was from mistakenly selecting one row after Suite2p squeezed the one-frame batch; it is
+not a frame reconstruction measurement and must not be used.
+
+The saved log starts with `FOUND BINARIES AND DBS` and then runs registration on every plane. This proves that it
+registered existing binaries without re-reading the TIFFs in that invocation. It does **not** by itself establish the
+pixels those binaries contained before that invocation or count previous registrations. Re-registration of already
+registered pixels is a plausible explanation, not a demonstrated two-pass history. The saved offsets do not reconstruct
+the raw page tested. Its fluorescence traces may still describe its registered movie, but their biological validity
+and full timing identity were not established by this failed check. A clean TIFF-based rerun was selected rather than
+assigning raw-page timestamps to those results without evidence.
