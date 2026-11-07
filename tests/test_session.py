@@ -9,7 +9,7 @@ import pytest
 from tank_lab_to_nwb.virmen.coerce import LossyConversionError
 from tank_lab_to_nwb.virmen.loader import Enum
 from tank_lab_to_nwb.virmen.session import ConversionError, normalize_log
-from tests.synthetic_log import L, NIL, R, lr_cell, make_block, make_log, make_maze, make_trial, make_version, scalar, single
+from tests.synthetic_log import L, NIL, R, lr_cell, make_block, make_log, make_maze, make_trial, make_version, port_cell, ports, scalar, single
 
 
 def _normalize(log):
@@ -384,6 +384,84 @@ class TestLicks:
         session = _normalize(make_log([make_block(make_trial(counter_licks=np.full((2, 1), np.nan, dtype="float32")))]))
         assert "counter_licks_iteration" not in _names(session.trials)
         assert "log.block.trial.counter_licks" in session.coverage.omitted
+
+
+NO_LICKS = np.full((2, 1), np.nan, dtype="float32")
+
+
+def _licks(*values):
+    return np.array([[10.0 * (k + 1) for k in range(len(values))], values], dtype="float32")
+
+
+class TestStatePorts:
+    def _session(self, *trials):
+        return _normalize(make_log([make_block([make_trial(start=1.0 + 9 * k, **trial) for k, trial in enumerate(trials)])]))
+
+    def test_one_bool_reading_per_lick_shares_the_licks_index(self):
+        session = self._session(
+            dict(licks=_licks(1, 2), state_ports=port_cell(ports(left_contact=True), ports(right_contact=True))),
+            dict(licks=NO_LICKS, state_ports=port_cell()),
+            dict(licks=_licks(2), state_ports=port_cell(ports(left_contact=True, right_contact=True))),
+        )
+        column = _column(session.trials, "state_ports")
+        assert column.data.dtype == np.bool_ and column.data.shape == (3, 2, 5)
+        assert column.index.tolist() == _column(session.trials, "licks_iteration").index.tolist() == [2, 2, 3]
+        np.testing.assert_array_equal(column.data[0], ports(left_contact=True).astype(bool))
+        assert not column.data[2][:, 0].any()
+        assert session.coverage.written["log.block.trial.state_ports"] == ["state_ports"]
+
+    def test_a_single_lick_trial_holds_one_reading(self):
+        session = self._session(dict(licks=_licks(1), state_ports=port_cell(ports(left_contact=True))))
+        assert _column(session.trials, "state_ports").data.shape == (1, 2, 5)
+
+    def test_a_reading_given_without_its_cell_is_one_lick(self):
+        session = self._session(dict(licks=_licks(1), state_ports=ports(left_contact=True).astype("float32")))
+        assert _column(session.trials, "state_ports").index.tolist() == [1]
+
+    def test_lick_counter_mode_leaves_it_empty_so_it_is_left_out_and_reported(self):
+        session = self._session(dict(licks=_licks(1, 1), state_ports=port_cell()), dict(licks=NO_LICKS, state_ports=port_cell()))
+        assert "state_ports" not in _names(session.trials)
+        assert "counter" in session.coverage.omitted["log.block.trial.state_ports"]
+
+    def test_logs_without_the_field_write_nothing(self):
+        session = self._session(dict(licks=_licks(1)))
+        assert "state_ports" not in _names(session.trials)
+        assert "log.block.trial.state_ports" not in session.coverage.omitted
+
+    def test_fewer_readings_than_licks_fail(self):
+        with pytest.raises(ConversionError, match=r"state_ports: row 0: .*1 .*2 licks"):
+            self._session(dict(licks=_licks(1, 2), state_ports=port_cell(ports(left_contact=True))))
+
+    def test_a_trial_with_licks_but_no_readings_fails_when_others_have_them(self):
+        with pytest.raises(ConversionError, match=r"state_ports: row 1: "):
+            self._session(dict(licks=_licks(1), state_ports=port_cell(ports(left_contact=True))),
+                          dict(licks=_licks(2), state_ports=port_cell()))
+
+    def test_readings_without_licks_fail(self):
+        with pytest.raises(ConversionError, match=r"state_ports: row 0: "):
+            self._session(dict(licks=NO_LICKS, state_ports=port_cell(ports(left_contact=True))))
+
+    def test_a_reading_of_another_shape_fails(self):
+        with pytest.raises(ConversionError, match=r"state_ports.*\(2, 4\)"):
+            self._session(dict(licks=_licks(1), state_ports=port_cell(np.ones((2, 4)))))
+
+    def test_an_empty_reading_among_real_ones_fails(self):
+        cell = port_cell(ports(left_contact=True), ports(right_contact=True))
+        cell[0, 1] = np.zeros((0, 0))
+        with pytest.raises(ConversionError, match="state_ports"):
+            self._session(dict(licks=_licks(1, 2), state_ports=cell))
+
+    def test_a_value_other_than_0_or_1_fails(self):
+        reading = ports(left_contact=True)
+        reading[0, 4] = 0.5
+        with pytest.raises(LossyConversionError, match="state_ports"):
+            self._session(dict(licks=_licks(1), state_ports=port_cell(reading)))
+
+    def test_nan_fails(self):
+        reading = ports(left_contact=True)
+        reading[1, 0] = np.nan
+        with pytest.raises(LossyConversionError, match="state_ports"):
+            self._session(dict(licks=_licks(1), state_ports=port_cell(reading)))
 
 
 def _stimulus_table(rows):

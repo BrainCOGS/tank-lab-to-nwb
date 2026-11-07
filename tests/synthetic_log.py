@@ -22,6 +22,24 @@ def lr_cell(left, right, dtype="float32"):
     return cell
 
 
+def port_cell(*snapshots):
+    """A trial's state_ports: one 2x5 float32 reading per lick, or ExperimentLog's initial {[]} with none."""
+    members = [np.asarray(snapshot, dtype="float32") for snapshot in snapshots] or [np.zeros((0, 0))]
+    cell = np.empty((1, len(members)), dtype=object)
+    for position, member in enumerate(members):
+        cell[0, position] = member
+    return cell
+
+
+def ports(left_contact=False, right_contact=False):
+    """A reading whose newest two columns show contact (0) on the chosen port after a reading without (1)."""
+    snapshot = np.ones((2, 5))
+    for row, contact in enumerate((left_contact, right_contact)):
+        if contact:
+            snapshot[row, :2] = 0
+    return snapshot
+
+
 def make_trial(start=1.0, n_frames=3, n_iti=2, choice=L, trial_type=L, **extra):
     n_time = n_frames + n_iti
     trial = dict(

@@ -223,6 +223,40 @@ class _Normalizer:
             self.fail(field.path, "is only partly NaN", row)
         return cell[0], cell[1]
 
+    def _per_lick_column(self, field, cells):
+        """One fixed-shape reading per lick. ExperimentLog starts each trial with {[]}, which means none."""
+        fixed, readings, lengths = field.shape[1:], [], []
+        for row, cell in enumerate(cells):
+            members = [] if _is_empty(cell) else list(cell.flat) if isinstance(cell, np.ndarray) and cell.dtype == object else [cell]
+            if len(members) == 1 and _is_empty(members[0]):
+                members = []
+            for member in members:
+                member = np.asarray(member)
+                if member.shape != fixed:
+                    self.fail(field.path, f"holds a reading of shape {member.shape}, not {fixed}", row)
+                readings.append(self.coerce(member, field, row))
+            lengths.append(len(members))
+        if not readings:
+            self.coverage.omitted[field.path] = "Empty in every trial of this session: ExperimentLog fills it only when it reads the lick ports, never in lick-counter mode."
+            return []
+        return [Column(field.name, field.dtype, field.doc, np.stack(readings), _ragged_index(lengths))]
+
+    def _check_per_lick(self, columns):
+        """A per-lick column must hold exactly one value for each lick in licks_iteration."""
+        by_name = {column.name: column for column in columns}
+        for field in self.registry:
+            column = by_name.get(field.name) if field.transform == "per_lick" else None
+            if column is None:
+                continue
+            licks = by_name.get("licks_iteration")
+            have = np.diff(column.index, prepend=0)
+            want = np.diff(licks.index, prepend=0) if licks is not None else np.zeros_like(have)
+            if have.shape != want.shape or (have != want).any():
+                row = int(np.flatnonzero(have != want)[0]) if have.shape == want.shape else None
+                got = have[row] if row is not None else int(have.sum())
+                needed = want[row] if row is not None else int(want.sum())
+                self.fail(field.path, f"holds {got} readings but the trial has {needed} licks", row)
+
     def _pair_columns(self, field, split):
         left, right = zip(*split) if split else ((), ())
         return [self._ragged_column(field, field.nwb_names[0], left), self._ragged_column(field, field.nwb_names[1], right)]
@@ -231,6 +265,8 @@ class _Normalizer:
         """The columns of one registered field, given its value in every row. Returns [] for an empty column."""
         if field.transform == "left_right":
             return self._pair_columns(field, [self._split_left_right(field, cell, row) for row, cell in enumerate(cells)])
+        if field.transform == "per_lick":
+            return self._per_lick_column(field, cells)
         if field.transform == "licks":
             split = [self._split_licks(field, cell, row) for row, cell in enumerate(cells)]
             preallocated = any(part is None for part in split)
@@ -280,6 +316,7 @@ class _Normalizer:
             columns += kept
             if kept:
                 self.coverage.written[field.path] = [column.name for column in kept]
+        self._check_per_lick(columns)
         if account:
             for name in names:
                 self._account_for(prefix + name, rows, name, columns, prefix)
