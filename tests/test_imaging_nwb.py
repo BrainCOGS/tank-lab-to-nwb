@@ -1,5 +1,6 @@
 """The raw imaging NWB file: what's on disk equals the TIFFs and the log, read back independently."""
 
+import json
 import warnings
 
 import h5py
@@ -7,8 +8,10 @@ import numpy as np
 import pytest
 from pynwb import NWBHDF5IO, validate
 
-from tank_lab_to_nwb.imaging.convert import convert_session, prepare_session
+from tank_lab_to_nwb.imaging import convert_session as cli
+from tank_lab_to_nwb.imaging.convert import _int32, convert_session, prepare_session
 from tank_lab_to_nwb.imaging.verify import RoundTripError, verify_imaging
+from tank_lab_to_nwb.virmen.coerce import LossyConversionError
 from tests.synthetic_log import make_block, make_log, make_trial, scalar
 from tests.synthetic_tiff import FRAME_PERIOD, frame_pixels, software, write_acquisition
 
@@ -187,6 +190,17 @@ def test_verify_passes_on_a_good_file(written):
         ("acquisition/TwoPhotonSeriesPlane1/timestamps", lambda d: d.__setitem__(3, d[3] + 1e-9)),
         ("processing/scanimage/frames/timestamp", lambda d: d.__setitem__(7, d[7] + 1e-9)),
         ("processing/scanimage/i2c_packets/iteration", lambda d: d.__setitem__(2, d[2] + 1)),
+        ("processing/scanimage/frames/file_index", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/scanimage/frames/page_index", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/scanimage/frames/acquisition_number", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/scanimage/frames/frame_number_acquisition", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/scanimage/frames/acq_trigger_timestamp", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/scanimage/frames/next_file_marker_timestamp", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/scanimage/frames/end_of_acquisition", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/scanimage/frames/end_of_acquisition_mode", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/scanimage/frames/dc_over_voltage", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/scanimage/i2c_packets/used_in_fit", lambda d: d.__setitem__(2, not d[2])),
+        ("processing/scanimage/files/n_frames", lambda d: d.__setitem__(0, d[0] + 1)),
     ],
 )
 def test_verify_catches_a_changed_value(written, dataset, change):
@@ -270,7 +284,7 @@ def test_the_trial_in_progress_is_kept_and_verified(tmp_path, log, tiffs):
         group = file["processing/in_progress_trial/position"]
         np.testing.assert_array_equal(group["data"][()], position[:2])
         assert group["data"].dtype == np.float64
-        assert group["timestamps"][0] == pytest.approx(30.0 + prepared.clock_offset)
+        assert group["timestamps"][0] == 30.0 + prepared.clock_offset + 0.0
     with NWBHDF5IO(str(path), "r", load_namespaces=True) as io:
         settings = io.read().lab_meta_data["LabMetaData"].settings
         rows = dict(zip(settings["key"].data[:], settings["value"].data[:]))
@@ -324,3 +338,164 @@ def test_the_label_columns_explain_their_limits(written):
         trial = frames["behavior_trial"].attrs["description"]
     assert "just before the trial began" in block and "late" in block
     assert "running when the log was saved" in trial
+
+
+@pytest.mark.parametrize(
+    "dataset",
+    [
+        "processing/scanimage/files/file_name",
+        "processing/scanimage/files/software",
+        "processing/scanimage/files/artist",
+        "processing/scanimage/alignment/key",
+        "processing/scanimage/alignment/value",
+        "processing/scanimage/alignment/meaning",
+    ],
+)
+def test_verify_catches_changed_text(written, dataset):
+    prepared, path, tiffs, _ = written
+    with h5py.File(path, "r+") as file:
+        file[dataset][0] = "changed"
+    with pytest.raises(RoundTripError):
+        verify_imaging(prepared, path, tiffs)
+
+
+def _alignment(path):
+    with h5py.File(path, "r") as file:
+        table = file["processing/scanimage/alignment"]
+        return dict(zip(table["key"].asstr()[()], table["value"].asstr()[()]))
+
+
+@pytest.mark.parametrize("value", [2**31, -(2**31) - 1, 1.5, float("nan")])
+def test_a_header_value_that_does_not_fit_is_refused_not_wrapped(value):
+    with pytest.raises(LossyConversionError, match="frame_number"):
+        _int32([1, value], "frame_number")
+
+
+def test_integer_columns_at_the_edge_of_the_range_are_exact():
+    values = _int32([2**31 - 1, -(2**31), 0], "frame_number")
+    assert values.dtype == np.int32
+    assert values.tolist() == [2**31 - 1, -(2**31), 0]
+
+
+def test_an_empty_integer_column_stays_empty():
+    assert _int32([], "frame_number").size == 0
+
+
+def test_conversion_writes_a_report_beside_the_file(written):
+    report = json.loads(written[1].with_suffix(".report.json").read_text())
+    assert report["alignment"]["frames"] == 801
+    assert "dropped" in report["coverage"]
+
+
+def test_the_report_lists_the_in_progress_trial_when_nothing_of_it_was_kept(written):
+    dropped = json.loads(written[1].with_suffix(".report.json").read_text())["coverage"]["dropped"]
+    assert not written[0].in_progress
+    assert {"log.currentTrial", "log.currentIt"} <= set(dropped)
+
+
+def _with_in_progress(log, **extra):
+    block = log["block"][0]
+    count = 2
+    log["currentTrial"] = {
+        "start": np.array([[30.0]]),
+        "time": np.array([[0.0], [0.004], [0.0]]),
+        "position": np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [0.0, 0.0, 0.0]]),
+        "viStart": np.array([[9.0]]),
+        **extra,
+    }
+    log["currentIt"] = np.array([[float(count)]])
+    return block
+
+
+def test_the_report_omits_the_in_progress_trial_when_it_was_kept(tmp_path, log, tiffs):
+    _with_in_progress(log)
+    path = tmp_path / "kept.nwb"
+    prepared = convert_session(log, tiffs, path, file="session.mat")
+    assert prepared.in_progress
+    dropped = json.loads(path.with_suffix(".report.json").read_text())["coverage"]["dropped"]
+    assert "log.currentTrial" not in dropped and "log.currentIt" not in dropped
+
+
+def test_empty_in_progress_fields_are_named_in_the_file(tmp_path, log, tiffs):
+    _with_in_progress(log, cueCombo=np.empty((0, 0)), emptyText="")
+    path = tmp_path / "kept.nwb"
+    convert_session(log, tiffs, path, file="session.mat")
+    with NWBHDF5IO(str(path), "r", load_namespaces=True) as io:
+        settings = io.read().lab_meta_data["LabMetaData"].settings
+        rows = dict(zip(settings["key"].data[:], settings["value"].data[:]))
+    assert set(json.loads(rows["derived.in_progress_trial.empty_fields"])) == {"cueCombo", "emptyText"}
+
+
+def test_long_stretches_without_packets_are_recorded_like_the_pipelines_warning(tmp_path, log):
+    packets = _frame_packets(log, 801)
+    folder = tmp_path / "gappy"
+    folder.mkdir()
+    numbers = sorted(packets)
+    missing = range(numbers[100], numbers[100] + 150)  # 3 s of frames at 50 Hz
+    kept = {number: value for number, value in packets.items() if number not in missing}
+    tiffs = write_acquisition(folder, 801, frames_per_file=300, packets=kept)
+    path = tmp_path / "gappy.nwb"
+    convert_session(log, tiffs, path, file="session.mat")
+    values = _alignment(path)
+    assert values["labels.gaps_over_2s"] == "1"
+    assert float(values["labels.longest_gap_seconds"]) > 2.0
+
+
+def test_short_stretches_without_packets_are_not_counted(written):
+    values = _alignment(written[1])
+    assert values["labels.gaps_over_2s"] == "0"
+    assert float(values["labels.longest_gap_seconds"]) < 2.0
+
+
+def test_the_acquisition_id_is_stable_and_names_only_this_acquisition(tmp_path, log, written):
+    prepared, path, tiffs, _ = written
+    again = tmp_path / "again.nwb"
+    convert_session(log, tiffs, again, file="session.mat")
+    first = _alignment(path)["acquisition.id"]
+    assert first == _alignment(again)["acquisition.id"]
+    assert len(first) == 64
+    other = tmp_path / "other"
+    other.mkdir()
+    shorter = write_acquisition(other, 800, frames_per_file=300, packets=_frame_packets(log, 800))
+    assert prepare_session(log, shorter, file="session.mat")
+    elsewhere = tmp_path / "elsewhere.nwb"
+    convert_session(log, shorter, elsewhere, file="session.mat")
+    assert _alignment(elsewhere)["acquisition.id"] != first
+
+
+class TestCommandLine:
+    def test_converts_and_reports(self, tmp_path, log, tiffs, monkeypatch):
+        monkeypatch.setattr(cli, "convert_session", convert_session_with_log(log))
+        path = cli.convert("session.mat", tmp_path / "out", tiffs)
+        assert path == tmp_path / "out" / "session.nwb"
+        assert path.exists() and path.with_suffix(".report.json").exists()
+
+    def test_stub_is_named_as_one(self, tmp_path, log, tiffs, monkeypatch):
+        monkeypatch.setattr(cli, "convert_session", convert_session_with_log(log))
+        path = cli.convert("session.mat", tmp_path / "out", tiffs, stub=5)
+        assert path.name == "session_stub.nwb"
+
+    def test_refuses_to_start_without_room_for_the_frames(self, tmp_path, tiffs, monkeypatch):
+        usage = type("Usage", (), {"free": 0})
+        monkeypatch.setattr(cli.shutil, "disk_usage", lambda _: usage)
+        with pytest.raises(OSError, match="free"):
+            cli.convert("session.mat", tmp_path / "out", tiffs)
+
+    def test_a_stub_does_not_need_room_for_every_frame(self, tmp_path, log, tiffs, monkeypatch):
+        usage = type("Usage", (), {"free": 0})
+        monkeypatch.setattr(cli.shutil, "disk_usage", lambda _: usage)
+        monkeypatch.setattr(cli, "convert_session", convert_session_with_log(log))
+        assert cli.convert("session.mat", tmp_path / "out", tiffs, stub=1).exists()
+
+    def test_the_usage_says_where_the_file_goes(self):
+        assert "<output>/staging" not in cli.__doc__
+        assert "<output>" in cli.__doc__
+
+
+def convert_session_with_log(log):
+    """The command line takes a path; these tests hand it the synthetic log already decoded."""
+
+    def run(_path, tiffs, output, **options):
+        return convert_session(log, tiffs, output, file="session.mat", **options)
+
+    return run

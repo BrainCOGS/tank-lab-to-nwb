@@ -10,7 +10,7 @@ from pynwb import NWBHDF5IO, NWBFile
 from pynwb.behavior import Position, SpatialSeries
 from pynwb.file import Subject
 
-from tank_lab_to_nwb.virmen.layout import insert_session_id, organize_for_dandi, write_stub_dandiset_yaml
+from tank_lab_to_nwb.virmen.layout import insert_description, insert_session_id, organize_for_dandi, write_stub_dandiset_yaml
 
 
 def _write_nwb(path, subject_id="mouse-1", session_id="20260101"):
@@ -121,3 +121,45 @@ class TestOrganize:
             io.write(nwbfile)
         with pytest.raises(Exception):
             organize_for_dandi(staging, tmp_path / "dandiset")
+
+
+class TestInsertDescription:
+    def test_goes_after_the_session(self):
+        assert insert_description("sub-a_ses-1_behavior+ophys.nwb", "suite2p") == "sub-a_ses-1_desc-suite2p_behavior+ophys.nwb"
+
+    def test_a_subject_containing_ses_does_not_confuse_it(self):
+        assert insert_description("sub-moses_ses-1_ophys.nwb", "rawtiff") == "sub-moses_ses-1_desc-rawtiff_ophys.nwb"
+
+    def test_needs_a_session(self):
+        with pytest.raises(ValueError, match="session"):
+            insert_description("sub-a_behavior.nwb", "suite2p")
+
+    def test_a_second_description_is_refused(self):
+        with pytest.raises(ValueError, match="already"):
+            insert_description("sub-a_ses-1_desc-raw_ophys.nwb", "suite2p")
+
+    @pytest.mark.parametrize("description", ["", "raw_tiff", "raw tiff", "raw-tiff", "../x"])
+    def test_only_letters_and_digits_fit_in_a_name(self, description):
+        with pytest.raises(ValueError, match="description"):
+            insert_description("sub-a_ses-1_ophys.nwb", description)
+
+
+def test_two_views_of_a_session_share_one_dandiset(tmp_path):
+    dandiset = tmp_path / "dandiset"
+    names = []
+    for description in ("rawtiff", "suite2p"):
+        staging = tmp_path / f"staging-{description}"
+        staging.mkdir()
+        _write_nwb(staging / "session.nwb")
+        names += [path.name for path in organize_for_dandi(staging, dandiset, description=description)]
+    assert names == ["sub-mouse-1_ses-20260101_desc-rawtiff_behavior.nwb", "sub-mouse-1_ses-20260101_desc-suite2p_behavior.nwb"]
+    assert sorted(path.name for path in dandiset.rglob("*.nwb")) == names
+
+
+def test_organizing_a_description_again_replaces_its_file(tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    _write_nwb(staging / "session.nwb")
+    organize_for_dandi(staging, tmp_path / "dandiset", description="suite2p")
+    organize_for_dandi(staging, tmp_path / "dandiset", description="suite2p")
+    assert len(list((tmp_path / "dandiset").rglob("*.nwb"))) == 1
