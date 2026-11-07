@@ -13,18 +13,33 @@ from pynwb import validate
 from scipy.io import loadmat
 
 from tank_lab_to_nwb.virmen.convert import convert_log
+from tank_lab_to_nwb.virmen.convert_folder import SessionSelectionError, check_session, select_logs
 from tank_lab_to_nwb.virmen.loader import load_log, records
 from tank_lab_to_nwb.virmen.session import normalize_log
 
 CORPUS = os.environ.get("VIRMEN_CORPUS")
-LOGS = sorted(Path(CORPUS).glob("*/*/*_g0/*.mat")) if CORPUS else []
+LOGS = sorted(Path(CORPUS).glob("*/*/*_g*/*.mat")) if CORPUS else []
 pytestmark = [pytest.mark.corpus, pytest.mark.skipif(not LOGS, reason="VIRMEN_CORPUS is not set")]
 # Index ids keep subject names out of test output.
 each_log = pytest.mark.parametrize("path", LOGS, ids=[f"log{i:02d}" for i in range(len(LOGS))])
 
 
-def test_all_37_logs_are_found():
-    assert len(LOGS) == 37
+def test_all_39_logs_are_found():
+    assert len(LOGS) == 39
+
+
+def test_every_log_agrees_with_its_folder_and_one_session_needs_choosing():
+    # One day has two gates of one subject. Nothing else may conflict, and every log must say the day and subject its folder does.
+    with pytest.raises(SessionSelectionError) as error:
+        select_logs(CORPUS)
+    conflicts = str(error.value).splitlines()[1:-1]
+    assert len(conflicts) == 1
+    key, gates = conflicts[0].strip().split(" has ")
+    subject, day = key.split("/")
+    selected = select_logs(CORPUS, choices={(subject, day): gates.split(", ")})
+    assert len(selected) == 39
+    for item in selected:
+        check_session(item, normalize_log(load_log(item.path), file=item.path))
 
 
 @each_log
@@ -119,7 +134,7 @@ def test_loader_agrees_with_scipy_on_every_plain_value(path):
 
 # Sorted-path indexes of the logs whose first block was stamped during setup, and how each is anchored. A new index here
 # means another log hit the fallback: see docs/virmen-timing.md.
-SETUP_STAMPED = {0: "engine_timestamps", 1: "session_end_upper_bound", 2: "session_end_upper_bound"}
+SETUP_STAMPED = {0: "engine_timestamps", 1: "session_end_upper_bound", 2: "session_end_upper_bound", 4: "session_end_upper_bound", 5: "session_end_upper_bound"}
 TIME_TOLERANCE = 0.001  # trial times are logged in single precision: about 0.24 ms at an hour
 
 

@@ -132,7 +132,11 @@ def write_session(session, nwbfile_path, metadata=None):
 
 def convert_log(log_path, nwbfile_path, metadata=None):
     """Convert one log, verify the file against the normalized values, and write its coverage report beside it."""
-    session = normalize_log(load_log(log_path), file=log_path)
+    return write_and_verify(normalize_log(load_log(log_path), file=log_path), nwbfile_path, metadata)
+
+
+def write_and_verify(session, nwbfile_path, metadata=None):
+    """Write a normalized session, verify the file against it, and write its coverage report beside it."""
     write_session(session, nwbfile_path, metadata)
     verify_round_trip(session, nwbfile_path)
     report = Path(nwbfile_path).with_suffix(".coverage.json")
