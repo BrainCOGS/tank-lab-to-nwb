@@ -139,7 +139,10 @@ def verify_combined(root):
         }
         expected["yrange"] = [0, expected["Ly"]]
         expected["xrange"] = [0, expected["Lx"]]
-        expected["save_path"] = str(combined)
+        if Path(actual["save_path"]).parts[-2:] != combined.parts[-2:]:
+            raise ValueError("combined storage path is not the expected combined folder")
+        # Suite2p preserves whether its caller supplied a relative or absolute root.
+        expected["save_path"] = actual["save_path"]
         same(actual, expected, "combined db")
         report["all_metadata_and_tiled_images_match"] = True
     return report
