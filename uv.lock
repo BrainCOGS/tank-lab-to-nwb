@@ -3265,6 +3265,7 @@ dependencies = [
     { name = "nwbwidgets" },
     { name = "pandas" },
     { name = "pynwb" },
+    { name = "scipy" },
     { name = "spikeinterface" },
     { name = "tifffile" },
 ]
@@ -3293,6 +3294,7 @@ requires-dist = [
     { name = "nwbwidgets" },
     { name = "pandas", specifier = ">=3" },
     { name = "pynwb", specifier = ">=4.2" },
+    { name = "scipy" },
     { name = "spikeinterface", specifier = ">=0.102.1" },
     { name = "tifffile" },
 ]
