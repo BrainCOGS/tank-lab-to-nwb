@@ -653,3 +653,24 @@ class TestAllNanColumns:
         session = _normalize(make_log(version=make_version(mazes=[make_maze(variable={"lStart": "NaN", "lCue": "Inf", "lMemory": "0"})])))
         assert "lStart" not in [column.name for column in session.mazes]
         assert any("lStart" in reason for reason in session.coverage.omitted.values())
+
+    def test_a_ragged_column_of_only_nan_is_left_out_and_listed(self):
+        maze = make_maze()
+        maze["criteria"] = {**maze.get("criteria", {}), "easyBlock": np.array([[np.nan]])}
+        session = _normalize(make_log(version=make_version(mazes=[maze])))
+        assert "easyBlock" not in [column.name for column in session.mazes]
+        assert "NaN" in session.coverage.omitted["log.version.mazes.criteria.easyBlock"]
+
+
+class TestEmptyTextAttributes:
+    def test_an_empty_optional_text_attribute_is_left_out_and_listed(self):
+        log = make_log()
+        log["animal"]["manipulationType"] = ""
+        session = _normalize(log)
+        assert "manipulationType" not in session.animal
+        assert "empty" in session.coverage.omitted["log.animal.manipulationType"]
+        assert "log.animal.manipulationType" not in session.coverage.written
+
+    def test_text_with_a_value_stays(self):
+        session = _normalize(make_log())
+        assert session.animal["manipulationType"] == "none"
