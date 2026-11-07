@@ -402,7 +402,7 @@ class TestCompleteness:
         path = tmp_path / "out.nwb"
         convert_session(log, stack, path, file="session.mat")
         report = json.loads(path.with_suffix(".report.json").read_text())
-        assert report["alignment"]["acquisition.completeness"].startswith("complete")
+        assert report["alignment"]["acquisition.completeness"].startswith("no gap found")
 
 
 class TestFinding:
@@ -430,3 +430,152 @@ class TestFinding:
         monkeypatch.setattr(cli, "convert_session", run)
         path = cli.convert("session.mat", tmp_path / "out", [tmp_path], allow_incomplete=False)
         assert path.exists()
+
+
+class TestReviewFindings:
+    """Cases an independent check of the real split data and of unusual layouts turned up."""
+
+    def _field(self, rows, center=(1.0, 0.0), size=(8.0, 8.0), rotation=0):
+        return {"pixelResolutionXY": [4, rows], "sizeXY": list(size), "centerXY": list(center), "rotationDegrees": rotation}
+
+    # The splitter's replace changes an I2C packet stamped with exactly the frame's time.
+    def test_a_packet_stamped_with_the_frame_time_is_recognized_as_the_splitters_change(self, tmp_path):
+        packets = {2: [(FRAME_PERIOD, (1, 1, 1))], 3: [(0.05, (1, 1, 3))]}
+        stack = write_stack(tmp_path, 8, THREE, frames_per_file=8, packets=packets)
+        acquisition = read_acquisition(split_stack(stack, tmp_path / "split", THREE), allow_incomplete=True)
+        assert acquisition.packets["iteration"].tolist() == [1, 3]
+        assert acquisition.packets["timestamp"].tolist() == [0.02, 0.05]
+        assert acquisition.split_packet_changes == 1
+
+    def test_a_stack_has_no_such_changes(self, tmp_path):
+        assert read_acquisition(write_stack(tmp_path, 3, THREE)).split_packet_changes == 0
+
+    def test_the_change_is_recorded_in_the_file(self, tmp_path, log):
+        folder = tmp_path / "s"
+        folder.mkdir()
+        packets = _packets(log, 801)
+        number = sorted(packets)[10]
+        packets[number] = [(FRAME_PERIOD * (number - 1), packets[number][0][1]), *packets[number][1:]]
+        parts = split_stack(write_stack(folder, 801, THREE, frames_per_file=300, packets=packets), tmp_path / "split", THREE)
+        path = tmp_path / "out.nwb"
+        convert_session(log, parts, path, file="session.mat", allow_incomplete=True)
+        with h5py.File(path, "r") as file:
+            table = file["processing/ophys/scanimage_alignment"]
+            values = dict(zip(table["key"].asstr()[()], table["value"].asstr()[()]))
+        assert values["acquisition.split_packet_changes"] == "1"
+
+    def test_any_other_packet_time_difference_is_still_refused(self, tmp_path):
+        one = tmp_path / "a"
+        two = tmp_path / "b"
+        one.mkdir()
+        two.mkdir()
+        first = split_stack(write_stack(one, 8, THREE, frames_per_file=8, packets={2: [(0.03, (1, 1, 1))]}), tmp_path / "s1", THREE)
+        second = split_stack(write_stack(two, 8, THREE, frames_per_file=8, packets={2: [(0.031, (1, 1, 1))]}), tmp_path / "s2", THREE)
+        mixed = tmp_path / "mixed"
+        mixed.mkdir()
+        chosen = []
+        for path in (first[0], second[1], first[2]):
+            target = mixed / path.name
+            target.write_bytes(path.read_bytes())
+            chosen.append(target)
+        with pytest.raises(ScanImageError, match="I2C"):
+            read_acquisition(chosen, allow_incomplete=True)
+
+    @pytest.mark.parametrize(("second_lag", "passes"), [(0.0011, True), (0.0012, False)])
+    def test_rounding_of_two_stamps_is_allowed_and_no_more(self, tmp_path, second_lag, passes):
+        import tifffile
+
+        stack = write_stack(tmp_path, 6, THREE, frames_per_file=6)
+        parts = split_stack(stack, tmp_path / "split", THREE)
+        path = next(item for item in parts if "ROI02" in item.name)
+        with tifffile.TiffFile(path) as source:
+            pages = [(page.asarray(), page.description) for page in source.pages]
+        with tifffile.TiffWriter(path) as writer:
+            for index, (pixels, text) in enumerate(pages):
+                base = (index) * FRAME_PERIOD
+                lag = {0: 0.0009, 3: second_lag}.get(index, 0.001)
+                old = text.split("frameTimestamps_sec = ")[1].split("\n")[0]
+                writer.write(pixels, description=text.replace(f"frameTimestamps_sec = {old}", f"frameTimestamps_sec = {base + lag:.4f}"), contiguous=False, metadata=None)
+        if passes:
+            assert read_acquisition(parts, allow_incomplete=True)
+        else:
+            with pytest.raises(ScanImageError, match="lag"):
+                read_acquisition(parts, allow_incomplete=True)
+
+    # Geometry
+    def test_scanfields_that_differ_by_depth_are_refused(self, tmp_path):
+        rois = [dict(rows=3, z=[10, 50], scanfields=[self._field(3), self._field(3, center=(9.0, 8.0))]), dict(rows=3, z=[10, 50], scanfields=[self._field(3), self._field(3)])]
+        with pytest.raises(ScanImageError, match="scanfields"):
+            read_acquisition(write_stack(tmp_path, 4, rois, zs=(10, 50), page_rows=8))
+
+    def test_identical_scanfields_are_one_scanfield(self, tmp_path):
+        rois = [dict(rows=3, z=[10, 50], scanfields=[self._field(3), self._field(3)]), dict(rows=3, z=[10, 50], scanfields=[self._field(3), self._field(3)])]
+        assert len(read_acquisition(write_stack(tmp_path, 4, rois, zs=(10, 50), page_rows=8)).fields) == 4
+
+    def test_a_rotated_scanfield_is_refused(self, tmp_path):
+        with pytest.raises(ScanImageError, match="rotat"):
+            read_acquisition(write_stack(tmp_path, 3, [dict(rows=3, rotation=30), dict(rows=3)], page_rows=8))
+
+    # Depths of split files
+    def test_swapped_depth_folders_are_refused(self, tmp_path):
+        rois = [dict(rows=3, z=10), dict(rows=3, z=50)]
+        stack = write_stack(tmp_path, 6, rois, zs=(10, 50), page_rows=3, frames_per_file=8)
+        parts = split_stack(stack, tmp_path / "split", rois, zs=(10, 50))
+        swapped = tmp_path / "swapped"
+        swapped.mkdir()
+        chosen = []
+        for path in parts:
+            name = path.name.replace("_z1_", "_zX_").replace("_z2_", "_z1_").replace("_zX_", "_z2_")
+            target = swapped / name
+            target.write_bytes(path.read_bytes())
+            chosen.append(target)
+        with pytest.raises(ScanImageError, match="depth"):
+            read_acquisition(chosen, allow_incomplete=True)
+
+    def test_a_file_boundary_inside_a_volume_is_refused_when_the_splitter_restarted_its_cycle(self, tmp_path):
+        rois = [dict(rows=3, z=10), dict(rows=3, z=50)]
+        stack = write_stack(tmp_path, 7, rois, zs=(10, 50), page_rows=3, frames_per_file=3)
+        parts = split_stack(stack, tmp_path / "split", rois, zs=(10, 50), file_local_depth=True)
+        with pytest.raises(ScanImageError, match="depth|frame"):
+            read_acquisition(parts, allow_incomplete=True)
+
+    def test_settings_whose_depths_are_not_ascending_are_refused_for_split_files(self, tmp_path):
+        rois = [dict(rows=3, z=50), dict(rows=3, z=10)]
+        text = mroi_software(zs=(50, 10), **{"SI.hRoiManager.mroiEnable": "0"})
+        stack = write_stack(tmp_path, 6, rois, zs=(50, 10), page_rows=3, frames_per_file=8)
+        parts = split_stack(stack, tmp_path / "split", [rois[1], rois[0]], zs=(10, 50), keep_tags=True, software_text=text, artist_text=mroi_artist(rois))
+        with pytest.raises(ScanImageError, match="depth"):
+            read_acquisition(parts, allow_incomplete=True)
+
+    # A ROI that's missing altogether
+    def test_a_roi_named_in_the_settings_but_not_given_is_refused(self, tmp_path):
+        text = mroi_software(**{"SI.hRoiManager.mroiEnable": "0"})
+        rois = [dict(rows=3), dict(rows=3)]
+        stack = write_stack(tmp_path, 6, rois, page_rows=8, frames_per_file=8)
+        parts = split_stack(stack, tmp_path / "split", rois, keep_tags=True, software_text=text, artist_text=mroi_artist(rois))
+        lone = tmp_path / "lone"
+        lone.mkdir()
+        target = lone / next(path for path in parts if "ROI02" in path.name).name
+        target.write_bytes(next(path for path in parts if "ROI02" in path.name).read_bytes())
+        with pytest.raises(ScanImageError, match="ROI 1"):
+            read_acquisition([target], allow_incomplete=True)
+
+    def test_without_settings_the_set_of_rois_is_said_to_be_unknown(self, split):
+        assert "which ROIs" in read_acquisition(split, allow_incomplete=True).completeness
+
+    # Completeness
+    def test_more_frames_than_requested_is_refused(self, tmp_path):
+        text = mroi_software(**{"SI.hStackManager.numVolumes": "2"})
+        with pytest.raises(ScanImageError, match="requested"):
+            read_acquisition(write_stack(tmp_path, 3, THREE, software_text=text))
+
+    def test_a_short_last_file_says_only_that_no_gap_was_found(self, tmp_path):
+        text = mroi_software(**{"SI.hScan2D.logFramesPerFile": "4"})
+        completeness = read_acquisition(write_stack(tmp_path, 6, THREE, frames_per_file=4, software_text=text)).completeness
+        assert completeness.startswith("no gap found")
+        assert "not proof" in completeness
+
+    def test_every_requested_volume_is_complete(self, tmp_path):
+        text = mroi_software(**{"SI.hScan2D.logFramesPerFile": "4", "SI.hStackManager.numVolumes": "8"})
+        completeness = read_acquisition(write_stack(tmp_path, 8, THREE, frames_per_file=4, software_text=text)).completeness
+        assert completeness.startswith("complete")
