@@ -240,7 +240,7 @@ def _add_field(nwbfile, prepared, field, channel, device, imaging, limit):
     if layout.line_period is not None:
         series_options["scan_line_rate"] = 1 / layout.line_period
     source = (
-        "Split copy of this ROI, clipped at 0 by the splitter, so it isn't the raw signal: (time, x, y), where x runs along a scan line."
+        "Split copy of this ROI, with negative values set to 0 by the splitter as the lab intends: (time, x, y), where x runs along a scan line."
         if acquisition.source == SPLIT_SOURCE
         else "Raw frames, exactly as saved by ScanImage: (time, x, y), where x runs along a scan line."
     )

@@ -357,9 +357,9 @@ class TestSplitFile:
             meanings = dict(zip(table["key"].asstr()[()], table["meaning"].asstr()[()]))
             description = file["acquisition/TwoPhotonSeriesPlane0Roi1"].attrs["description"]
         assert "split" in values["acquisition.source"]
-        assert "clipped" in meanings["acquisition.source"]
+        assert "negative values set to 0" in meanings["acquisition.source"]
         assert "rounded" in meanings["acquisition.source"]
-        assert "clipped" in description
+        assert "negative values set to 0" in description
 
     def test_verify_passes_and_catches_a_changed_pixel(self, written):
         prepared, path, tiffs = written

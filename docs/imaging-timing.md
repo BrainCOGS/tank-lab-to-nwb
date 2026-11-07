@@ -93,7 +93,7 @@ session, and given a folder it uses the first it finds: `originalStacks`, TIFFs 
 
 | | Original stack | Split `ROI<r>_z<d>` folders |
 |---|---|---|
-| Pixels | As ScanImage saved them, `int16` | The splitter's copy: `uint16`, negatives clipped to 0 |
+| Pixels | As ScanImage saved them, `int16` | The splitter's copy: `uint16`, negatives set to 0 on purpose |
 | Pixels between ROIs | Kept in `FlybackLinesPlane<p>`, so every page can be rebuilt exactly | Gone |
 | Frame times | ScanImage's | Rounded to 0.1 ms by the splitter |
 | When a ROI's frame was scanned | Frame start + first row x line period | Frame start + the splitter's lag, which is the fly-to time per ROI and understates it |
