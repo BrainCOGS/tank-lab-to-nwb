@@ -1,5 +1,8 @@
 """Synthetic Suite2p output: all coordinates and counts are deliberately small."""
 
+import hashlib
+import json
+
 import h5py
 import numpy as np
 import pytest
@@ -7,8 +10,11 @@ from pynwb import validate
 
 from tests.synthetic_tiff import frame_pixels
 from tests.test_imaging_nwb import log, tiffs  # noqa: F401
-from tank_lab_to_nwb.imaging.convert import prepare_session
-from tank_lab_to_nwb.imaging.suite2p import load_suite2p
+from tank_lab_to_nwb.imaging import convert_suite2p as cli
+from tank_lab_to_nwb.imaging.alignment import AlignmentError
+from tank_lab_to_nwb.imaging.convert import convert_session, prepare_session
+from tank_lab_to_nwb.imaging.suite2p import convert_suite2p, load_suite2p, read_companion, verify_suite2p
+from tank_lab_to_nwb.imaging.verify import RoundTripError
 
 
 @pytest.fixture
@@ -327,3 +333,90 @@ def test_numpy_scalars_nested_in_stat_lists_roundtrip(tmp_path, log, tiffs, run)
     convert_suite2p(log, tiffs, run, path, file="session.mat")
     with h5py.File(path) as f:
         assert f["processing/ophys/ImageSegmentation/PlaneSegmentation0/stat_med"].asstr()[0] == "[1, 2]"
+
+
+@pytest.fixture
+def raw_file(tmp_path, log, tiffs):
+    path = tmp_path / "raw.nwb"
+    convert_session(log, tiffs, path, file="session.mat")
+    return path
+
+
+def _alignment(path):
+    with h5py.File(path, "r") as file:
+        table = file["processing/scanimage/alignment"]
+        return dict(zip(table["key"].asstr()[()], table["value"].asstr()[()]))
+
+
+def test_the_raw_file_it_goes_with_is_recorded(tmp_path, log, tiffs, run, raw_file):
+    output = tmp_path / "s2p.nwb"
+    convert_suite2p(log, tiffs, run, output, file="session.mat", raw_nwb=raw_file)
+    assert _alignment(output)["acquisition.id"] == _alignment(raw_file)["acquisition.id"]
+    with h5py.File(raw_file, "r") as raw, h5py.File(output, "r") as file:
+        table = file["processing/scanimage/companion_files"]
+        assert table["desc"].asstr()[0] == "rawtiff"
+        assert table["identifier"].asstr()[0] == raw["identifier"].asstr()[()]
+        assert table["identifier"].asstr()[0] != file["identifier"].asstr()[()]
+    assert table_sha(output) == hashlib.sha256(raw_file.read_bytes()).hexdigest()
+
+
+def table_sha(path):
+    with h5py.File(path, "r") as file:
+        return file["processing/scanimage/companion_files/sha256"].asstr()[0]
+
+
+def test_no_raw_file_means_no_companion_table(tmp_path, log, tiffs, run):
+    output = tmp_path / "s2p.nwb"
+    convert_suite2p(log, tiffs, run, output, file="session.mat")
+    with h5py.File(output, "r") as file:
+        assert "companion_files" not in file["processing/scanimage"]
+
+
+def test_a_raw_file_from_another_acquisition_is_refused(tmp_path, log, tiffs, run, raw_file):
+    with h5py.File(raw_file, "r+") as file:
+        table = file["processing/scanimage/alignment"]
+        keys = list(table["key"].asstr()[()])
+        table["value"][keys.index("acquisition.id")] = "another"
+    with pytest.raises(AlignmentError, match="another acquisition"):
+        convert_suite2p(log, tiffs, run, tmp_path / "s2p.nwb", file="session.mat", raw_nwb=raw_file)
+
+
+def test_a_raw_file_on_a_different_clock_is_refused(tmp_path, log, tiffs, run, raw_file):
+    with h5py.File(raw_file, "r+") as file:
+        times = file["processing/scanimage/frames/session_time"]
+        times[3] = times[3] + 1e-9
+    with pytest.raises(AlignmentError, match="clock"):
+        convert_suite2p(log, tiffs, run, tmp_path / "s2p.nwb", file="session.mat", raw_nwb=raw_file)
+
+
+@pytest.mark.parametrize("column", ["dc_over_voltage", "acquisition_number", "next_file_marker_timestamp", "page_index"])
+def test_verify_catches_a_changed_header_column(tmp_path, log, tiffs, run, column):
+    output = tmp_path / "s2p.nwb"
+    prepared = convert_suite2p(log, tiffs, run, output, file="session.mat")
+    with h5py.File(output, "r+") as file:
+        data = file[f"processing/scanimage/frames/{column}"]
+        data[4] = data[4] + 1
+    with pytest.raises(RoundTripError):
+        verify_suite2p(prepared, output, run, tiffs)
+
+
+def test_verify_catches_a_changed_companion_record(tmp_path, log, tiffs, run, raw_file):
+    output = tmp_path / "s2p.nwb"
+    prepared = convert_suite2p(log, tiffs, run, output, file="session.mat", raw_nwb=raw_file)
+    expected = read_companion(raw_file, prepared)
+    with h5py.File(output, "r+") as file:
+        file["processing/scanimage/companion_files/sha256"][0] = "changed"
+    with pytest.raises(RoundTripError, match="companion"):
+        verify_suite2p(prepared, output, run, tiffs, companion=expected)
+
+
+def test_the_report_lists_what_was_dropped_and_the_companion(tmp_path, log, tiffs, run, raw_file, monkeypatch):
+    def with_log(_path, tiff_paths, root, output, **options):
+        return convert_suite2p(log, tiff_paths, root, output, file="session.mat", **options)
+
+    monkeypatch.setattr(cli, "convert_suite2p", with_log)
+    path = cli.convert("session.mat", run, tmp_path / "out", tiffs, raw_nwb=raw_file)
+    report = json.loads(path.with_suffix(".report.json").read_text())
+    assert {"log.currentTrial", "log.currentIt"} <= set(report["coverage"]["dropped"])
+    assert report["companion"]["desc"] == "rawtiff"
+    assert report["alignment"]["frames"] == 801
