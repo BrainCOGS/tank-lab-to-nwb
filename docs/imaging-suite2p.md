@@ -5,12 +5,17 @@ with NumPy; Suite2p and torch are not converter dependencies. Object NPY files c
 trusted run. Nothing uploads.
 
 ```
-python -m tank_lab_to_nwb.imaging.convert_suite2p LOG.mat SUITE2P_DIR OUTPUT_DIR TIFF [TIFF ...]
+python -m tank_lab_to_nwb.imaging.convert_suite2p LOG.mat SUITE2P_DIR OUTPUT_DIR TIFF [TIFF ...] [--raw-nwb RAW.nwb]
 ```
 
 The output is `OUTPUT_DIR/staging/suite2p.nwb`, with a report beside it. Organize it using
-`virmen.layout.organize_for_dandi(staging, separate_dandiset)` before local DANDI validation. Keep this separate from
-the raw imaging dandiset, since the subject and session identifiers are shared.
+`virmen.layout.organize_for_dandi(staging, dandiset, description="suite2p")` before local DANDI validation. It can share a
+dandiset with the raw file, named with `description="rawtiff"`: the two get the same subject and session and differ by `desc-`.
+
+The two files are tied together in three ways. Both carry the same `subject_id` and `session_id`, and the same `acquisition.id`
+in `processing/scanimage/alignment`. With `--raw-nwb`, this converter also checks that the raw file has that `acquisition.id` and
+exactly the same frame times, refusing it otherwise, and records its NWB identifier and SHA256 in
+`processing/scanimage/companion_files`. The raw file can't name this one, because it's written first.
 
 ## Alignment and what it means
 
@@ -147,8 +152,7 @@ It was organized with a separate local stub dandiset and the `ses-` filename fix
 The Inspector uvx environment pinned `pynwb==4.2.0`, `hdmf==6.2.0`, `h5py==3.13.0`, and `numpy==2.5.4`, with the local
 schema extension 0.4.1. This avoids an unrelated source-build attempt for a newer h5py. No upstream package was changed.
 
-`registration.do_bidiphase=False` remains unchanged on this bidirectionally scanned acquisition and is an open user
-decision. Indicator, location `root`, and NaN wavelengths retain the raw converter's placeholders. The pending behavior
+`registration.do_bidiphase=False` stays as configured on this bidirectionally scanned acquisition, by decision. Indicator, location `root`, and NaN wavelengths retain the raw converter's placeholders. The pending behavior
 field decisions were not changed. Biological validity of the ROI detection and deconvolution was not assessed.
 No data was uploaded and no PR was opened or branch pushed.
 

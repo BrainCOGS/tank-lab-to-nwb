@@ -1,8 +1,9 @@
 """Convert a trusted Suite2p run with TIFF/behavior timing. Nothing here uploads.
 
-python -m tank_lab_to_nwb.imaging.convert_suite2p LOG SUITE2P OUTPUT TIFF [TIFF ...]
-OUTPUT/staging/suite2p.nwb and suite2p.report.json are created. Use the existing
-virmen.layout.organize_for_dandi on staging and a separate OUTPUT/dandiset.
+python -m tank_lab_to_nwb.imaging.convert_suite2p LOG SUITE2P OUTPUT TIFF [TIFF ...] [--raw-nwb RAW.nwb]
+OUTPUT/staging/suite2p.nwb and suite2p.report.json are created. With --raw-nwb, the raw TIFF file of this acquisition is
+checked and recorded. Name it with virmen.layout.organize_for_dandi(staging, dandiset, description="suite2p"), which can
+share a dandiset with the raw file.
 """
 
 import argparse
@@ -13,7 +14,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from .convert import alignment_summary
+from .convert import conversion_report
 from .suite2p import _sources, convert_suite2p
 
 
@@ -148,7 +149,7 @@ def verify_combined(root):
     return report
 
 
-def convert(log, root, output, tiffs):
+def convert(log, root, output, tiffs, raw_nwb=None):
     """Write and verify, then report source inventory and measured alignment beside NWB."""
     root, output = Path(root), Path(output)
     staging = output / "staging"
@@ -159,11 +160,14 @@ def convert(log, root, output, tiffs):
         raise OSError(f"Need {source_bytes * 3} bytes of free disk; found {free}")
     path = staging / "suite2p.nwb"
     combined = verify_combined(root)
-    prepared = convert_suite2p(log, tiffs, root, path)
+    prepared = convert_suite2p(log, tiffs, root, path, raw_nwb=raw_nwb)
     with h5py.File(path) as f:
         evidence = json.loads(f["scratch/suite2p_frame_mapping"].asstr()[()])
+        table = f["processing/scanimage"].get("companion_files")
+        companion = {name: table[name].asstr()[0] for name in table if name != "id"} if table is not None else None
     report = dict(
-        alignment=alignment_summary(prepared),
+        **conversion_report(prepared),
+        companion=companion,
         combined=combined,
         artifacts=artifact_inventory(root),
         mapping=evidence,
@@ -182,8 +186,9 @@ def main():
     parser.add_argument("suite2p", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("tiffs", type=Path, nargs="+")
+    parser.add_argument("--raw-nwb", type=Path, help="The raw TIFF NWB file of this acquisition, to check and record.")
     args = parser.parse_args()
-    print(convert(args.log, args.suite2p, args.output, args.tiffs))
+    print(convert(args.log, args.suite2p, args.output, args.tiffs, raw_nwb=args.raw_nwb))
 
 
 if __name__ == "__main__":

@@ -81,7 +81,42 @@ def _sources(root):
     return sorted(p for p in Path(root).rglob("*") if p.is_file() and p.name != "data.bin")
 
 
-def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None):
+_COMPANION_COLUMNS = {
+    "desc": "The file's desc- value in its DANDI name.",
+    "identifier": "That file's NWB identifier.",
+    "sha256": "SHA256 of that file when this one was written.",
+    "relation": "How the two files relate.",
+}
+
+
+def read_companion(raw_nwb, prepared):
+    """What ties a raw TIFF file to this one. Refuses a file from another acquisition or on another clock."""
+    import h5py
+    import hashlib
+
+    from .alignment import AlignmentError, acquisition_id
+    from .verify import _alignment_values
+
+    with h5py.File(raw_nwb, "r") as file:
+        scanimage = file["processing/scanimage"]
+        if _alignment_values(scanimage["alignment"]).get("acquisition.id") != acquisition_id(prepared.acquisition):
+            raise AlignmentError(f"{raw_nwb}: this file comes from another acquisition")
+        if not np.array_equal(scanimage["frames/session_time"][()], prepared.frame_times):
+            raise AlignmentError(f"{raw_nwb}: its frame times differ, so the two files aren't on the same clock")
+        identifier = file["identifier"].asstr()[()]
+    digest = hashlib.sha256()
+    with open(raw_nwb, "rb") as handle:
+        while chunk := handle.read(64_000_000):
+            digest.update(chunk)
+    return dict(
+        desc="rawtiff",
+        identifier=identifier,
+        sha256=digest.hexdigest(),
+        relation="Raw frames of the same acquisition, on the same clock: acquisition.id and every frame time were checked against that file when this one was written.",
+    )
+
+
+def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion=None):
     """Build ophys interfaces plus a byte-exact source archive for fields without an NWB equivalent."""
     import hashlib
     from hdmf.backends.hdf5.h5_utils import H5DataIO
@@ -109,9 +144,18 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None):
         "session-start shift and frame-time fit. Raw pixels are external and are not duplicated here. "
         "Per-plane Suite2p folders define lengths; combined contains padded display traces. "
         "Original Suite2p artifacts except data.bin are preserved byte-for-byte in scratch; object NPY files require a trusted pickle reader. "
-        "registration.do_bidiphase is preserved without modification; decide separately whether this bidirectional rig needs correction."
+        "registration.do_bidiphase is False, as configured, on this bidirectionally scanned rig. "
+        "Files of this acquisition share acquisition.id in processing/scanimage/alignment; processing/scanimage/companion_files names the raw file when it was given."
     )
     _add_scanimage_tables(nwb, prepared)
+    if companion is not None:
+        nwb.processing["scanimage"].add(
+            _table(
+                "companion_files",
+                "Other NWB files made from this acquisition, checked against this one when it was written.",
+                [(name, text, np.array([companion[name]], dtype=object)) for name, text in _COMPANION_COLUMNS.items()],
+            )
+        )
     _add_in_progress(nwb, prepared)
     module = nwb.create_processing_module(
         "ophys",
@@ -314,7 +358,7 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None):
     return nwb
 
 
-def convert_suite2p(log, tiffs, root, output, file=None, metadata=None):
+def convert_suite2p(log, tiffs, root, output, file=None, metadata=None, raw_nwb=None):
     """Write, then independently verify; no upload or automatic organization."""
     from pynwb import NWBHDF5IO
     from .convert import prepare_session
@@ -324,18 +368,19 @@ def convert_suite2p(log, tiffs, root, output, file=None, metadata=None):
     from .suite2p_mapping import prove_frame_mapping
 
     mapping = prove_frame_mapping(prepared.acquisition, root)
+    companion = read_companion(raw_nwb, prepared) if raw_nwb is not None else None
     with NWBHDF5IO(str(output), "w") as io:
-        io.write(build_suite2p_nwbfile(prepared, root, metadata, mapping))
-    verify_suite2p(prepared, output, root, tiffs)
+        io.write(build_suite2p_nwbfile(prepared, root, metadata, mapping, companion))
+    verify_suite2p(prepared, output, root, tiffs, companion=companion)
     return prepared
 
 
-def verify_suite2p(prepared, output, root, tiffs):
+def verify_suite2p(prepared, output, root, tiffs, companion=None):
     """Compare HDF5 against fresh NumPy files and independently parsed TIFF headers, exactly."""
     import h5py
     import hashlib
     from ..virmen.verify import verify_round_trip, _check_series
-    from .verify import RoundTripError, _read_sources, _check_packets, _alignment_values
+    from .verify import RoundTripError, _alignment_values, _read_headers, check_scanimage_tables
 
     def equal(actual, expected, label):
         actual, expected = np.asarray(actual), np.asarray(expected)
@@ -345,39 +390,19 @@ def verify_suite2p(prepared, output, root, tiffs):
             raise RoundTripError(f"{label}: differs from source")
 
     verify_round_trip(prepared.session, output)
-    numbers, times, packets = _read_sources(tiffs)
+    headers = _read_headers(tiffs)
+    numbers, times = headers["columns"]["frame_number"], headers["columns"]["timestamp"]
     with h5py.File(output) as f:
         scan = f["processing/scanimage"]
-        equal(scan["frames/frame_number"][()], numbers, "frame numbers")
-        equal(scan["frames/timestamp"][()], times, "TIFF timestamps")
-        _check_packets(scan["i2c_packets"], packets)
+        check_scanimage_tables(scan, prepared, headers)
         values = _alignment_values(scan["alignment"])
         slope, intercept, offset = [float(values[f"fit.{k}"]) for k in ("slope", "intercept", "clock_offset")]
-        equal(
-            [slope, intercept, offset], [prepared.fit.slope, prepared.fit.intercept, prepared.clock_offset], "clock fit"
-        )
         session_times = (times - intercept) / slope + offset
-        equal(scan["frames/plane"][()], (numbers - 1) % prepared.acquisition.layout.n_planes, "plane indices")
-        equal(scan["frames/session_time"][()], prepared.frame_times, "prepared frame times")
-        for key, column in prepared.acquisition.frames.items():
-            if key in scan["frames"]:
-                equal(scan[f"frames/{key}"][()], column, "header " + key)
-        for key, expected in [
-            ("file_name", [x.name for x in prepared.acquisition.files]),
-            ("software", [x.software for x in prepared.acquisition.files]),
-            ("artist", [x.artist for x in prepared.acquisition.files]),
-        ]:
-            if list(scan[f"files/{key}"].asstr()[()]) != expected:
-                raise RoundTripError("source TIFF " + key + " differs")
         equal(scan["frames/session_time"][()], session_times, "session times")
-        for key in ("block", "trial", "iteration"):
-            equal(scan[f"frames/behavior_{key}"][()], prepared.labels[key], key)
-        for key, expected in [
-            ("elapsed", prepared.packet_elapsed),
-            ("session_time", prepared.packet_times),
-            ("used_in_fit", prepared.fit.used),
-        ]:
-            equal(scan[f"i2c_packets/{key}"][()], expected, key)
+        if companion is not None:
+            for name, value in companion.items():
+                if scan[f"companion_files/{name}"].asstr()[0] != value:
+                    raise RoundTripError(f"companion_files.{name} differs from the raw file")
         for series in prepared.in_progress:
             _check_series(f["processing/in_progress_trial"], series)
         o = f["processing/ophys"]
