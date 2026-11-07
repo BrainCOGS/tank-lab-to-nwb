@@ -119,7 +119,7 @@ def _saved_iterations(log):
 
 SOURCE_MEANING = {
     STACK_SOURCE: "The pages ScanImage wrote, pixel for pixel.",
-    SPLIT_SOURCE: "Copies the lab's ScanInfo splitter made from the original stack. Pixels were converted to uint16, which clipped negative values at 0, so they can't be compared with the original's dark offset. Frame times were rounded to 0.1 ms, and the splitter's replace also rounded any I2C packet stamped with exactly its frame's time. The original stack, if it exists, is the better source.",
+    SPLIT_SOURCE: "Copies the lab's ScanInfo splitter made from the original stack. Pixels were converted to uint16 with negative values set to 0, as the lab intends. Frame times were rounded to 0.1 ms, and the splitter's replace also rounded any I2C packet stamped with exactly its frame's time. The original stack, if it exists, is the better source.",
 }
 TIME_OFFSET = {
     STACK_SOURCE: "Seconds from the frame's start to this field's first row, from its row position and the line period. Its series timestamps include this.",
