@@ -111,7 +111,8 @@ def test_a_file_without_scanimage_metadata_is_an_error(tmp_path):
 def test_two_epochs_are_an_error(tmp_path):
     first = write_acquisition(tmp_path, 2, frames_per_file=2, stem="a_00001")
     (tmp_path / "b").mkdir()
-    write_acquisition(tmp_path / "b", 4, frames_per_file=2, stem="a_00001", epoch="[2026  7 15 11 59 51.000]")
+    second = write_acquisition(tmp_path / "b", 4, frames_per_file=2, stem="a_00001", epoch="[2026  7 15 11 59 51.000]")
+    second[0].unlink()
     with pytest.raises(ScanImageError, match="epoch"):
         read_acquisition([first[0], tmp_path / "b" / "a_00001_00002.tif"])
 

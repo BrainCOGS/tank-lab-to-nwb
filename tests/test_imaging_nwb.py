@@ -8,8 +8,10 @@ import numpy as np
 import pytest
 from pynwb import NWBHDF5IO, validate
 
+from tank_lab_to_nwb.imaging import alignment
 from tank_lab_to_nwb.imaging import convert_session as cli
 from tank_lab_to_nwb.imaging.convert import _int32, convert_session, prepare_session
+from tank_lab_to_nwb.imaging.scanimage import read_acquisition
 from tank_lab_to_nwb.imaging.verify import RoundTripError, verify_imaging
 from tank_lab_to_nwb.virmen.coerce import LossyConversionError
 from tests.synthetic_log import make_block, make_log, make_trial, scalar
@@ -426,19 +428,33 @@ def test_empty_in_progress_fields_are_named_in_the_file(tmp_path, log, tiffs):
     assert set(json.loads(rows["derived.in_progress_trial.empty_fields"])) == {"cueCombo", "emptyText"}
 
 
-def test_long_stretches_without_packets_are_recorded_like_the_pipelines_warning(tmp_path, log):
+def test_long_stretches_without_packets_are_recorded_like_the_pipelines_warning(tmp_path, log, monkeypatch):
+    # This fixture's packets span only 2 s of frames, so lower the threshold rather than the realism of the fit.
+    monkeypatch.setattr(alignment, "PACKET_GAP_SECONDS", 0.5)
     packets = _frame_packets(log, 801)
     folder = tmp_path / "gappy"
     folder.mkdir()
     numbers = sorted(packets)
-    missing = range(numbers[100], numbers[100] + 150)  # 3 s of frames at 50 Hz
-    kept = {number: value for number, value in packets.items() if number not in missing}
-    tiffs = write_acquisition(folder, 801, frames_per_file=300, packets=kept)
+    missing = set(numbers[20:70])  # 1 s of frames at 50 Hz
+    tiffs = write_acquisition(folder, 801, frames_per_file=300, packets={number: value for number, value in packets.items() if number not in missing})
     path = tmp_path / "gappy.nwb"
     convert_session(log, tiffs, path, file="session.mat")
     values = _alignment(path)
     assert values["labels.gaps_over_2s"] == "1"
-    assert float(values["labels.longest_gap_seconds"]) > 2.0
+    assert float(values["labels.longest_gap_seconds"]) == pytest.approx(49 * FRAME_PERIOD + FRAME_PERIOD, abs=1e-9)
+
+
+def test_a_gap_is_measured_from_its_first_frame_without_a_packet_to_the_next_packet(tmp_path):
+    packet = [(0.0, (1, 1, 1))]
+    paths = write_acquisition(tmp_path, 300, frames_per_file=400, packets={2: packet, 3: packet, 200: packet, 201: packet})
+    # Frames 4 to 199 have no packet: from frame 4 at 0.06 s to frame 200 at 3.98 s.
+    assert alignment.packet_gaps(read_acquisition(paths)).tolist() == [3.98 - 0.06]
+
+
+@pytest.mark.parametrize("packets", [{}, {5: [(0.0, (1, 1, 1))]}, {5: [(0.0, (1, 1, 1))], 6: [(0.0, (1, 1, 2))]}])
+def test_no_interior_gap_when_nothing_lies_between_packets(tmp_path, packets):
+    paths = write_acquisition(tmp_path, 10, frames_per_file=400, packets=packets)
+    assert alignment.packet_gaps(read_acquisition(paths)).size == 0
 
 
 def test_short_stretches_without_packets_are_not_counted(written):

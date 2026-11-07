@@ -1,5 +1,6 @@
 """Put imaging frames on the behavior clock using the I2C packets ViRMEn sends. See docs/imaging-timing.md."""
 
+import hashlib
 import json
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -10,12 +11,25 @@ from ..virmen.loader import records
 from ..virmen.session import Series, encode_setting
 
 MIN_PACKETS = 100
-# Rejection follows the pipeline's rule: more than max(5 MADs, 5 ms) from the line, until the kept set stops changing.
+# Rejection follows the Python port of the pipeline's sync: more than max(5 MADs, 5 ms) from the line, until the kept set
+# stops changing. The canonical MATLAB fits no line; it only labels frames.
 _REJECT_MADS, _REJECT_FLOOR_SECONDS = 5.0, 0.005
 # Beyond these the two clocks aren't related by a line, so the session needs a person to look at it.
 MAX_RATE_DIFFERENCE_PPM = 100.0
 MAX_REJECTED_FRACTION = 0.05
 MAX_RESIDUAL_SECONDS = 0.010
+# SyncImagingBehavior warns about interior stretches without packets longer than this (cfg.minBehaviorSecs).
+PACKET_GAP_SECONDS = 2.0
+
+METHOD = (
+    "A straight line from each packet's logged iteration time on ViRMEn's elapsed clock to its arrival on the ScanImage clock. Each trial's "
+    "first iteration is excluded. Start with ordinary least squares. Then reject packets further from the median residual than max(5 x MAD, "
+    "5 ms), with MAD scaled by 1.4826 and taken over the kept packets, refit by least squares on the rest, and repeat until the kept set stops changing."
+)
+SEND_LATENCY = (
+    "A constant, not corrected: the fit can't see the delay between the logged iteration time and the packet's arrival, so frame times run early by "
+    "that delay. It wasn't measured, and the ViRMEn source sets no upper bound, because packets go out from a separate thread after the iteration's work."
+)
 
 _IN_PROGRESS_FIELDS = {
     "time": ("seconds", "Seconds since this trial started."),
@@ -103,6 +117,11 @@ def _saved_iterations(log):
     return (count, trial) if count > 0 else (0, None)
 
 
+def _in_progress_trial(blocks):
+    """The block and trial numbers of the trial running at save, which comes after the block's saved trials."""
+    return len(blocks), len(records(blocks[-1]["trial"])) + 1
+
+
 def iteration_clock(log):
     """Each trial's elapsed-clock start and per-iteration times, including the trial that was running when the log was saved."""
     blocks = records(log["block"])
@@ -112,8 +131,7 @@ def iteration_clock(log):
             clock[(block_number, trial_number)] = (float(np.asarray(trial["start"]).item()), np.asarray(trial["time"], dtype="float64").ravel())
     count, current = _saved_iterations(log)
     if count and blocks:
-        key = (len(blocks), len(records(blocks[-1]["trial"])) + 1)
-        clock[key] = (float(np.asarray(current["start"]).item()), np.asarray(current["time"], dtype="float64").ravel()[:count])
+        clock[_in_progress_trial(blocks)] = (float(np.asarray(current["start"]).item()), np.asarray(current["time"], dtype="float64").ravel()[:count])
     return clock
 
 
@@ -219,7 +237,7 @@ def in_progress_series(log, offset):
     allocated = time.size
     start = float(np.asarray(trial["start"]).item())
     timestamps = start + offset + time[:count]
-    series, other = [], {}
+    series, other, empty = [], {}, []
     for name, value in trial.items():
         if isinstance(value, np.ndarray) and value.dtype != object and value.ndim and value.shape[0] == allocated and allocated >= count and name in _IN_PROGRESS_FIELDS:
             if _is_written(value[count:]):
@@ -229,7 +247,12 @@ def in_progress_series(log, offset):
             series.append(Series(name, data, timestamps, unit, description, "in_progress"))
         elif np.size(value) if not isinstance(value, str) else value:
             other[name] = value.item() if isinstance(value, np.ndarray) and value.size == 1 and value.dtype != object else value
-    record = dict(other, block=len(blocks), trial=len(records(blocks[-1]["trial"])) + 1, saved_iterations=count)
+        else:
+            empty.append(name)
+    block, trial_number = _in_progress_trial(blocks)
+    record = dict(other, block=block, trial=trial_number, saved_iterations=count)
+    if empty:
+        record["empty_fields"] = sorted(empty)
     return series, record
 
 
@@ -237,3 +260,49 @@ def in_progress_settings(record):
     """Settings rows describing the trial in progress, one per field."""
     meaning = "The trial running when ViRMEn saved the log. It isn't in the trials table; its per-iteration data is in processing/in_progress_trial."
     return [(f"derived.in_progress_trial.{name}", encode_setting(value), meaning) for name, value in record.items()]
+
+
+def packet_gaps(acquisition):
+    """Seconds spanned by each interior stretch of frames with no packet, measured as SyncImagingBehavior measures them."""
+    times = acquisition.frames["timestamp"]
+    with_packet = np.unique(acquisition.packets["frame_index"])
+    if with_packet.size < 2:
+        return np.zeros(0)
+    jumps = np.flatnonzero(np.diff(with_packet) > 1)
+    return times[with_packet[jumps + 1]] - times[with_packet[jumps] + 1]
+
+
+def acquisition_id(acquisition):
+    """A fingerprint of the acquisition itself, the same in every NWB file made from it."""
+    times = acquisition.frames["timestamp"]
+    parts = [acquisition.epoch, *(file.name for file in acquisition.files), str(times.size), repr(float(times[0])), repr(float(times[-1]))]
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+def alignment_rows(prepared):
+    """(key, value, meaning) for everything a reader needs to judge the alignment."""
+    fit, acquisition = prepared.fit, prepared.acquisition
+    gaps = packet_gaps(acquisition)
+    return [
+        ("acquisition.id", acquisition_id(acquisition), "Fingerprint of this acquisition: ScanImage's epoch, the TIFF names, the frame count, and the first and last frame times. Every NWB file made from this acquisition, raw TIFF or processed, carries the same value, along with the same subject_id and session_id."),
+        ("fit.method", METHOD, "How frames were put on the behavior clock. No wall clock is involved."),
+        ("fit.slope", repr(fit.slope), "ScanImage seconds per ViRMEn elapsed second."),
+        ("fit.intercept", repr(fit.intercept), "ScanImage clock reading when ViRMEn's elapsed clock read zero, in seconds."),
+        ("fit.clock_offset", repr(prepared.clock_offset), "Seconds added to elapsed time to get this file's time. Frame time = (frameTimestamps_sec - intercept) / slope + clock_offset."),
+        ("fit.n_packets", str(fit.n_packets), "Packets matched to logged iterations."),
+        ("fit.n_first_iteration", str(fit.n_first_iteration), "Packets from a trial's first iteration, which aren't fit because they're always sent late."),
+        ("fit.n_rejected", str(fit.n_rejected), "Packets rejected from the fit as off the line."),
+        ("fit.residual_min_ms", repr(fit.residual_ms["min"]), "Lowest packet residual, over all packets."),
+        ("fit.residual_p1_ms", repr(fit.residual_ms["p1"]), "1st percentile of packet residuals, over all packets."),
+        ("fit.residual_p50_ms", repr(fit.residual_ms["p50"]), "Median packet residual, over all packets."),
+        ("fit.residual_p99_ms", repr(fit.residual_ms["p99"]), "99th percentile of packet residuals, over all packets."),
+        ("fit.residual_max_ms", repr(fit.residual_ms["max"]), "Highest packet residual, over all packets. Packets are sent late, not early, so this says how late, not how wrong the frame times are."),
+        ("fit.kept_std_ms", repr(fit.kept_std_ms), "Standard deviation of the residuals of the fit packets. Residuals show how far packets sit from the line, not frame-time error."),
+        ("fit.within_5ms_fraction", repr(fit.within_5ms_fraction), "Fraction of all packets within 5 ms of the line."),
+        ("fit.send_latency", "not measured", SEND_LATENCY),
+        ("fit.frame_time_meaning", "start of frame", "Each timestamp marks the start of a frame; later lines in it were scanned up to one frame period later. The animal saw each iteration after a display delay that isn't measured."),
+        ("labels.gaps_over_2s", str(int(np.sum(gaps > PACKET_GAP_SECONDS))), "Interior stretches of frames with no packet lasting over 2 s, which SyncImagingBehavior warns about. The frame label columns repeat the last packet across these. The clock fit doesn't use those labels."),
+        ("labels.longest_gap_seconds", repr(float(gaps.max())) if gaps.size else "0.0", "The longest interior stretch of frames with no packet, in seconds on the ScanImage clock."),
+        ("scanimage.epoch", acquisition.epoch, "ScanImage's wall clock at its clock's zero, on its own computer. Not used for alignment."),
+        ("scanimage.aux_triggers", "empty", "auxTrigger0-3 were empty in every frame, so they aren't stored per frame."),
+    ]

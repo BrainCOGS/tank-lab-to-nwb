@@ -12,6 +12,7 @@ import numpy as np
 import tifffile
 
 from ..virmen.verify import RoundTripError, _check_series, verify_round_trip
+from .alignment import alignment_rows
 
 _CACHE_BYTES = 256_000_000
 _FIELD = r"^{} = (.*)$"
@@ -29,21 +30,51 @@ def _equal(stored, expected, label):
         raise RoundTripError(f"{label}: on disk differs from the source{difference}")
 
 
-def _read_sources(tiff_paths):
-    """Frame numbers, times and packets, parsed here from the raw descriptions."""
-    numbers, times, packets = [], [], []
-    for path in sorted(map(Path, tiff_paths), key=lambda p: p.name):
+_INTEGER_COLUMNS = {
+    "acquisition_number": "acquisitionNumbers",
+    "frame_number_acquisition": "frameNumberAcquisition",
+    "end_of_acquisition": "endOfAcquisition",
+    "end_of_acquisition_mode": "endOfAcquisitionMode",
+    "dc_over_voltage": "dcOverVoltage",
+}
+_FLOAT_COLUMNS = {
+    "acq_trigger_timestamp": "acqTriggerTimestamps_sec",
+    "next_file_marker_timestamp": "nextFileMarkerTimestamps_sec",
+}
+
+
+def _read_headers(tiff_paths):
+    """Every header value the file should hold, parsed here from the raw TIFFs."""
+    columns = {name: [] for name in ("file_index", "page_index", "frame_number", "timestamp", *_INTEGER_COLUMNS, *_FLOAT_COLUMNS)}
+    packets, epochs, files = [], set(), []
+    for file_index, path in enumerate(sorted(map(Path, tiff_paths), key=lambda p: p.name)):
         with tifffile.TiffFile(path) as tif:
             tif.pages.cache = False
             tif.pages.useframes = False
-            for page in tif.pages:
+            for page_index, page in enumerate(tif.pages):
                 text = page.description
-                numbers.append(int(_field(text, "frameNumbers")))
-                times.append(float(_field(text, "frameTimestamps_sec")))
+                if page_index == 0:
+                    files.append(dict(file_name=path.name, software=page.tags["Software"].value, artist=page.tags["Artist"].value, n_frames=0))
+                files[-1]["n_frames"] += 1
+                columns["file_index"].append(file_index)
+                columns["page_index"].append(page_index)
+                columns["frame_number"].append(int(_field(text, "frameNumbers")))
+                columns["timestamp"].append(float(_field(text, "frameTimestamps_sec")))
+                for name, header in _INTEGER_COLUMNS.items():
+                    columns[name].append(int(_field(text, header)))
+                for name, header in _FLOAT_COLUMNS.items():
+                    columns[name].append(float(_field(text, header)))
+                epochs.add(_field(text, "epoch"))
                 for stamp, data in _PACKET.findall(_field(text, "I2CData")):
                     raw = [int(byte) for byte in re.split(r"[\s,]+", data.strip())]
-                    packets.append((numbers[-1] - 1, float(stamp), raw[0] + 256 * raw[1], raw[2] + 256 * raw[3], raw[4] + 256 * raw[5]))
-    return np.array(numbers), np.array(times), packets
+                    packets.append((columns["frame_number"][-1] - 1, float(stamp), raw[0] + 256 * raw[1], raw[2] + 256 * raw[3], raw[4] + 256 * raw[5]))
+    return dict(columns={name: np.array(values) for name, values in columns.items()}, packets=packets, epochs=epochs, files=files)
+
+
+def _read_sources(tiff_paths):
+    """Frame numbers, times and packets, parsed here from the raw descriptions."""
+    headers = _read_headers(tiff_paths)
+    return headers["columns"]["frame_number"], headers["columns"]["timestamp"], headers["packets"]
 
 
 def _check_packets(table, packets):
@@ -54,6 +85,35 @@ def _check_packets(table, packets):
 
 def _alignment_values(table):
     return dict(zip(table["key"].asstr()[()], table["value"].asstr()[()]))
+
+
+def check_scanimage_tables(scanimage, prepared, headers):
+    """Every column of processing/scanimage against the TIFF headers and the alignment, shared by every view of a session."""
+    columns, packets = headers["columns"], headers["packets"]
+    numbers = columns["frame_number"]
+    frames = scanimage["frames"]
+    for name, values in columns.items():
+        _equal(frames[name][()], values, f"frames.{name}")
+    _equal(frames["plane"][()], (numbers - 1) % prepared.acquisition.layout.n_planes, "frame planes")
+    _equal(frames["session_time"][()], prepared.frame_times, "frame session times")
+    _equal(frames["behavior_block"][()], prepared.labels["block"], "behavior_block")
+    _equal(frames["behavior_trial"][()], prepared.labels["trial"], "behavior_trial")
+    _equal(frames["behavior_iteration"][()], prepared.labels["iteration"], "behavior_iteration")
+    table = scanimage["i2c_packets"]
+    _check_packets(table, packets)
+    _equal(table["elapsed"][()], prepared.packet_elapsed, "packet elapsed times")
+    _equal(table["session_time"][()], prepared.packet_times, "packet session times")
+    _equal(table["used_in_fit"][()], prepared.fit.used, "used_in_fit")
+    files = scanimage["files"]
+    for name in ("file_name", "software", "artist"):
+        _equal(files[name].asstr()[()], np.array([file[name] for file in headers["files"]], dtype=object), f"files.{name}")
+    _equal(files["n_frames"][()], [file["n_frames"] for file in headers["files"]], "files.n_frames")
+    alignment = scanimage["alignment"]
+    rows = alignment_rows(prepared)
+    for position, name in enumerate(("key", "value", "meaning")):
+        _equal(alignment[name].asstr()[()], np.array([row[position] for row in rows], dtype=object), f"alignment.{name}")
+    if headers["epochs"] != {_alignment_values(alignment)["scanimage.epoch"]}:
+        raise RoundTripError(f"scanimage.epoch: the TIFFs say {sorted(headers['epochs'])}")
 
 
 def _check_pixels(file, tiff_paths, numbers, n_planes, limit):
@@ -88,23 +148,14 @@ def _check_pixels(file, tiff_paths, numbers, n_planes, limit):
 def verify_imaging(prepared, nwbfile_path, tiff_paths, max_frames_per_plane=None):
     """Raise RoundTripError unless the file holds exactly what the TIFFs and the log hold. Returns what was checked."""
     verify_round_trip(prepared.session, nwbfile_path)
-    numbers, times, packets = _read_sources(tiff_paths)
+    headers = _read_headers(tiff_paths)
+    numbers, times = headers["columns"]["frame_number"], headers["columns"]["timestamp"]
     if not np.array_equal(numbers, np.arange(1, numbers.size + 1)):
         raise RoundTripError("frame numbers in the TIFFs aren't 1, 2, 3...")
     n_planes = prepared.acquisition.layout.n_planes
     with h5py.File(nwbfile_path, "r", rdcc_nbytes=_CACHE_BYTES) as file:
         scanimage = file["processing/scanimage"]
-        frames = scanimage["frames"]
-        _equal(frames["frame_number"][()], numbers, "frame numbers")
-        _equal(frames["timestamp"][()], times, "frame timestamps")
-        _equal(frames["plane"][()], (numbers - 1) % n_planes, "frame planes")
-        _equal(frames["session_time"][()], prepared.frame_times, "frame session times")
-        _equal(frames["behavior_block"][()], prepared.labels["block"], "behavior_block")
-        _equal(frames["behavior_trial"][()], prepared.labels["trial"], "behavior_trial")
-        _equal(frames["behavior_iteration"][()], prepared.labels["iteration"], "behavior_iteration")
-        _check_packets(scanimage["i2c_packets"], packets)
-        _equal(scanimage["i2c_packets/elapsed"][()], prepared.packet_elapsed, "packet elapsed times")
-        _equal(scanimage["i2c_packets/session_time"][()], prepared.packet_times, "packet session times")
+        check_scanimage_tables(scanimage, prepared, headers)
 
         # The timestamps again, from the line as the file itself records it.
         values = _alignment_values(scanimage["alignment"])
@@ -121,4 +172,4 @@ def verify_imaging(prepared, nwbfile_path, tiff_paths, max_frames_per_plane=None
         for series in prepared.in_progress:
             _check_series(file["processing/in_progress_trial"], series)
         checked = _check_pixels(file, tiff_paths, numbers, n_planes, max_frames_per_plane)
-    return dict(frames_checked=checked, frames_in_tiffs=int(numbers.size), packets_checked=len(packets))
+    return dict(frames_checked=checked, frames_in_tiffs=int(numbers.size), packets_checked=len(headers["packets"]))
