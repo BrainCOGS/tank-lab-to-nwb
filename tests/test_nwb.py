@@ -143,3 +143,8 @@ def test_placeholder_subject_is_marked(written):
         nwbfile = io.read()
         assert "placeholder" in nwbfile.subject.description.lower()
         assert nwbfile.subject.species == "Mus musculus"
+
+
+def test_keywords_are_recorded(written):
+    with h5py.File(written, "r") as file:
+        assert "ViRMEn" in list(file["general/keywords"].asstr()[()])

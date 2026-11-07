@@ -119,7 +119,7 @@ def test_frames_land_where_the_packets_say(written):
     """Independent of the fit's code: packet i, on the session clock, matches the behavior time of its iteration."""
     prepared, path, *_ = written
     with h5py.File(path, "r") as file:
-        table = file["processing/scanimage/i2c_packets"]
+        table = file["processing/ophys/scanimage_i2c_packets"]
         mapped, iteration = table["session_time"][()], table["iteration"][()]
         trial_start = file["intervals/trials/start_time"][0]
     expected = trial_start + (iteration - 1) * STEP
@@ -129,23 +129,23 @@ def test_frames_land_where_the_packets_say(written):
 def test_all_header_fields_and_packets_are_in_the_file(written):
     prepared, path, tiffs, _ = written
     with h5py.File(path, "r") as file:
-        scanimage = file["processing/scanimage"]
-        frames = scanimage["frames"]
+        scanimage = file["processing/ophys"]
+        frames = scanimage["scanimage_frames"]
         assert frames["frame_number"].shape == (801,)
         np.testing.assert_array_equal(frames["timestamp"][()], prepared.acquisition.frames["timestamp"])
         np.testing.assert_array_equal(frames["plane"][()], np.arange(801) % 2)
         assert frames["end_of_acquisition"].dtype.kind in "iub"
-        assert scanimage["i2c_packets/block"].shape == prepared.acquisition.packets["block"].shape
-        names = scanimage["files/file_name"].asstr()[()]
+        assert scanimage["scanimage_i2c_packets/block"].shape == prepared.acquisition.packets["block"].shape
+        names = scanimage["scanimage_files/file_name"].asstr()[()]
         assert list(names) == [tiff.name for tiff in tiffs]
-        assert all("hStackManager" in text for text in scanimage["files/software"].asstr()[()])
-        assert all("RoiGroups" in text for text in scanimage["files/artist"].asstr()[()])
+        assert all("hStackManager" in text for text in scanimage["scanimage_files/software"].asstr()[()])
+        assert all("RoiGroups" in text for text in scanimage["scanimage_files/artist"].asstr()[()])
 
 
 def test_the_accuracy_is_recorded_in_the_file(written):
     _, path, *_ = written
     with h5py.File(path, "r") as file:
-        table = file["processing/scanimage/alignment"]
+        table = file["processing/ophys/scanimage_alignment"]
         values = dict(zip(table["key"].asstr()[()], table["value"].asstr()[()]))
         meanings = dict(zip(table["key"].asstr()[()], table["meaning"].asstr()[()]))
     assert float(values["fit.slope"]) == pytest.approx(1 - 5e-6, abs=1e-9)
@@ -190,19 +190,19 @@ def test_verify_passes_on_a_good_file(written):
     [
         ("acquisition/TwoPhotonSeriesPlane0/data", lambda d: d.__setitem__((5, 1, 1), d[5, 1, 1] + 1)),
         ("acquisition/TwoPhotonSeriesPlane1/timestamps", lambda d: d.__setitem__(3, d[3] + 1e-9)),
-        ("processing/scanimage/frames/timestamp", lambda d: d.__setitem__(7, d[7] + 1e-9)),
-        ("processing/scanimage/i2c_packets/iteration", lambda d: d.__setitem__(2, d[2] + 1)),
-        ("processing/scanimage/frames/file_index", lambda d: d.__setitem__(4, d[4] + 1)),
-        ("processing/scanimage/frames/page_index", lambda d: d.__setitem__(4, d[4] + 1)),
-        ("processing/scanimage/frames/acquisition_number", lambda d: d.__setitem__(4, d[4] + 1)),
-        ("processing/scanimage/frames/frame_number_acquisition", lambda d: d.__setitem__(4, d[4] + 1)),
-        ("processing/scanimage/frames/acq_trigger_timestamp", lambda d: d.__setitem__(4, d[4] + 1)),
-        ("processing/scanimage/frames/next_file_marker_timestamp", lambda d: d.__setitem__(4, d[4] + 1)),
-        ("processing/scanimage/frames/end_of_acquisition", lambda d: d.__setitem__(4, d[4] + 1)),
-        ("processing/scanimage/frames/end_of_acquisition_mode", lambda d: d.__setitem__(4, d[4] + 1)),
-        ("processing/scanimage/frames/dc_over_voltage", lambda d: d.__setitem__(4, d[4] + 1)),
-        ("processing/scanimage/i2c_packets/used_in_fit", lambda d: d.__setitem__(2, not d[2])),
-        ("processing/scanimage/files/n_frames", lambda d: d.__setitem__(0, d[0] + 1)),
+        ("processing/ophys/scanimage_frames/timestamp", lambda d: d.__setitem__(7, d[7] + 1e-9)),
+        ("processing/ophys/scanimage_i2c_packets/iteration", lambda d: d.__setitem__(2, d[2] + 1)),
+        ("processing/ophys/scanimage_frames/file_index", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/ophys/scanimage_frames/page_index", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/ophys/scanimage_frames/acquisition_number", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/ophys/scanimage_frames/frame_number_acquisition", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/ophys/scanimage_frames/acq_trigger_timestamp", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/ophys/scanimage_frames/next_file_marker_timestamp", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/ophys/scanimage_frames/end_of_acquisition", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/ophys/scanimage_frames/end_of_acquisition_mode", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/ophys/scanimage_frames/dc_over_voltage", lambda d: d.__setitem__(4, d[4] + 1)),
+        ("processing/ophys/scanimage_i2c_packets/used_in_fit", lambda d: d.__setitem__(2, not d[2])),
+        ("processing/ophys/scanimage_files/n_frames", lambda d: d.__setitem__(0, d[0] + 1)),
     ],
 )
 def test_verify_catches_a_changed_value(written, dataset, change):
@@ -229,7 +229,7 @@ def test_stub_cuts_only_the_pixels_and_their_timestamps(tmp_path, log, tiffs):
     with h5py.File(path, "r") as file:
         assert file["acquisition/TwoPhotonSeriesPlane0/data"].shape == (3, 4, 3)
         assert file["acquisition/TwoPhotonSeriesPlane0/timestamps"].shape == (3,)
-        assert file["processing/scanimage/frames/frame_number"].shape == (801,)
+        assert file["processing/ophys/scanimage_frames/frame_number"].shape == (801,)
     assert verify_imaging(prepared, path, tiffs, max_frames_per_plane=3)["frames_checked"] == 6
 
 
@@ -283,7 +283,7 @@ def test_the_trial_in_progress_is_kept_and_verified(tmp_path, log, tiffs):
     path = tmp_path / "progress.nwb"
     prepared = convert_session(log, tiffs, path, file="session.mat")
     with h5py.File(path, "r") as file:
-        group = file["processing/in_progress_trial/position"]
+        group = file["processing/behavior/in_progress_position"]
         np.testing.assert_array_equal(group["data"][()], position[:2])
         assert group["data"].dtype == np.float64
         assert group["timestamps"][0] == 30.0 + prepared.clock_offset + 0.0
@@ -294,7 +294,7 @@ def test_the_trial_in_progress_is_kept_and_verified(tmp_path, log, tiffs):
     assert rows["derived.in_progress_trial.viStart"] == "9"
     assert rows["derived.in_progress_trial.saved_iterations"] == "2"
     with h5py.File(path, "r+") as file:
-        data = file["processing/in_progress_trial/position/data"]
+        data = file["processing/behavior/in_progress_position/data"]
         data[0, 0] = data[0, 0] + 1
     with pytest.raises(RoundTripError):
         verify_imaging(prepared, path, tiffs)
@@ -303,7 +303,7 @@ def test_the_trial_in_progress_is_kept_and_verified(tmp_path, log, tiffs):
 def test_frames_table_holds_the_pipeline_labels(written):
     prepared, path, *_ = written
     with h5py.File(path, "r") as file:
-        frames = file["processing/scanimage/frames"]
+        frames = file["processing/ophys/scanimage_frames"]
         block, trial, iteration = frames["behavior_block"][()], frames["behavior_trial"][()], frames["behavior_iteration"][()]
     numbered = np.flatnonzero(block)
     assert numbered[0] > 0  # imaging started before the first trial
@@ -315,7 +315,7 @@ def test_frames_table_holds_the_pipeline_labels(written):
 def test_the_file_describes_its_method_well_enough_to_reproduce(written):
     _, path, *_ = written
     with h5py.File(path, "r") as file:
-        table = file["processing/scanimage/alignment"]
+        table = file["processing/ophys/scanimage_alignment"]
         values = dict(zip(table["key"].asstr()[()], table["value"].asstr()[()]))
         meanings = dict(zip(table["key"].asstr()[()], table["meaning"].asstr()[()]))
     for detail in ("least squares", "median", "1.4826", "refit"):
@@ -326,7 +326,7 @@ def test_the_file_describes_its_method_well_enough_to_reproduce(written):
 def test_the_send_latency_claims_no_bound_the_source_does_not_give(written):
     _, path, *_ = written
     with h5py.File(path, "r") as file:
-        table = file["processing/scanimage/alignment"]
+        table = file["processing/ophys/scanimage_alignment"]
         meaning = dict(zip(table["key"].asstr()[()], table["meaning"].asstr()[()]))["fit.send_latency"]
     assert "no upper bound" in meaning
     assert "12 ms" not in meaning
@@ -335,7 +335,7 @@ def test_the_send_latency_claims_no_bound_the_source_does_not_give(written):
 def test_the_label_columns_explain_their_limits(written):
     _, path, *_ = written
     with h5py.File(path, "r") as file:
-        frames = file["processing/scanimage/frames"]
+        frames = file["processing/ophys/scanimage_frames"]
         block = frames["behavior_block"].attrs["description"]
         trial = frames["behavior_trial"].attrs["description"]
     assert "just before the trial began" in block and "late" in block
@@ -345,12 +345,12 @@ def test_the_label_columns_explain_their_limits(written):
 @pytest.mark.parametrize(
     "dataset",
     [
-        "processing/scanimage/files/file_name",
-        "processing/scanimage/files/software",
-        "processing/scanimage/files/artist",
-        "processing/scanimage/alignment/key",
-        "processing/scanimage/alignment/value",
-        "processing/scanimage/alignment/meaning",
+        "processing/ophys/scanimage_files/file_name",
+        "processing/ophys/scanimage_files/software",
+        "processing/ophys/scanimage_files/artist",
+        "processing/ophys/scanimage_alignment/key",
+        "processing/ophys/scanimage_alignment/value",
+        "processing/ophys/scanimage_alignment/meaning",
     ],
 )
 def test_verify_catches_changed_text(written, dataset):
@@ -363,7 +363,7 @@ def test_verify_catches_changed_text(written, dataset):
 
 def _alignment(path):
     with h5py.File(path, "r") as file:
-        table = file["processing/scanimage/alignment"]
+        table = file["processing/ophys/scanimage_alignment"]
         return dict(zip(table["key"].asstr()[()], table["value"].asstr()[()]))
 
 
@@ -515,3 +515,15 @@ def convert_session_with_log(log):
         return convert_session(log, tiffs, output, file="session.mat", **options)
 
     return run
+
+
+def test_keywords_say_what_the_file_holds(written):
+    with h5py.File(written[1], "r") as file:
+        keywords = list(file["general/keywords"].asstr()[()])
+    assert "two-photon calcium imaging" in keywords
+    assert "ViRMEn" in keywords
+
+
+def test_processing_modules_use_the_schema_names(written):
+    with h5py.File(written[1], "r") as file:
+        assert set(file["processing"]) == {"behavior", "ophys"}
