@@ -71,7 +71,7 @@ fields without an NWB semantic equivalent, native dtypes and even duplicate fiel
 To recover an artifact, write the named scratch dataset's bytes to the inventory's relative path. Object NPY files
 still need a trusted pickle reader. The adjacent report inventories every NPY dictionary key and every `stat` key.
 
-The measured run's `stat` keys will be reported below. Each also has a `stat_*` text column containing its original
+The measured run's `stat` keys are listed below. Each also has a `stat_*` text column containing its original
 scalar or array value as JSON with NaN literals; the artifact retains the exact native dtype and NaN representation.
 All `F`, `Fneu`, `spks`, `iscell`, registration/detection dictionaries, `ops`, `db`, settings/version, `zcorr`,
 `regPC`, `tPC`, `regDX`, and processing times remain in their native source artifacts even when also represented
@@ -86,7 +86,72 @@ A mismatch raises rather than being rounded away.
 
 ## Session measurements
 
-Measurements and validation results will be recorded here after the clean run and final conversion complete.
+The clean run used Suite2p **1.1.0**, Python **3.12.15**, torch **2.15.0+cu132**, the GTX 1660 Ti, and the supplied
+configuration. Every per-plane settings dictionary matches that configuration without a changed field. Only output
+paths were redirected. The run started from all **45 TIFFs**, not existing binaries, and completed successfully in
+**1,382.52 s**, including TIFF conversion. GPU compute was idle before launch; over 800 GB of disk was free.
+
+The TIFFs contain **89,508 signed int16 frames**, each 300 rows by 512 columns. No uint16 halving applies: plane-0
+frame-0 reconstruction with unscaled pixels has RMSE **0.024206**, while halving these signed pixels gives
+**292.612127**. Both the interpolation and the final truncation to int16 are included in the reconstruction.
+
+The **675 samples** (135 per plane) include every file's first, middle and last frame. All passed the mapping gate;
+all **1,340 available ±1 controls** were worse. Matching RMSE spans **0.010520–0.026639** intensity units; controls span
+**754.697–939.568**. The smallest same-sample control/match ratio is **31,177.9**. These results support Suite2p frame
+`i` of plane `p` mapping to `acquisition.plane_frames(p)[i]` at the sampled positions throughout this acquisition.
+The intervening unsampled registered pixels were not individually checked.
+
+| Plane | Frames | All ROIs | Maximum matching RMSE | Minimum −1 control | Minimum +1 control |
+|---|---:|---:|---:|---:|---:|
+| 0 | 17,902 | 327 | 0.025643 | 771.649 | 754.697 |
+| 1 | 17,902 | 337 | 0.026639 | 798.140 | 799.994 |
+| 2 | 17,902 | 326 | 0.025259 | 801.822 | 794.642 |
+| 3 | 17,901 | 326 | 0.026393 | 813.851 | 808.412 |
+| 4 | 17,901 | 348 | 0.026270 | 827.527 | 825.642 |
+
+Every plane has 96 nonrigid blocks. `nframes`, all trace and offset lengths, both badframe vectors and TIFF plane
+counts agree; both badframe vectors are all false. For the first 44 files, every plane has 400 samples per file.
+The last file contributes 302 samples to planes 0–2 and 301 to planes 3–4. No sample is invented for the partial volume.
+`combined/` NPY traces, classifications, all stat keys, metadata and tiled images match the per-plane-derived view,
+including the final zero padding. Its MATLAB variables match those NPY values after MATLAB singleton/empty-value
+representation is accounted for. The extra combined `redcell` is a 1,664×2 all-zero placeholder; each per-plane
+`redcell` is empty (0×0). Combined holds no additional measured signal or ROI field.
+
+All 19 per-plane `stat` keys are preserved: `aspect_ratio`, `compact`, `footprint`, `lam`, `med`, `mrs`, `mrs0`, `npix`,
+`npix_norm`, `npix_norm_no_crop`, `npix_soma`, `overlap`, `radius`, `skew`, `snr`, `soma_crop`, `std`, `xpix`, `ypix`.
+Combined adds the derived `iplane`. The report inventories all native dictionary and MATLAB variable names.
+**71 nonmovie artifacts** are byte-exact in NWB scratch. The only omitted artifacts are the five registered `data.bin`
+movies (27,496,857,600 bytes total), which remain external. Every nonmovie Suite2p field is retained in the archive.
+
+The clock fit used **73,413 packets**, excluded **180 first-iteration packets**, and rejected **382** additional packets
+(0.5216% of eligible packets). Slope is **0.9999948645516386** (−5.13545 ppm), intercept **11.027272188700522 s**,
+and shifted clock offset **11.02732920000016 s**. Kept residual standard deviation is **1.051158 ms**;
+all-packet residual p1/p99 are **−1.785986 / +3.499372 ms**. These are packet scatter, not frame-time error.
+`session_start_time` moved back **10.244864 s**. Frame times span **0.000000381022–1,782.896587029 s**.
+The first plane times are **0.000000381, 0.019918908, 0.039837436, 0.059755968, 0.079674495 s**; each response series
+round-trips exactly against its own fitted TIFF times. No behavior-level activity sanity check was used as timing proof.
+
+The file has **1,949,889,971 bytes**. Its organized copy is byte-identical to the independently source-verified staging
+file; both have SHA256 `c50c8205cf88d1742706658727e4ed0e3a1b0554d1929283c54c074c8b1008e7`.
+It was organized with a separate local stub dandiset and the `ses-` filename fix before these serial checks:
+
+- `pynwb.validate`: **[]**, no errors.
+- NWB Inspector **0.7.2**, via uvx on Python 3.13 with `--config dandi`: exit **0**, **6 BEST_PRACTICE_SUGGESTION** findings;
+  no errors, critical findings or best-practice violations. Suggestions are missing keywords, the reused `scanimage`
+  and `in_progress_trial` module names, a single-row epochs table, and the all-NaN `easyBlock` and `trialID` columns.
+  The reused behavior/provenance tables and their NaNs were retained faithfully.
+- DANDI **0.82.0** `validate`: exit **0**, **No errors found.** It also logged a nonfatal HTTP 500 during the Inspector
+  version lookup; the explicit Inspector run above used the recorded pinned version.
+- Final full suite: **363 passed, 9 skipped**; baseline was **338 passed, 9 skipped**. UserWarnings are errors in tests.
+
+The Inspector uvx environment pinned `pynwb==4.2.0`, `hdmf==6.2.0`, `h5py==3.13.0`, and `numpy==2.5.4`, with the local
+schema extension 0.4.1. This avoids an unrelated source-build attempt for a newer h5py. No upstream package was changed.
+
+`registration.do_bidiphase=False` remains unchanged on this bidirectionally scanned acquisition and is an open user
+decision. Indicator, location `root`, and NaN wavelengths retain the raw converter's placeholders. The pending behavior
+field decisions were not changed. Biological validity of the ROI detection and deconvolution was not assessed.
+No data was uploaded and no PR was opened or branch pushed.
+
 
 ### Why the pre-existing run was not reused
 
@@ -98,7 +163,7 @@ The saved log starts with `FOUND BINARIES AND DBS` and then runs registration on
 found a mixed history in plane 0. At 98 of 135 samples (first, middle and last frame of each of the 45 files), applying
 the old saved transform to the fresh registered frame reproduces the old movie with RMSE **0.00920–0.01976**. At the
 remaining 37 samples, the old transform applied directly to raw reproduces it with RMSE **0.01693–0.02615**. None of
-these samples is unexplained by those alternatives. The transition is between adjacent frames **12,999 and 13,000**:
+these samples is unexplained by those alternatives. The transition is between adjacent zero-based frames **12,999 and 13,000**:
 
 | Plane-0 frame | Old transform applied to raw: RMSE | Fresh registration, then old transform: RMSE |
 |---|---:|---:|
