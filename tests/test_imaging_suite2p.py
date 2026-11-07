@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from pynwb import validate
 
-from tests.synthetic_tiff import frame_pixels, write_acquisition
+from tests.synthetic_tiff import frame_pixels, write_acquisition, write_stack
 from tests.test_imaging_nwb import log, tiffs  # noqa: F401
 from tank_lab_to_nwb.imaging import convert_suite2p as cli
 from tank_lab_to_nwb.imaging.convert_suite2p import verify_combined
@@ -359,37 +359,30 @@ def raw_file(tmp_path, log, tiffs):
 
 def _alignment(path):
     with h5py.File(path, "r") as file:
-        table = file["processing/scanimage/alignment"]
+        table = file["processing/ophys/scanimage_alignment"]
         return dict(zip(table["key"].asstr()[()], table["value"].asstr()[()]))
 
 
 def test_the_raw_file_it_goes_with_is_recorded(tmp_path, log, tiffs, run, raw_file):
     output = tmp_path / "s2p.nwb"
     convert_suite2p(log, tiffs, run, output, file="session.mat", raw_nwb=raw_file)
-    assert _alignment(output)["acquisition.id"] == _alignment(raw_file)["acquisition.id"]
+    values = _alignment(output)
+    assert values["acquisition.id"] == _alignment(raw_file)["acquisition.id"]
     with h5py.File(raw_file, "r") as raw, h5py.File(output, "r") as file:
-        table = file["processing/scanimage/companion_files"]
-        assert table["desc"].asstr()[0] == "rawtiff"
-        assert table["identifier"].asstr()[0] == raw["identifier"].asstr()[()]
-        assert table["identifier"].asstr()[0] != file["identifier"].asstr()[()]
-    assert table_sha(output) == hashlib.sha256(raw_file.read_bytes()).hexdigest()
+        assert values["companion.rawtiff.identifier"] == raw["identifier"].asstr()[()]
+        assert values["companion.rawtiff.identifier"] != file["identifier"].asstr()[()]
+    assert values["companion.rawtiff.sha256"] == hashlib.sha256(raw_file.read_bytes()).hexdigest()
 
 
-def table_sha(path):
-    with h5py.File(path, "r") as file:
-        return file["processing/scanimage/companion_files/sha256"].asstr()[0]
-
-
-def test_no_raw_file_means_no_companion_table(tmp_path, log, tiffs, run):
+def test_no_raw_file_means_no_companion_rows(tmp_path, log, tiffs, run):
     output = tmp_path / "s2p.nwb"
     convert_suite2p(log, tiffs, run, output, file="session.mat")
-    with h5py.File(output, "r") as file:
-        assert "companion_files" not in file["processing/scanimage"]
+    assert not [key for key in _alignment(output) if key.startswith("companion.")]
 
 
 def test_a_raw_file_from_another_acquisition_is_refused(tmp_path, log, tiffs, run, raw_file):
     with h5py.File(raw_file, "r+") as file:
-        table = file["processing/scanimage/alignment"]
+        table = file["processing/ophys/scanimage_alignment"]
         keys = list(table["key"].asstr()[()])
         table["value"][keys.index("acquisition.id")] = "another"
     with pytest.raises(AlignmentError, match="another acquisition"):
@@ -398,7 +391,7 @@ def test_a_raw_file_from_another_acquisition_is_refused(tmp_path, log, tiffs, ru
 
 def test_a_raw_file_on_a_different_clock_is_refused(tmp_path, log, tiffs, run, raw_file):
     with h5py.File(raw_file, "r+") as file:
-        times = file["processing/scanimage/frames/session_time"]
+        times = file["processing/ophys/scanimage_frames/session_time"]
         times[3] = times[3] + 1e-9
     with pytest.raises(AlignmentError, match="clock"):
         convert_suite2p(log, tiffs, run, tmp_path / "s2p.nwb", file="session.mat", raw_nwb=raw_file)
@@ -409,7 +402,7 @@ def test_verify_catches_a_changed_header_column(tmp_path, log, tiffs, run, colum
     output = tmp_path / "s2p.nwb"
     prepared = convert_suite2p(log, tiffs, run, output, file="session.mat")
     with h5py.File(output, "r+") as file:
-        data = file[f"processing/scanimage/frames/{column}"]
+        data = file[f"processing/ophys/scanimage_frames/{column}"]
         data[4] = data[4] + 1
     with pytest.raises(RoundTripError):
         verify_suite2p(prepared, output, run, tiffs)
@@ -420,9 +413,34 @@ def test_verify_catches_a_changed_companion_record(tmp_path, log, tiffs, run, ra
     prepared = convert_suite2p(log, tiffs, run, output, file="session.mat", raw_nwb=raw_file)
     expected = read_companion(raw_file, prepared)
     with h5py.File(output, "r+") as file:
-        file["processing/scanimage/companion_files/sha256"][0] = "changed"
-    with pytest.raises(RoundTripError, match="companion"):
+        table = file["processing/ophys/scanimage_alignment"]
+        table["value"][list(table["key"].asstr()[()]).index("companion.rawtiff.sha256")] = "changed"
+    with pytest.raises(RoundTripError):
         verify_suite2p(prepared, output, run, tiffs, companion=expected)
+
+
+def test_a_multi_roi_session_is_refused_for_now(tmp_path, log, run):
+    folder = tmp_path / "stack"
+    folder.mkdir()
+    rois = [dict(rows=3), dict(rows=3)]
+    packets = {}
+    trial = log["block"][0]["trial"][0]
+    for iteration in range(1, 900, 2):
+        time = (float(trial["start"].item()) + float(trial["time"][iteration - 1, 0])) * (1 - 5e-6) + 13.0
+        frame = int(time // 0.02) + 1
+        if frame <= 801:
+            packets.setdefault(frame, []).append((time, (1, 1, iteration)))
+    stack = write_stack(folder, 801, rois, frames_per_file=300, packets=packets)
+    with pytest.raises(ValueError, match="multi-ROI"):
+        convert_suite2p(log, stack, run, tmp_path / "out.nwb", file="session.mat")
+
+
+def test_the_file_uses_the_schema_module_names_and_has_keywords(tmp_path, log, tiffs, run):
+    output = tmp_path / "s2p.nwb"
+    convert_suite2p(log, tiffs, run, output, file="session.mat")
+    with h5py.File(output, "r") as file:
+        assert set(file["processing"]) == {"behavior", "ophys"}
+        assert "Suite2p" in list(file["general/keywords"].asstr()[()])
 
 
 def test_the_report_lists_what_was_dropped_and_the_companion(tmp_path, log, tiffs, run, raw_file, monkeypatch):
@@ -433,7 +451,7 @@ def test_the_report_lists_what_was_dropped_and_the_companion(tmp_path, log, tiff
     path = cli.convert("session.mat", run, tmp_path / "out", tiffs, raw_nwb=raw_file)
     report = json.loads(path.with_suffix(".report.json").read_text())
     assert {"log.currentTrial", "log.currentIt"} <= set(report["coverage"]["dropped"])
-    assert report["companion"]["desc"] == "rawtiff"
+    assert len(report["companion"]["sha256"]) == 64
     assert report["alignment"]["frames"] == 801
 
 
