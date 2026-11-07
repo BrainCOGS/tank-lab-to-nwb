@@ -135,6 +135,7 @@ def test_loader_agrees_with_scipy_on_every_plain_value(path):
 # Sorted-path indexes of the logs whose first block was stamped during setup, and how each is anchored. A new index here
 # means another log hit the fallback: see docs/virmen-timing.md.
 SETUP_STAMPED = {0: "engine_timestamps", 1: "session_end_upper_bound", 2: "session_end_upper_bound", 4: "session_end_upper_bound", 5: "session_end_upper_bound"}
+UPPER_BOUND = {index for index, anchor in SETUP_STAMPED.items() if anchor == "session_end_upper_bound"}
 TIME_TOLERANCE = 0.001  # trial times are logged in single precision: about 0.24 ms at an hour
 
 
@@ -168,10 +169,10 @@ def test_block_end_matches_the_session_end(path):
     clock = normalize_log(load_log(path), file=path).coverage.clock
     # Stopping and deleting the video runs before session.end is read in the one log that recorded it.
     limit = 0.75 if LOGS.index(path) == 0 else 0.25
-    if LOGS.index(path) in (1, 2):
+    if LOGS.index(path) in UPPER_BOUND:
         assert clock["session_end_minus_block_end"] == pytest.approx(0.0, abs=1e-9)  # the fallback defines it
     assert abs(clock["session_end_minus_block_end"]) <= limit
-    assert clock["needs_review"] is (LOGS.index(path) in (1, 2))
+    assert clock["needs_review"] is (LOGS.index(path) in UPPER_BOUND)
 
 
 @each_log

@@ -10,7 +10,7 @@ from pynwb import NWBHDF5IO, validate
 
 from tank_lab_to_nwb.imaging import alignment
 from tank_lab_to_nwb.imaging import convert_session as cli
-from tank_lab_to_nwb.imaging.convert import _int32, convert_session, prepare_session
+from tank_lab_to_nwb.imaging.convert import _int32, build_imaging_nwbfile, convert_session, prepare_session
 from tank_lab_to_nwb.imaging.scanimage import read_acquisition
 from tank_lab_to_nwb.imaging.verify import RoundTripError, verify_imaging
 from tank_lab_to_nwb.virmen.coerce import LossyConversionError
@@ -527,3 +527,22 @@ def test_keywords_say_what_the_file_holds(written):
 def test_processing_modules_use_the_schema_names(written):
     with h5py.File(written[1], "r") as file:
         assert set(file["processing"]) == {"behavior", "ophys"}
+
+
+def test_the_report_lists_the_sentinels_the_file_uses(written):
+    sentinels = json.loads(written[1].with_suffix(".report.json").read_text())["sentinels"]
+    assert set(sentinels) == {"behavior_block", "behavior_trial", "behavior_iteration", "excitation_lambda", "emission_lambda"}
+    assert sentinels["behavior_trial"]["value"] == 0
+    assert sentinels["excitation_lambda"]["value"] == "NaN"
+
+
+def test_more_alignment_rows_can_be_added_and_are_verified(tmp_path, log, tiffs):
+    path = tmp_path / "out.nwb"
+    prepared = prepare_session(log, tiffs, file="session.mat")
+    extra = [("companion.note", "value", "meaning")]
+    nwbfile = build_imaging_nwbfile(prepared, extra_alignment_rows=extra, max_frames_per_plane=2)
+    with NWBHDF5IO(str(path), "w") as io:
+        io.write(nwbfile)
+    verify_imaging(prepared, path, tiffs, max_frames_per_plane=2, extra_alignment_rows=extra)
+    with pytest.raises(RoundTripError):
+        verify_imaging(prepared, path, tiffs, max_frames_per_plane=2)

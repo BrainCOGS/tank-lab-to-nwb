@@ -9,6 +9,7 @@ import numpy as np
 
 from ..virmen.loader import records
 from ..virmen.session import Series, encode_setting
+from .scanimage import SPLIT_SOURCE, STACK_SOURCE
 
 MIN_PACKETS = 100
 # Rejection follows the Python port of the pipeline's sync: more than max(5 MADs, 5 ms) from the line, until the kept set
@@ -115,6 +116,16 @@ def _saved_iterations(log):
         return 0, None
     count = int(np.asarray(count).item())
     return (count, trial) if count > 0 else (0, None)
+
+
+SOURCE_MEANING = {
+    STACK_SOURCE: "The pages ScanImage wrote, pixel for pixel.",
+    SPLIT_SOURCE: "Copies the lab's ScanInfo splitter made from the original stack. Pixels were converted to uint16, which clipped negative values at 0, so they can't be compared with the original's dark offset. Frame times were rounded to 0.1 ms. The original stack, if it exists, is the better source.",
+}
+TIME_OFFSET = {
+    STACK_SOURCE: "Seconds from the frame's start to this field's first row, from its row position and the line period. Its series timestamps include this.",
+    SPLIT_SOURCE: "The lag the splitter added to this ROI's frame times, which its series timestamps include. The splitter's lag is the fly-to time per ROI, not the row position, so it understates when a later ROI was scanned. The original stack gives the row position.",
+}
 
 
 def _in_progress_trial(blocks):
@@ -283,7 +294,19 @@ def alignment_rows(prepared):
     """(key, value, meaning) for everything a reader needs to judge the alignment."""
     fit, acquisition = prepared.fit, prepared.acquisition
     gaps = packet_gaps(acquisition)
+    rois = [] if len(acquisition.fields) <= acquisition.layout.n_planes and len({field.number for field in acquisition.fields}) == 1 else [
+        row
+        for field in acquisition.fields
+        for row in (
+            (f"roi.{field.label}.name", field.name, "This field's ROI name in the header, or its folder's if the split files kept no header."),
+            (f"roi.{field.label}.rows", f"{field.rows[0]}:{field.rows[1]}", "The rows of a stored page holding this field, as start:stop."),
+            (f"roi.{field.label}.time_offset_seconds", repr(field.time_offset), TIME_OFFSET[acquisition.source]),
+        )
+    ]
     return [
+        ("acquisition.source", acquisition.source, SOURCE_MEANING[acquisition.source]),
+        ("acquisition.completeness", acquisition.completeness, "Whether these TIFFs are the whole acquisition, as far as they can show."),
+        *rois,
         ("acquisition.id", acquisition_id(acquisition), "Fingerprint of this acquisition: ScanImage's epoch, the TIFF names, the frame count, and the first and last frame times. Every NWB file made from this acquisition, raw TIFF or processed, carries the same value, along with the same subject_id and session_id."),
         ("fit.method", METHOD, "How frames were put on the behavior clock. No wall clock is involved."),
         ("fit.slope", repr(fit.slope), "ScanImage seconds per ViRMEn elapsed second."),

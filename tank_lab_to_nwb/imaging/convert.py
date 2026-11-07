@@ -10,6 +10,7 @@ from hdmf.common import DynamicTable, VectorData
 from hdmf.data_utils import GenericDataChunkIterator
 from pynwb import NWBHDF5IO, TimeSeries
 from pynwb.device import Device
+from pynwb.image import ImageSeries
 from pynwb.ophys import OpticalChannel, TwoPhotonSeries
 
 from ..virmen.coerce import coerce
@@ -29,12 +30,18 @@ from .alignment import (
     session_start_shift,
     shifted_session,
 )
-from .scanimage import Acquisition, read_acquisition, read_frames
+from .scanimage import SPLIT_SOURCE, Acquisition, read_acquisition, read_field, read_flyback
 from .verify import verify_imaging
 
 COMPRESSION = dict(compression="gzip", compression_opts=4, shuffle=True)
 _CHUNK_BYTES = 10_000_000
 _BUFFER_BYTES = 1_000_000_000
+
+# Values in the imaging tables that stand for "none", beyond the ViRMEn field registry's own.
+SENTINELS = {
+    **{name: dict(value=0, meaning="This frame has no label: it's before the first packet, after the last, or in the trial running at save.") for name in ("behavior_block", "behavior_trial", "behavior_iteration")},
+    **{name: dict(value="NaN", meaning="PLACEHOLDER: the wavelength isn't recorded in these sources.") for name in ("excitation_lambda", "emission_lambda")},
+}
 
 PLACEHOLDER_IMAGING = dict(
     indicator="PLACEHOLDER: indicator not recorded here.",
@@ -59,13 +66,17 @@ class PreparedSession:
     labels: dict
     in_progress: list
 
+    def field_times(self, field):
+        """A field's frame times on the file's clock."""
+        return self.fit.to_elapsed(field.timestamps) + self.clock_offset
 
-def prepare_session(log, tiff_paths, file=None):
+
+def prepare_session(log, tiff_paths, file=None, allow_incomplete=False):
     """Read and align without writing. `log` is a path or an already decoded log."""
     if isinstance(log, (str, Path)):
         file = file or log
         log = load_log(log)
-    acquisition = read_acquisition(tiff_paths)
+    acquisition = read_acquisition(tiff_paths, allow_incomplete=allow_incomplete)
     packets = acquisition.packets
     elapsed = match_packets(packets, iteration_clock(log))
     if np.any(np.diff(packets["timestamp"]) <= 0):
@@ -97,28 +108,30 @@ def prepare_session(log, tiff_paths, file=None):
     )
 
 
-class _PlanePixels(GenericDataChunkIterator):
-    """One plane's frames as (time, x, y), read a buffer at a time, so a plane never has to fit in memory."""
+class _FramePixels(GenericDataChunkIterator):
+    """Frames as (time, x, y), read a buffer at a time, so a series never has to fit in memory. `read` gives (frames, rows, columns)."""
 
-    def __init__(self, acquisition, frame_indices):
-        self._acquisition = acquisition
-        self._frame_indices = frame_indices
-        rows, columns = acquisition.layout.frame_shape
-        frame_bytes = rows * columns * acquisition.dtype.itemsize
-        chunk = max(1, min(frame_indices.size, _CHUNK_BYTES // frame_bytes))
+    def __init__(self, read, n_frames, shape, dtype):
+        self._read = read
+        self._n_frames = n_frames
+        self._shape = shape
+        self._dtype = dtype.newbyteorder("=")
+        rows, columns = shape
+        frame_bytes = rows * columns * dtype.itemsize
+        chunk = max(1, min(n_frames, _CHUNK_BYTES // frame_bytes))
         buffer = max(1, _BUFFER_BYTES // (frame_bytes * chunk)) * chunk
-        super().__init__(chunk_shape=(chunk, columns, rows), buffer_shape=(min(frame_indices.size, buffer), columns, rows), display_progress=False)
+        super().__init__(chunk_shape=(chunk, columns, rows), buffer_shape=(min(n_frames, buffer), columns, rows), display_progress=False)
 
     def _get_data(self, selection):
-        frames = read_frames(self._acquisition, self._frame_indices[selection[0]])
-        return frames.transpose(0, 2, 1)[(slice(None), selection[1], selection[2])]
+        positions = np.arange(self._n_frames)[selection[0]]
+        return self._read(positions).transpose(0, 2, 1)[(slice(None), selection[1], selection[2])]
 
     def _get_maxshape(self):
-        rows, columns = self._acquisition.layout.frame_shape
-        return (self._frame_indices.size, columns, rows)
+        rows, columns = self._shape
+        return (self._n_frames, columns, rows)
 
     def _get_dtype(self):
-        return self._acquisition.dtype.newbyteorder("=")
+        return self._dtype
 
 
 def _compressed(data):
@@ -135,7 +148,7 @@ def _int32(data, field):
     return coerce(data, "int32", file="ScanImage headers", field=field)
 
 
-def _add_scanimage_tables(nwbfile, prepared):
+def _add_scanimage_tables(nwbfile, prepared, extra_alignment_rows=()):
     acquisition, frames, packets = prepared.acquisition, prepared.acquisition.frames, prepared.acquisition.packets
     module = nwbfile.create_processing_module("ophys", "ScanImage's per-frame headers, the I2C packets that align frames to behavior, and any processed results.")
     module.add(_table("scanimage_frames", "One row per TIFF page, in acquisition order.", [
@@ -172,7 +185,7 @@ def _add_scanimage_tables(nwbfile, prepared):
         ("software", "The first page's Software tag: all ScanImage settings.", np.array([file.software for file in acquisition.files], dtype=object)),
         ("artist", "The first page's Artist tag: the ROI groups, as JSON.", np.array([file.artist for file in acquisition.files], dtype=object)),
     ]))
-    rows = alignment_rows(prepared)
+    rows = [*alignment_rows(prepared), *extra_alignment_rows]
     module.add(_table("scanimage_alignment", "How frames were aligned to behavior, and how far to trust it.", [
         ("key", "Name of the value.", np.array([row[0] for row in rows], dtype=object)),
         ("value", "The value, as text.", np.array([row[1] for row in rows], dtype=object)),
@@ -192,43 +205,88 @@ def _add_in_progress(nwbfile, prepared):
         clock = clock or built
 
 
-def _add_planes(nwbfile, prepared, imaging, max_frames_per_plane):
+def _limited(count, limit):
+    return count if limit is None else min(count, limit)
+
+
+def _add_field(nwbfile, prepared, field, channel, device, imaging, limit):
     acquisition, layout = prepared.acquisition, prepared.acquisition.layout
-    device = Device(name="Microscope", description=f"Two-photon microscope run by ScanImage {layout.version}.")
+    n_frames = _limited(field.frame_indices.size, limit)
+    columns = field.page_shape[1]
+    depth = layout.zs_um[field.plane]
+    place = f"ROI {field.name}, on plane {field.plane} of {layout.n_planes}" if field.label != f"Plane{field.plane}" else f"Plane {field.plane} of {layout.n_planes}"
+    at = "at an unknown z, because the split files kept no ScanImage settings" if np.isnan(depth) else f"at ScanImage z = {depth:g} um"
+    plane_options = {}
+    if field.pixel_size_um is not None:
+        plane_options.update(grid_spacing=list(field.pixel_size_um), grid_spacing_unit="micrometers")
+    if field.origin_um is not None and field.label != f"Plane{field.plane}":
+        plane_options.update(origin_coords=list(field.origin_um), origin_coords_unit="micrometers")
+    imaging_plane = nwbfile.create_imaging_plane(
+        name=f"ImagingPlane{field.label.removeprefix('Plane')}",
+        optical_channel=channel,
+        description=f"{place}, {at}. PLACEHOLDER: the location says only that this is in the brain, and the wavelengths aren't recorded here.",
+        device=device,
+        excitation_lambda=imaging["excitation_lambda"],
+        indicator=imaging["indicator"],
+        location=imaging["location"],
+        imaging_rate=layout.volume_rate,
+        **plane_options,
+    )
+    series_options = {}
+    if field.size_um is not None:
+        series_options["field_of_view"] = [size * 1e-6 for size in field.size_um]
+    if layout.line_period is not None:
+        series_options["scan_line_rate"] = 1 / layout.line_period
+    source = (
+        "Split copy of this ROI, clipped at 0 by the splitter, so it isn't the raw signal: (time, x, y), where x runs along a scan line."
+        if acquisition.source == SPLIT_SOURCE
+        else "Raw frames, exactly as saved by ScanImage: (time, x, y), where x runs along a scan line."
+    )
+    nwbfile.add_acquisition(TwoPhotonSeries(
+        name=f"TwoPhotonSeries{field.label}",
+        imaging_plane=imaging_plane,
+        data=H5DataIO(data=_FramePixels(lambda positions, f=field: read_field(acquisition, f, positions), n_frames, field.shape, acquisition.dtype), **COMPRESSION),
+        unit="n.a.",
+        timestamps=_compressed(prepared.field_times(field)[:n_frames]),
+        dimension=[columns, field.shape[0]],
+        description=f"{source} {place}. See processing/ophys/scanimage_alignment for how far to trust the timestamps.",
+        **series_options,
+    ))
+
+
+def _add_flyback(nwbfile, prepared, plane, limit):
+    """The rows between a plane's ROIs, so that with the fields they rebuild every page of the stack exactly."""
+    acquisition = prepared.acquisition
+    gaps = acquisition.layout.flyback_rows.get(plane)
+    if not gaps:
+        return
+    indices = acquisition.plane_frames(plane)
+    n_frames = _limited(indices.size, limit)
+    rows = sum(stop - start for start, stop in gaps)
+    columns = acquisition.layout.frame_shape[1]
+    nwbfile.add_acquisition(ImageSeries(
+        name=f"FlybackLinesPlane{plane}",
+        data=H5DataIO(data=_FramePixels(lambda positions, p=plane: read_flyback(acquisition, p, positions), n_frames, (rows, columns), acquisition.dtype), **COMPRESSION),
+        unit="n.a.",
+        timestamps=_compressed(prepared.frame_times[indices][:n_frames]),
+        dimension=[columns, rows],
+        description=f"The rows ScanImage saved while flying between ROIs on plane {plane}, joined top to bottom: rows {', '.join(f'{start}:{stop}' for start, stop in gaps)} of each page. Not imaging data. They're kept because nothing is dropped, and with the plane's fields they rebuild each page exactly.",
+    ))
+
+
+def _add_planes(nwbfile, prepared, imaging, max_frames_per_plane):
+    layout = prepared.acquisition.layout
+    version = "an unknown version" if layout.version == "unknown" else layout.version
+    device = Device(name="Microscope", description=f"Two-photon microscope run by ScanImage {version}.")
     nwbfile.add_device(device)
     channel = OpticalChannel(name="OpticalChannel", description="Channel 1, the only saved channel.", emission_lambda=imaging["emission_lambda"])
-    rows, columns = layout.frame_shape
+    for field in prepared.acquisition.fields:
+        _add_field(nwbfile, prepared, field, channel, device, imaging, max_frames_per_plane)
     for plane in range(layout.n_planes):
-        depth = layout.zs_um[plane]
-        imaging_plane = nwbfile.create_imaging_plane(
-            name=f"ImagingPlane{plane}",
-            optical_channel=channel,
-            description=f"Plane {plane} of {layout.n_planes}, at ScanImage z = {depth:g} um. PLACEHOLDER: the location says only that this is in the brain, and the wavelengths aren't recorded here.",
-            device=device,
-            excitation_lambda=imaging["excitation_lambda"],
-            indicator=imaging["indicator"],
-            location=imaging["location"],
-            imaging_rate=layout.volume_rate,
-            grid_spacing=list(layout.pixel_size_um),
-            grid_spacing_unit="micrometers",
-        )
-        frame_indices = acquisition.plane_frames(plane)
-        if max_frames_per_plane is not None:
-            frame_indices = frame_indices[:max_frames_per_plane]
-        nwbfile.add_acquisition(TwoPhotonSeries(
-            name=f"TwoPhotonSeriesPlane{plane}",
-            imaging_plane=imaging_plane,
-            data=H5DataIO(data=_PlanePixels(acquisition, frame_indices), **COMPRESSION),
-            unit="n.a.",
-            timestamps=_compressed(prepared.frame_times[frame_indices]),
-            dimension=[columns, rows],
-            field_of_view=[size * 1e-6 for size in layout.field_of_view_um],
-            scan_line_rate=1 / layout.line_period,
-            description=f"Raw frames of plane {plane}, exactly as saved by ScanImage: (time, x, y), where x runs along a scan line. See processing/ophys/scanimage_alignment for how far to trust the timestamps.",
-        ))
+        _add_flyback(nwbfile, prepared, plane, max_frames_per_plane)
 
 
-def build_imaging_nwbfile(prepared, metadata=None, imaging=None, max_frames_per_plane=None):
+def build_imaging_nwbfile(prepared, metadata=None, imaging=None, max_frames_per_plane=None, extra_alignment_rows=()):
     """The NWB file for raw imaging with behavior, ready to write. Pixels stream from the TIFFs when it's written."""
     placeholder = {
         **PLACEHOLDER_METADATA,
@@ -238,16 +296,16 @@ def build_imaging_nwbfile(prepared, metadata=None, imaging=None, max_frames_per_
     }
     nwbfile = build_nwbfile(prepared.session, {**placeholder, **(metadata or {})})
     _add_planes(nwbfile, prepared, {**PLACEHOLDER_IMAGING, **(imaging or {})}, max_frames_per_plane)
-    _add_scanimage_tables(nwbfile, prepared)
+    _add_scanimage_tables(nwbfile, prepared, extra_alignment_rows)
     _add_in_progress(nwbfile, prepared)
     return nwbfile
 
 
-def convert_session(log, tiff_paths, nwbfile_path, file=None, metadata=None, imaging=None, max_frames_per_plane=None, verify=True):
+def convert_session(log, tiff_paths, nwbfile_path, file=None, metadata=None, imaging=None, max_frames_per_plane=None, verify=True, allow_incomplete=False):
     """Convert one session, check it against the sources unless told not to, and write its report beside it. Returns what was prepared."""
     if max_frames_per_plane is not None and max_frames_per_plane < 1:
         raise ValueError(f"max_frames_per_plane must be at least 1, got {max_frames_per_plane}")
-    prepared = prepare_session(log, tiff_paths, file=file)
+    prepared = prepare_session(log, tiff_paths, file=file, allow_incomplete=allow_incomplete)
     with NWBHDF5IO(str(nwbfile_path), "w") as io:
         io.write(build_imaging_nwbfile(prepared, metadata, imaging, max_frames_per_plane))
     if verify:
@@ -263,7 +321,7 @@ def alignment_summary(prepared):
 
 def conversion_report(prepared):
     """The alignment and what happened to every log field. The trial in progress counts as dropped unless it was written."""
-    report = dict(alignment=alignment_summary(prepared), coverage=prepared.session.coverage.as_dict())
+    report = dict(alignment=alignment_summary(prepared), coverage=prepared.session.coverage.as_dict(), sentinels=SENTINELS)
     if prepared.in_progress:
         report["coverage"]["dropped"].pop("log.currentTrial", None)
         report["coverage"]["dropped"].pop("log.currentIt", None)

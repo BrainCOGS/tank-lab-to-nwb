@@ -72,14 +72,40 @@ start and stop times.
 
 ## What the converter refuses for now
 
-More than one saved channel, averaged frames, saved or discarded flyback frames, several ROIs in one page, missing frames or files,
-and several acquisitions in one file. Each stops with an error, because guessing would misplace frames.
+More than one saved channel, averaged frames, saved or discarded flyback frames, missing frames or files, and several acquisitions
+in one file. Each stops with an error, because guessing would misplace frames.
 
 Files missing from the end of an acquisition can't be seen from their numbering, so two more checks catch them. Any file of the
 acquisition beside the given ones but not listed stops the conversion. So does a last file holding a full `logFramesPerFile` pages
 when fewer than `numVolumes` volumes are present, because later files may exist. ScanImage's `endOfAcquisition` reads 0 on the last
 frame of the data seen so far, so it can't settle this. An acquisition that really does end exactly on a file boundary without
-reaching `numVolumes` is refused too, and would need a person to check it.
+reaching `numVolumes` is refused too, and would need a person to check it. When the TIFFs really are only part of an acquisition,
+`--allow-incomplete` converts what's there and records `acquisition.completeness` as not confirmed.
+
+## Multi-ROI imaging
+
+Each plane and ROI becomes its own `TwoPhotonSeriesPlane<p>Roi<r>` with its own `ImagingPlane`. The converter takes either form of a
+session, and given a folder it uses the first it finds: `originalStacks`, TIFFs in the folder, then `ROI*_z*` folders.
+
+| | Original stack | Split `ROI<r>_z<d>` folders |
+|---|---|---|
+| Pixels | As ScanImage saved them, `int16` | The splitter's copy: `uint16`, negatives clipped to 0 |
+| Pixels between ROIs | Kept in `FlybackLinesPlane<p>`, so every page can be rebuilt exactly | Gone |
+| Frame times | ScanImage's | Rounded to 0.1 ms by the splitter |
+| When a ROI's frame was scanned | Frame start + first row x line period | Frame start + the splitter's lag, which is the fly-to time per ROI and understates it |
+| ROI names, size, position, z, line rate | From the header | From the header if the split files kept it, otherwise unknown |
+| Whole acquisition? | Checked against `logFramesPerFile` and `numVolumes` | Needs `--allow-incomplete` when no header says how many files to expect |
+
+Use the original stack when it exists. On the one real session checked, the splitter's lag was 1 and 2 ms where the row positions put the
+ROIs 22 and 45 ms into the frame.
+
+Split files are checked against each other: every ROI at a depth must hold the same frames, the same I2C data, and the same clock apart
+from a fixed lag. Each depth's lowest ROI speaks for the frame and packet tables. The alignment is the same either way, because the I2C
+packet times keep their full precision in both.
+
+ROIs on different planes follow the header's `zs`, and each plane's rows are placed from the top with even gaps, as the splitter does.
+A layout that doesn't divide evenly, a ROI on no plane, a plane with no ROI, a ROI of a different width, or several ROIs with `mroiEnable`
+off stops with an error. Suite2p output from a multi-ROI session isn't converted yet.
 
 ## Files for one session
 
