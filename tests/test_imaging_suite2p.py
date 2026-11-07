@@ -8,13 +8,21 @@ import numpy as np
 import pytest
 from pynwb import validate
 
-from tests.synthetic_tiff import frame_pixels
+from tests.synthetic_tiff import frame_pixels, write_acquisition
 from tests.test_imaging_nwb import log, tiffs  # noqa: F401
 from tank_lab_to_nwb.imaging import convert_suite2p as cli
+from tank_lab_to_nwb.imaging.convert_suite2p import verify_combined
+from tank_lab_to_nwb.imaging.scanimage import read_acquisition
+from tank_lab_to_nwb.imaging.suite2p_mapping import is_separated, predict_traces, prove_frame_mapping
 from tank_lab_to_nwb.imaging.alignment import AlignmentError
 from tank_lab_to_nwb.imaging.convert import convert_session, prepare_session
 from tank_lab_to_nwb.imaging.suite2p import convert_suite2p, load_suite2p, read_companion, verify_suite2p
 from tank_lab_to_nwb.imaging.verify import RoundTripError
+
+
+def _pixel_trace(plane):
+    """Suite2p's fluorescence for the fixture's one-pixel ROI at row 1, column 2, of this plane's registered movie."""
+    return np.array([frame_pixels(i)[1, 2] for i in range(plane + 1, 802, 2)], dtype="float32")
 
 
 @pytest.fixture
@@ -58,7 +66,7 @@ def run(tmp_path, tiffs):
             ops=dict(),
             zcorr=np.array([]),
             iscell=np.array([[0.0, 0.125]]),
-            F=np.arange(count, dtype="float32")[None, :],
+            F=_pixel_trace(plane)[None, :],
             Fneu=np.ones((1, count), dtype="float32"),
             spks=np.zeros((1, count), dtype="float32"),
         ).items():
@@ -259,9 +267,7 @@ def test_cropped_summary_image_has_explicit_full_frame_origin(tmp_path, log, tif
         assert o["SummaryImages0/max_proj"][1, 0] == o["SummaryImages0/meanImg"][2, 1] == 6
 
 
-def test_combined_is_only_tiling_and_padding(run):
-    from tank_lab_to_nwb.imaging.convert_suite2p import verify_combined
-
+def _write_combined(run):
     combined = run / "combined"
     combined.mkdir()
     for key in ("F", "Fneu", "spks"):
@@ -277,6 +283,13 @@ def test_combined_is_only_tiling_and_padding(run):
         roi["iplane"] = plane
         stat.append(roi)
     np.save(combined / "stat.npy", stat)
+    return combined
+
+
+def test_combined_is_only_tiling_and_padding(run):
+    from tank_lab_to_nwb.imaging.convert_suite2p import verify_combined
+
+    combined = _write_combined(run)
     assert verify_combined(run)["roi_values_match"]
     trace = np.load(combined / "F.npy")
     trace[1, -1] = 1
@@ -307,7 +320,9 @@ def test_bidiphase_decision_and_version_are_visible_without_unpickling(tmp_path,
         values = list(table["value"].asstr()[()])
         assert values[keys.index("plane0.registration.do_bidiphase")] == "false"
         assert values[keys.index("plane0.version")] == '"1.1.0"'
-        assert "open decision" in table.attrs["description"]
+        assert "open decision" not in table.attrs["description"]
+        assert "bidirectional" not in table.attrs["description"]
+        assert "bidirectional" not in f["general/notes"].asstr()[()]
 
 
 @pytest.mark.parametrize("dataset", ["processing/ophys/Plane0_xoff", "processing/ophys/SummaryImages0/meanImg"])
@@ -420,3 +435,254 @@ def test_the_report_lists_what_was_dropped_and_the_companion(tmp_path, log, tiff
     assert {"log.currentTrial", "log.currentIt"} <= set(report["coverage"]["dropped"])
     assert report["companion"]["desc"] == "rawtiff"
     assert report["alignment"]["frames"] == 801
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(lambda trace: trace[:, ::-1], id="reversed"),
+        pytest.param(lambda trace: np.roll(trace, 1, axis=1), id="one frame late"),
+        pytest.param(lambda trace: np.roll(trace, -1, axis=1), id="one frame early"),
+    ],
+)
+def test_traces_that_do_not_match_the_registered_movie_are_refused(tmp_path, log, tiffs, run, change):
+    np.save(run / "plane0/F.npy", change(np.load(run / "plane0/F.npy")))
+    with pytest.raises(ValueError, match="trace"):
+        convert_suite2p(log, tiffs, run, tmp_path / "bad.nwb", file="session.mat")
+
+
+def test_the_evidence_records_trace_errors_with_controls(log, tiffs, run):
+    evidence = prove_frame_mapping(prepare_session(log, tiffs, file="session.mat").acquisition, run)
+    middle = next(sample for sample in evidence if sample["frame"] == 200)
+    assert middle["trace_rmse"]["0"] == 0
+    assert middle["trace_rmse"]["-1"] > 1 and middle["trace_rmse"]["1"] > 1
+
+
+def test_a_trace_without_a_value_at_a_sampled_frame_is_not_measured_there(log, tiffs, run):
+    trace = np.load(run / "plane0/F.npy")
+    trace[0, 0] = np.nan
+    np.save(run / "plane0/F.npy", trace)
+    evidence = prove_frame_mapping(prepare_session(log, tiffs, file="session.mat").acquisition, run)
+    first = next(sample for sample in evidence if sample["plane"] == 0 and sample["frame"] == 0)
+    assert first["trace_rmse"] is None
+
+
+def test_predicted_traces_use_normalized_weights_and_leave_out_overlaps():
+    frame = np.arange(12, dtype="int16").reshape(3, 4)
+    roi = dict(xpix=np.array([0, 1, 2]), ypix=np.array([1, 1, 1]), lam=np.array([1.0, 3.0, 8.0], dtype="float32"), overlap=np.array([False, False, True]))
+    assert predict_traces(frame, [roi], allow_overlap=False).tolist() == [(4 * 1 + 5 * 3) / 4]
+    assert predict_traces(frame, [roi], allow_overlap=True).tolist() == [(4 * 1 + 5 * 3 + 6 * 8) / 12]
+
+
+def test_a_roi_without_overlap_recorded_counts_every_pixel():
+    frame = np.ones((3, 4), dtype="int16")
+    roi = dict(xpix=np.array([0, 1]), ypix=np.array([0, 0]), lam=np.array([1.0, 1.0], dtype="float32"))
+    assert predict_traces(frame, [roi], allow_overlap=False).tolist() == [1.0]
+
+
+def test_a_roi_entirely_in_overlap_has_a_zero_trace():
+    frame = np.ones((3, 4), dtype="int16")
+    roi = dict(xpix=np.array([0]), ypix=np.array([0]), lam=np.array([1.0], dtype="float32"), overlap=np.array([True]))
+    assert predict_traces(frame, [roi], allow_overlap=False).tolist() == [0.0]
+
+
+@pytest.mark.parametrize(
+    ("errors", "passes"),
+    [
+        ({"0": 0.0, "1": 0.2}, True),
+        ({"0": 0.0, "1": 0.1}, False),  # the control must be more than ten times worse, with a floor
+        ({"0": 0.5, "-1": 5.0}, False),
+        ({"0": 0.5, "-1": 5.1, "1": 6.0}, True),
+        ({"0": 2.0, "1": 100.0}, True),
+        ({"0": 2.1, "1": 100.0}, False),
+        ({"0": 0.0}, True),  # one frame in the plane, so no neighbors
+    ],
+)
+def test_a_match_must_be_close_and_stand_clear_of_its_controls(errors, passes):
+    assert is_separated(errors, limit=2) is passes
+
+
+def test_a_plane_with_no_pages_in_the_last_file_is_still_checked(tmp_path, log):
+    folder = tmp_path / "short"
+    folder.mkdir()
+    tiffs = write_acquisition(folder, 7, frames_per_file=3)
+    root = tmp_path / "s2p"
+    for plane, count in enumerate((4, 3)):
+        where = root / f"plane{plane}"
+        where.mkdir(parents=True)
+        movie = np.stack([frame_pixels(i) for i in range(plane + 1, 8, 2)])
+        movie.tofile(where / "data.bin")
+        np.save(where / "reg_outputs.npy", dict(xoff=np.zeros(count, dtype="int64"), yoff=np.zeros(count, dtype="int64")))
+        np.save(where / "settings.npy", dict(registration=dict(do_bidiphase=False, nonrigid=False)))
+        np.save(where / "stat.npy", [dict(xpix=np.array([2]), ypix=np.array([1]), lam=np.array([0.5], dtype="float32"))])
+        np.save(where / "F.npy", movie[:, 1, 2].astype("float32")[None, :])
+    evidence = prove_frame_mapping(read_acquisition(tiffs), root)
+    assert {sample["plane"] for sample in evidence} == {0, 1}
+
+
+def test_every_setting_must_be_in_the_file(tmp_path, log, tiffs, run):
+    path = tmp_path / "out.nwb"
+    prepared = convert_suite2p(log, tiffs, run, path, file="session.mat")
+    with h5py.File(path, "r+") as f:
+        keys = f["processing/ophys/suite2p_settings/key"]
+        keys[list(keys.asstr()[()]).index("plane0.registration.do_bidiphase")] = "plane0.registration.renamed"
+    with pytest.raises(RoundTripError, match="setting"):
+        verify_suite2p(prepared, path, run, tiffs)
+
+
+def test_a_changed_setting_value_is_caught(tmp_path, log, tiffs, run):
+    path = tmp_path / "out.nwb"
+    prepared = convert_suite2p(log, tiffs, run, path, file="session.mat")
+    with h5py.File(path, "r+") as f:
+        table = f["processing/ophys/suite2p_settings"]
+        table["value"][list(table["key"].asstr()[()]).index("plane0.registration.do_bidiphase")] = "true"
+    with pytest.raises(RoundTripError):
+        verify_suite2p(prepared, path, run, tiffs)
+
+
+def test_traces_must_point_at_their_own_plane_rois(tmp_path, log, tiffs, run):
+    path = tmp_path / "out.nwb"
+    prepared = convert_suite2p(log, tiffs, run, path, file="session.mat")
+    with h5py.File(path, "r+") as f:
+        f["processing/ophys/Fluorescence/Plane0/rois"].attrs["table"] = f["processing/ophys/ImageSegmentation/PlaneSegmentation1"].ref
+    with pytest.raises(RoundTripError, match="rois"):
+        verify_suite2p(prepared, path, run, tiffs)
+
+
+def test_the_stored_mapping_evidence_is_checked(tmp_path, log, tiffs, run):
+    path = tmp_path / "out.nwb"
+    prepared = convert_suite2p(log, tiffs, run, path, file="session.mat")
+    evidence = prove_frame_mapping(prepared.acquisition, run)
+    verify_suite2p(prepared, path, run, tiffs, mapping=evidence)
+    evidence[0]["rmse"]["0"] += 1
+    with pytest.raises(RoundTripError, match="mapping"):
+        verify_suite2p(prepared, path, run, tiffs, mapping=evidence)
+
+
+def test_a_stat_key_absent_from_a_roi_is_not_confused_with_none(tmp_path, log, tiffs, run):
+    folder = run / "plane0"
+    roi = np.load(folder / "stat.npy", allow_pickle=True)[0]
+    np.save(folder / "stat.npy", [dict(roi, note=None), dict(roi)])
+    for key in ("F", "Fneu", "spks"):
+        trace = np.load(folder / f"{key}.npy")
+        np.save(folder / f"{key}.npy", np.concatenate([trace, trace]))
+    np.save(folder / "iscell.npy", np.array([[0.0, 0.125], [1.0, 0.5]]))
+    path = tmp_path / "out.nwb"
+    prepared = convert_suite2p(log, tiffs, run, path, file="session.mat")
+    with h5py.File(path, "r+") as f:
+        column = f["processing/ophys/ImageSegmentation/PlaneSegmentation0/stat_note"]
+        assert list(column.asstr()[()]) == ["null", ""]
+        column[1] = "null"
+    with pytest.raises(RoundTripError, match="note"):
+        verify_suite2p(prepared, path, run, tiffs)
+
+
+def test_a_zero_byte_artifact_is_archived(tmp_path, log, tiffs, run):
+    (run / "plane0/empty.log").write_bytes(b"")
+    path = tmp_path / "out.nwb"
+    convert_suite2p(log, tiffs, run, path, file="session.mat")
+    with h5py.File(path) as f:
+        inventory = f["processing/ophys/source_inventory"]
+        name = inventory["scratch_name"].asstr()[list(inventory["path"].asstr()[()]).index("plane0/empty.log")]
+        assert f[f"scratch/{name}"].shape == (0,)
+
+
+def test_a_movie_anywhere_is_listed_as_left_out(run):
+    (run / "combined").mkdir()
+    (run / "combined/data.bin").write_bytes(b"12")
+    (run / "data.bin").write_bytes(b"12")
+    inventory = cli.artifact_inventory(run)
+    assert inventory["combined/data.bin"]["storage"].startswith("excluded:")
+    assert inventory["data.bin"]["storage"].startswith("excluded:")
+
+
+def _change_db(run, **changes):
+    path = run / "plane0/db.npy"
+    np.save(path, {**np.load(path, allow_pickle=True).item(), **changes})
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [dict(Ly=4), dict(Lx=5), dict(iplane=1), dict(nframes=400), dict(frames_per_file=[150, 150, 100])],
+    ids=["rows", "columns", "plane", "frames", "frames per file"],
+)
+def test_a_run_that_disagrees_with_the_tiffs_is_refused(log, tiffs, run, changes):
+    _change_db(run, **changes)
+    with pytest.raises(ValueError, match="plane 0"):
+        load_suite2p(run, prepare_session(log, tiffs, file="session.mat"))
+
+
+def test_a_run_from_files_in_another_order_is_refused(log, tiffs, run):
+    _change_db(run, file_list=[str(path) for path in reversed(tiffs)])
+    with pytest.raises(ValueError, match="file order"):
+        load_suite2p(run, prepare_session(log, tiffs, file="session.mat"))
+
+
+@pytest.mark.parametrize(("probability", "passes"), [(0.0, True), (1.0, True), (float("nan"), False), (-0.1, False), (1.5, False)])
+def test_cell_probability_must_be_a_probability(log, tiffs, run, probability, passes):
+    np.save(run / "plane0/iscell.npy", np.array([[0.0, probability]]))
+    prepared = prepare_session(log, tiffs, file="session.mat")
+    if passes:
+        assert load_suite2p(run, prepared)
+    else:
+        with pytest.raises(ValueError, match="probability"):
+            load_suite2p(run, prepared)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "passes"),
+    [("xpix", 0, True), ("xpix", 3, True), ("xpix", 4, False), ("xpix", -1, False), ("ypix", 0, True), ("ypix", 2, True), ("ypix", 3, False)],
+)
+def test_mask_pixels_must_lie_in_the_frame(log, tiffs, run, field, value, passes):
+    stat = np.load(run / "plane0/stat.npy", allow_pickle=True)
+    stat[0][field] = np.array([value])
+    np.save(run / "plane0/stat.npy", stat)
+    prepared = prepare_session(log, tiffs, file="session.mat")
+    if passes:
+        assert load_suite2p(run, prepared)
+    else:
+        with pytest.raises(ValueError, match="pixels"):
+            load_suite2p(run, prepared)
+
+
+def test_combined_settings_must_match_the_planes(run):
+    combined = _write_combined(run)
+    settings = np.load(run / "plane0/settings.npy", allow_pickle=True).item()
+    np.save(combined / "settings.npy", settings)
+    assert verify_combined(run)["roi_values_match"]
+    np.save(combined / "settings.npy", dict(settings, version="other"))
+    with pytest.raises(ValueError, match="combined settings"):
+        verify_combined(run)
+
+
+def _combined_db(run, save_path):
+    folder = run / "plane1"
+    image = np.arange(12, dtype="float32").reshape(3, 4)
+    tiled = np.hstack([image, image]).astype("float64")
+    merged = {}
+    for name in ("db", "reg_outputs", "detect_outputs"):
+        merged.update(np.load(folder / f"{name}.npy", allow_pickle=True).item())
+    return {**merged, "meanImg": tiled, "max_proj": tiled, "Ly": 3, "Lx": 8, "yrange": [0, 3], "xrange": [0, 8], "save_path": save_path}
+
+
+@pytest.mark.parametrize("save_path", ["runs/session/suite2p/combined", "/data/session/suite2p/combined"], ids=["relative", "absolute"])
+def test_combined_db_may_use_any_root(run, save_path):
+    combined = _write_combined(run)
+    np.save(combined / "db.npy", _combined_db(run, save_path.replace("suite2p", run.name)))
+    assert verify_combined(run)["all_metadata_and_tiled_images_match"]
+
+
+def test_combined_db_elsewhere_is_refused(run):
+    combined = _write_combined(run)
+    np.save(combined / "db.npy", _combined_db(run, "elsewhere/plane0"))
+    with pytest.raises(ValueError, match="storage path"):
+        verify_combined(run)
+
+
+def test_a_changed_value_in_combined_db_is_refused(run):
+    combined = _write_combined(run)
+    db = _combined_db(run, f"{run.name}/combined")
+    db["nframes"] = 1
+    np.save(combined / "db.npy", db)
+    with pytest.raises(ValueError, match="combined db"):
+        verify_combined(run)
