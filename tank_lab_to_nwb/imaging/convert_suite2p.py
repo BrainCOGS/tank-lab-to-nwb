@@ -41,6 +41,10 @@ def artifact_inventory(root):
                 }
             else:
                 entry["array"] = describe(value)
+        elif path.suffix == ".mat":
+            from scipy.io import whosmat
+
+            entry["fields"] = {name: dict(shape=list(shape), matlab_class=kind) for name, shape, kind in whosmat(path)}
         result[str(path.relative_to(root))] = entry
     for path in sorted(Path(root).glob("plane*/data.bin")):
         result[str(path.relative_to(root))] = dict(

@@ -277,3 +277,14 @@ def test_combined_is_only_tiling_and_padding(run):
     np.save(combined / "F.npy", trace)
     with pytest.raises(ValueError, match="padding"):
         verify_combined(run)
+
+
+def test_inventory_includes_matlab_fields_and_excluded_movie_reason(run):
+    from scipy.io import savemat
+    from tank_lab_to_nwb.imaging.convert_suite2p import artifact_inventory
+
+    savemat(run / "plane0/Fall.mat", dict(redcell=np.empty((0, 0)), F=np.array([[1.0]], dtype="float32")))
+    inventory = artifact_inventory(run)
+    assert inventory["plane0/Fall.mat"]["fields"]["redcell"]["shape"] == [0, 0]
+    assert inventory["plane0/Fall.mat"]["fields"]["F"]["matlab_class"] == "single"
+    assert inventory["plane0/data.bin"]["storage"].startswith("excluded:")
