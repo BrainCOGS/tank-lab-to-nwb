@@ -9,6 +9,10 @@ import numpy as np
 from ..virmen.coerce import coerce
 
 
+REGISTRATION_SERIES = ("xoff", "yoff", "corrXY", "xoff1", "yoff1", "corrXY1", "badframes", "badframes0")
+TRACE_SERIES = (("Fluorescence", "F"), ("Neuropil", "Fneu"), ("Deconvolved", "spks"))
+
+
 def load_suite2p(root, prepared):
     """Validate counts and geometry against TIFF headers; never use combined's padded traces.
 
@@ -16,6 +20,8 @@ def load_suite2p(root, prepared):
     """
     root = Path(root)
     acquisition = prepared.acquisition
+    if len(acquisition.fields) != acquisition.layout.n_planes:
+        raise ValueError("Suite2p output from a multi-ROI session isn't converted yet: its plane folders mean plane and ROI together")
     expected_folders = {f"plane{p}" for p in range(acquisition.layout.n_planes)}
     if {p.name for p in root.glob("plane*") if p.is_dir()} != expected_folders:
         raise ValueError("Suite2p plane folders differ from the TIFF planes")
@@ -50,7 +56,7 @@ def load_suite2p(root, prepared):
         coerce(data["iscell"][:, 0], "bool", file=folder, field="iscell")
         if not np.all(np.isfinite(data["iscell"][:, 1]) & (data["iscell"][:, 1] >= 0) & (data["iscell"][:, 1] <= 1)):
             raise ValueError(f"plane {plane}: invalid cell probability")
-        for key in ("xoff", "yoff", "corrXY", "xoff1", "yoff1", "corrXY1", "badframes", "badframes0"):
+        for key in REGISTRATION_SERIES:
             if key in data["reg_outputs"] and data["reg_outputs"][key].shape[0] != nframes:
                 raise ValueError(f"plane {plane}: {key} frame count differs")
         for roi in data["stat"]:
@@ -95,12 +101,13 @@ def _flatten_settings(prefix, value):
         yield prefix, value
 
 
-_COMPANION_COLUMNS = {
-    "desc": "The file's desc- value in its DANDI name.",
-    "identifier": "That file's NWB identifier.",
-    "sha256": "SHA256 of that file when this one was written.",
-    "relation": "How the two files relate.",
-}
+def _companion_rows(companion):
+    """Alignment rows naming the raw file a Suite2p file goes with."""
+    return [
+        ("companion.rawtiff.identifier", companion["identifier"], "That file's NWB identifier. Its DANDI name has desc-rawtiff."),
+        ("companion.rawtiff.sha256", companion["sha256"], "SHA256 of that file when this one was written."),
+        ("companion.rawtiff.relation", companion["relation"], "How the two files relate."),
+    ] if companion else []
 
 
 def read_companion(raw_nwb, prepared):
@@ -111,10 +118,10 @@ def read_companion(raw_nwb, prepared):
     from .verify import _alignment_values
 
     with h5py.File(raw_nwb, "r") as file:
-        scanimage = file["processing/scanimage"]
-        if _alignment_values(scanimage["alignment"]).get("acquisition.id") != acquisition_id(prepared.acquisition):
+        scanimage = file["processing/ophys"]
+        if _alignment_values(scanimage["scanimage_alignment"]).get("acquisition.id") != acquisition_id(prepared.acquisition):
             raise AlignmentError(f"{raw_nwb}: this file comes from another acquisition")
-        if not np.array_equal(scanimage["frames/session_time"][()], prepared.frame_times):
+        if not np.array_equal(scanimage["scanimage_frames/session_time"][()], prepared.frame_times):
             raise AlignmentError(f"{raw_nwb}: its frame times differ, so the two files aren't on the same clock")
         identifier = file["identifier"].asstr()[()]
     digest = hashlib.sha256()
@@ -122,7 +129,6 @@ def read_companion(raw_nwb, prepared):
         while chunk := handle.read(64_000_000):
             digest.update(chunk)
     return dict(
-        desc="rawtiff",
         identifier=identifier,
         sha256=digest.hexdigest(),
         relation="Raw frames of the same acquisition, on the same clock: acquisition.id and every frame time were checked against that file when this one was written.",
@@ -139,7 +145,7 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
     from pynwb.device import Device
     from pynwb.image import GrayscaleImage
     from pynwb.ophys import Fluorescence, ImageSegmentation, OpticalChannel, RoiResponseSeries
-    from ..virmen.convert import PLACEHOLDER_METADATA, build_nwbfile
+    from ..virmen.convert import KEYWORDS, PLACEHOLDER_METADATA, build_nwbfile
     from .convert import PLACEHOLDER_IMAGING, _add_in_progress, _add_scanimage_tables, _table, COMPRESSION
 
     planes = load_suite2p(root, prepared)
@@ -147,6 +153,7 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
         prepared.session,
         {
             **PLACEHOLDER_METADATA,
+            "keywords": [*KEYWORDS, "two-photon calcium imaging", "Suite2p"],
             "session_description": "ViRMEn behavior and Suite2p two-photon results, aligned using TIFF headers and behavior I2C events.",
             **(metadata or {}),
         },
@@ -157,22 +164,11 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
         "Per-plane Suite2p folders define lengths; combined contains padded display traces. "
         "Original Suite2p artifacts except data.bin are preserved byte-for-byte in scratch; object NPY files require a trusted pickle reader. "
         f"registration.do_bidiphase is {planes[0]['settings']['registration'].get('do_bidiphase')} in the Suite2p settings. "
-        "Files of this acquisition share acquisition.id in processing/scanimage/alignment; processing/scanimage/companion_files names the raw file when it was given."
+        "Files of this acquisition share acquisition.id in that table; processing/ophys/scanimage_alignment names the raw file in its companion rows, when it was given."
     )
-    _add_scanimage_tables(nwb, prepared)
-    if companion is not None:
-        nwb.processing["scanimage"].add(
-            _table(
-                "companion_files",
-                "Other NWB files made from this acquisition, checked against this one when it was written.",
-                [(name, text, np.array([companion[name]], dtype=object)) for name, text in _COMPANION_COLUMNS.items()],
-            )
-        )
+    _add_scanimage_tables(nwb, prepared, _companion_rows(companion))
     _add_in_progress(nwb, prepared)
-    module = nwb.create_processing_module(
-        "ophys",
-        "Suite2p segmentation, fluorescence, neuropil, deconvolution and registration; per-plane TIFF frame times.",
-    )
+    module = nwb.processing["ophys"]
     segmentation = ImageSegmentation()
     module.add(segmentation)
     containers = {key: Fluorescence(name=key) for key in ("Fluorescence", "Neuropil", "Deconvolved")}
@@ -185,7 +181,7 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
     layout = prepared.acquisition.layout
     image_coordinates = []
     for plane, data in enumerate(planes):
-        ip = nwb.create_imaging_plane(
+        imaging_plane = nwb.create_imaging_plane(
             name=f"ImagingPlane{plane}",
             optical_channel=OpticalChannel(
                 name=f"OpticalChannel{plane}", description="Only saved channel.", emission_lambda=float("nan")
@@ -200,7 +196,7 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
         # emission_lambda belongs to OpticalChannel, not ImagingPlane.
         ps = segmentation.create_plane_segmentation(
             name=f"PlaneSegmentation{plane}",
-            imaging_plane=ip,
+            imaging_plane=imaging_plane,
             id=ElementIdentifiers(name="id", data=np.array([], dtype="int64")),
             description="Every Suite2p ROI, including rejected cells. Full-frame x=column, y=row. stat_* columns are JSON source values; native dtype is preserved in the source archive.",
         )
@@ -234,7 +230,7 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
             region = ps.create_roi_table_region(
                 region=list(range(len(data["stat"]))), description="All ROIs in source order."
             )
-            for name, key in (("Fluorescence", "F"), ("Neuropil", "Fneu"), ("Deconvolved", "spks")):
+            for name, key in TRACE_SERIES:
                 containers[name].add_roi_response_series(
                     RoiResponseSeries(
                         name=f"Plane{plane}",
@@ -275,7 +271,7 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
                     )
         if images.images:
             module.add(images)
-        for key in ("xoff", "yoff", "corrXY", "xoff1", "yoff1", "corrXY1", "badframes", "badframes0"):
+        for key in REGISTRATION_SERIES:
             if key in data["reg_outputs"]:
                 module.add(
                     TimeSeries(
@@ -402,48 +398,44 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None, mapping=None):
     headers = _read_headers(tiffs)
     numbers, times = headers["columns"]["frame_number"], headers["columns"]["timestamp"]
     with h5py.File(output) as f:
-        scan = f["processing/scanimage"]
-        check_scanimage_tables(scan, prepared, headers)
-        values = _alignment_values(scan["alignment"])
+        scan = f["processing/ophys"]
+        check_scanimage_tables(scan, prepared, headers, _companion_rows(companion))
+        values = _alignment_values(scan["scanimage_alignment"])
         slope, intercept, offset = [float(values[f"fit.{k}"]) for k in ("slope", "intercept", "clock_offset")]
         session_times = (times - intercept) / slope + offset
-        equal(scan["frames/session_time"][()], session_times, "session times")
-        if companion is not None:
-            for name, value in companion.items():
-                if scan[f"companion_files/{name}"].asstr()[0] != value:
-                    raise RoundTripError(f"companion_files.{name} differs from the raw file")
+        equal(scan["scanimage_frames/session_time"][()], session_times, "session times")
         if mapping is not None and json.loads(f["scratch/suite2p_frame_mapping"].asstr()[()]) != mapping:
             raise RoundTripError("the stored frame mapping evidence differs from what was measured")
         for series in prepared.in_progress:
-            _check_series(f["processing/in_progress_trial"], series)
-        o = f["processing/ophys"]
+            _check_series(f["processing/behavior"], series)
+        ophys = f["processing/ophys"]
         for plane in range(prepared.acquisition.layout.n_planes):
             folder = Path(root) / f"plane{plane}"
             stat = np.load(folder / "stat.npy", allow_pickle=True)
             cells = np.load(folder / "iscell.npy")
-            ps = o[f"ImageSegmentation/PlaneSegmentation{plane}"]
-            equal(ps["id"][()], np.arange(len(stat)), "ROI ids")
+            segmentation = ophys[f"ImageSegmentation/PlaneSegmentation{plane}"]
+            equal(segmentation["id"][()], np.arange(len(stat)), "ROI ids")
             db = np.load(folder / "db.npy", allow_pickle=True).item()
             reg = np.load(folder / "reg_outputs.npy", allow_pickle=True).item()
-            equal(ps["iscell"][()], cells[:, 0], "iscell")
-            equal(ps["cell_probability"][()], cells[:, 1], "probability")
+            equal(segmentation["iscell"][()], cells[:, 0], "iscell")
+            equal(segmentation["cell_probability"][()], cells[:, 1], "probability")
             cursor = 0
             for i, roi in enumerate(stat):
-                end = int(ps["pixel_mask_index"][i])
-                mask = ps["pixel_mask"][cursor:end]
+                end = int(segmentation["pixel_mask_index"][i])
+                mask = segmentation["pixel_mask"][cursor:end]
                 equal(mask["x"], roi["xpix"], "mask x")
                 equal(mask["y"], roi["ypix"], "mask y")
                 equal(mask["weight"], roi["lam"], "mask weights")
                 cursor = end
                 for key, value in roi.items():
-                    equal(json.loads(ps[f"stat_{key}"].asstr()[i]), value, f"stat.{key}")
-                for column in ps:
-                    if column.startswith("stat_") and column.removeprefix("stat_") not in roi and ps[column].asstr()[i] != "":
+                    equal(json.loads(segmentation[f"stat_{key}"].asstr()[i]), value, f"stat.{key}")
+                for column in segmentation:
+                    if column.startswith("stat_") and column.removeprefix("stat_") not in roi and segmentation[column].asstr()[i] != "":
                         raise RoundTripError(f"{column}: ROI {i} has no such key, but the file holds a value")
-            for name, key in [("Fluorescence", "F"), ("Neuropil", "Fneu"), ("Deconvolved", "spks")]:
+            for name, key in TRACE_SERIES:
                 source = np.load(folder / f"{key}.npy", mmap_mode="r")
                 if len(stat):
-                    series = o[f"{name}/Plane{plane}"]
+                    series = ophys[f"{name}/Plane{plane}"]
                     if series["data"].dtype != np.float32:
                         raise RoundTripError(key + " dtype differs")
                     equal(series["data"][()], source.T, key)
@@ -459,12 +451,12 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None, mapping=None):
             for source in ("reg_outputs", "detect_outputs"):
                 meta = np.load(folder / f"{source}.npy", allow_pickle=True).item()
                 for key, value in meta.items():
-                    if key in ("xoff", "yoff", "corrXY", "xoff1", "yoff1", "corrXY1", "badframes", "badframes0"):
-                        if f"Plane{plane}_{key}" not in o:
+                    if key in REGISTRATION_SERIES:
+                        if f"Plane{plane}_{key}" not in ophys:
                             raise RoundTripError("missing registration " + key)
-                        equal(o[f"Plane{plane}_{key}/data"][()], value, key)
+                        equal(ophys[f"Plane{plane}_{key}/data"][()], value, key)
                         equal(
-                            o[f"Plane{plane}_{key}/timestamps"][()],
+                            ophys[f"Plane{plane}_{key}/timestamps"][()],
                             session_times[(numbers - 1) % prepared.acquisition.layout.n_planes == plane],
                             key + " times",
                         )
@@ -473,10 +465,10 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None, mapping=None):
                         and value.ndim == 2
                         and key in ("meanImg", "meanImgE", "max_proj", "Vcorr", "refImg", "meanImg_crop")
                     ):
-                        if f"SummaryImages{plane}/{key}" not in o:
+                        if f"SummaryImages{plane}/{key}" not in ophys:
                             raise RoundTripError("missing summary image " + key)
-                        equal(o[f"SummaryImages{plane}/{key}"][()], value.T, key)
-                        table = o["summary_image_coordinates"]
+                        equal(ophys[f"SummaryImages{plane}/{key}"][()], value.T, key)
+                        table = ophys["summary_image_coordinates"]
                         row = list(table["image"].asstr()[()]).index(f"SummaryImages{plane}/{key}")
                         origin = (0, 0) if value.shape == (db["Ly"], db["Lx"]) else (reg["xrange"][0], reg["yrange"][0])
                         equal(
@@ -484,7 +476,7 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None, mapping=None):
                             [*origin, value.shape[1], value.shape[0]],
                             "summary image coordinates",
                         )
-        table = o["suite2p_settings"]
+        table = ophys["suite2p_settings"]
         stored = dict(zip(table["key"].asstr()[()], table["value"].asstr()[()]))
         expected = {}
         for plane in range(prepared.acquisition.layout.n_planes):
@@ -494,7 +486,7 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None, mapping=None):
             raise RoundTripError(f"Suite2p settings differ: {sorted(set(stored) ^ set(expected))}")
         for key, value in expected.items():
             equal(json.loads(stored[key]), value, "Suite2p setting " + key)
-        inventory = o["source_inventory"]
+        inventory = ophys["source_inventory"]
         sources = _sources(root)
         if list(inventory["path"].asstr()[()]) != [str(p.relative_to(root)) for p in sources]:
             raise RoundTripError("source archive inventory differs")

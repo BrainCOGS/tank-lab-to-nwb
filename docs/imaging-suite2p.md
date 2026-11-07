@@ -13,9 +13,9 @@ The output is `OUTPUT_DIR/staging/suite2p.nwb`, with a report beside it. Organiz
 dandiset with the raw file, named with `description="rawtiff"`: the two get the same subject and session and differ by `desc-`.
 
 The two files are tied together in three ways. Both carry the same `subject_id` and `session_id`, and the same `acquisition.id`
-in `processing/scanimage/alignment`. With `--raw-nwb`, this converter also checks that the raw file has that `acquisition.id` and
+in `processing/ophys/scanimage_alignment`. With `--raw-nwb`, this converter also checks that the raw file has that `acquisition.id` and
 exactly the same frame times, refusing it otherwise, and records its NWB identifier and SHA256 in
-`processing/scanimage/companion_files`. The raw file can't name this one, because it's written first.
+its `companion.rawtiff.*` rows. The raw file can't name this one, because it's written first.
 
 ## Alignment and what it means
 
@@ -146,7 +146,7 @@ round-trips exactly against its own fitted TIFF times. No behavior-level activit
 
 The file has **1,949,976,431 bytes**, SHA256 `0ee1ab3bea6db23c3fbd3621f2a1cb446658beda1d0b354e11033bdf5de7215f`. The raw file it goes
 with has **18,266,980,032 bytes**, SHA256 `d923c30b6a7e99f82226bfa47557bb7f9e052a9892bdbc485bf9550336ecf369`, the value recorded in
-`companion_files`. Both are organized into one local stub dandiset, as `desc-rawtiff` and `desc-suite2p`, and these serial checks ran
+`companion.rawtiff.sha256`. Both are organized into one local stub dandiset, as `desc-rawtiff` and `desc-suite2p`, and these serial checks ran
 there:
 
 - `pynwb.validate`: **[]** on both files.
