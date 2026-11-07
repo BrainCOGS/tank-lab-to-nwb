@@ -1,6 +1,5 @@
 """Put imaging frames on the behavior clock using the I2C packets ViRMEn sends. See docs/imaging-timing.md."""
 
-import hashlib
 import json
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -283,13 +282,6 @@ def packet_gaps(acquisition):
     return times[with_packet[jumps + 1]] - times[with_packet[jumps] + 1]
 
 
-def acquisition_id(acquisition):
-    """A fingerprint of the acquisition itself, the same in every NWB file made from it."""
-    times = acquisition.frames["timestamp"]
-    parts = [acquisition.epoch, *(file.name for file in acquisition.files), str(times.size), repr(float(times[0])), repr(float(times[-1]))]
-    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
-
-
 def alignment_rows(prepared):
     """(key, value, meaning) for everything a reader needs to judge the alignment."""
     fit, acquisition = prepared.fit, prepared.acquisition
@@ -308,7 +300,6 @@ def alignment_rows(prepared):
         ("acquisition.completeness", acquisition.completeness, "Whether these TIFFs are the whole acquisition, as far as they can show."),
         *rois,
         *([("acquisition.split_packet_changes", str(acquisition.split_packet_changes), "I2C packets whose time the splitter changed, because they shared their frame's time. The lowest ROI's rounded value is the one stored and fit.")] if acquisition.source == SPLIT_SOURCE else []),
-        ("acquisition.id", acquisition_id(acquisition), "Fingerprint of this acquisition: ScanImage's epoch, the TIFF names, the frame count, and the first and last frame times. Every NWB file made from this acquisition, raw TIFF or processed, carries the same value, along with the same subject_id and session_id."),
         ("fit.method", METHOD, "How frames were put on the behavior clock. No wall clock is involved."),
         ("fit.slope", repr(fit.slope), "ScanImage seconds per ViRMEn elapsed second."),
         ("fit.intercept", repr(fit.intercept), "ScanImage clock reading when ViRMEn's elapsed clock read zero, in seconds."),

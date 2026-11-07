@@ -463,20 +463,16 @@ def test_short_stretches_without_packets_are_not_counted(written):
     assert float(values["labels.longest_gap_seconds"]) < 2.0
 
 
-def test_the_acquisition_id_is_stable_and_names_only_this_acquisition(tmp_path, log, written):
-    prepared, path, tiffs, _ = written
-    again = tmp_path / "again.nwb"
-    convert_session(log, tiffs, again, file="session.mat")
-    first = _alignment(path)["acquisition.id"]
-    assert first == _alignment(again)["acquisition.id"]
-    assert len(first) == 64
-    other = tmp_path / "other"
-    other.mkdir()
-    shorter = write_acquisition(other, 800, frames_per_file=300, packets=_frame_packets(log, 800))
-    assert prepare_session(log, shorter, file="session.mat")
-    elsewhere = tmp_path / "elsewhere.nwb"
-    convert_session(log, shorter, elsewhere, file="session.mat")
-    assert _alignment(elsewhere)["acquisition.id"] != first
+def test_files_of_one_acquisition_are_matched_by_recorded_values_not_a_derived_id(written):
+    # A reader matches a raw and a processed file by what ScanImage recorded, all of which is in the file.
+    prepared, path, _, _ = written
+    values = _alignment(path)
+    assert not any(key.startswith("acquisition.id") for key in values)
+    assert values["scanimage.epoch"] == prepared.acquisition.epoch
+    with h5py.File(path, "r") as file:
+        ophys = file["processing/ophys"]
+        assert [name.decode() for name in ophys["scanimage_files/file_name"][()]] == [f.name for f in prepared.acquisition.files]
+        assert np.array_equal(ophys["scanimage_frames/timestamp"][()], prepared.acquisition.frames["timestamp"])
 
 
 class TestCommandLine:
