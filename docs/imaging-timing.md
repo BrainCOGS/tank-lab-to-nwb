@@ -125,5 +125,7 @@ off stops with an error. Suite2p output from a multi-ROI session isn't converted
 
 A session's raw and processed files are separate NWB files in one dandiset, told apart by name:
 `sub-<subject>_ses-<session>_desc-rawtiff_behavior+ophys.nwb` and `..._desc-suite2p_behavior+ophys.nwb`. Pass `description` to
-`organize_for_dandi` to name them. They share a `subject_id`, a `session_id`, and `acquisition.id` in
-`processing/ophys/scanimage_alignment`, a fingerprint of the acquisition itself.
+`organize_for_dandi` to name them. They share a `subject_id`, a `session_id` and a `session_start_time`, and the same
+ScanImage record in `processing/ophys`: `scanimage.epoch` in `scanimage_alignment`, the TIFF names and page counts in
+`scanimage_files`, and every frame's number and time in `scanimage_frames`. Comparing those tells whether two files come
+from one acquisition. There's no derived ID to trust instead.

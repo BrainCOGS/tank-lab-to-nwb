@@ -10,11 +10,12 @@ from pynwb import NWBHDF5IO, validate
 from tank_lab_to_nwb.virmen.convert import convert_log, write_session
 from tank_lab_to_nwb.virmen.session import normalize_log
 from tank_lab_to_nwb.virmen.verify import RoundTripError, verify_round_trip
-from tests.synthetic_log import make_block, make_log, make_trial, single
+from tests.synthetic_log import make_block, make_log, make_trial, port_cell, ports, single
 from tests.test_session import _stimulus_table
 
 FULL_TRIAL = dict(
     licks=np.array([[10.0, 20.0], [1.0, 2.0]], dtype="float32"),
+    state_ports=port_cell(ports(left_contact=True), ports(right_contact=True)),
     forcedChoice=single(0),
     wallGuide=np.array([[False]]),
     startPosition=np.array([[0.0, -30.0, 2.0, 0.0]], dtype="float32"),
@@ -57,6 +58,13 @@ def test_declared_dtypes_are_on_disk(written):
         assert trials["cuePos_left_index"].dtype.kind == "u"
         assert trials["start_time"].dtype == np.float64
         assert f["intervals/epochs/rewardMiL"].dtype == np.float64
+
+
+def test_state_ports_are_bool_readings_per_lick_on_disk(written):
+    with h5py.File(written[1], "r") as file:
+        trials = file["intervals/trials"]
+        assert trials["state_ports"].dtype == np.bool_ and trials["state_ports"].shape == (4, 2, 5)
+        assert trials["state_ports_index"][()].tolist() == trials["licks_iteration_index"][()].tolist() == [2, 4]
 
 
 def test_round_trip_is_exact(written):
