@@ -120,7 +120,7 @@ def _saved_iterations(log):
 
 SOURCE_MEANING = {
     STACK_SOURCE: "The pages ScanImage wrote, pixel for pixel.",
-    SPLIT_SOURCE: "Copies the lab's ScanInfo splitter made from the original stack. Pixels were converted to uint16, which clipped negative values at 0, so they can't be compared with the original's dark offset. Frame times were rounded to 0.1 ms. The original stack, if it exists, is the better source.",
+    SPLIT_SOURCE: "Copies the lab's ScanInfo splitter made from the original stack. Pixels were converted to uint16, which clipped negative values at 0, so they can't be compared with the original's dark offset. Frame times were rounded to 0.1 ms, and the splitter's replace also rounded any I2C packet stamped with exactly its frame's time. The original stack, if it exists, is the better source.",
 }
 TIME_OFFSET = {
     STACK_SOURCE: "Seconds from the frame's start to this field's first row, from its row position and the line period. Its series timestamps include this.",
@@ -307,6 +307,7 @@ def alignment_rows(prepared):
         ("acquisition.source", acquisition.source, SOURCE_MEANING[acquisition.source]),
         ("acquisition.completeness", acquisition.completeness, "Whether these TIFFs are the whole acquisition, as far as they can show."),
         *rois,
+        *([("acquisition.split_packet_changes", str(acquisition.split_packet_changes), "I2C packets whose time the splitter changed, because they shared their frame's time. The lowest ROI's rounded value is the one stored and fit.")] if acquisition.source == SPLIT_SOURCE else []),
         ("acquisition.id", acquisition_id(acquisition), "Fingerprint of this acquisition: ScanImage's epoch, the TIFF names, the frame count, and the first and last frame times. Every NWB file made from this acquisition, raw TIFF or processed, carries the same value, along with the same subject_id and session_id."),
         ("fit.method", METHOD, "How frames were put on the behavior clock. No wall clock is involved."),
         ("fit.slope", repr(fit.slope), "ScanImage seconds per ViRMEn elapsed second."),

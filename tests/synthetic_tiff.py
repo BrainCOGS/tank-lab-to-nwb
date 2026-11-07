@@ -106,7 +106,7 @@ def mroi_artist(rois):
         built.append({
             "name": roi.get("name", f"area{number}"),
             "zs": roi.get("z", 10),
-            "scanfields": {"pixelResolutionXY": [roi.get("cols", 4), roi["rows"]], "sizeXY": [8.0, 8.0], "centerXY": roi.get("center", [float(number), 0.0])},
+            "scanfields": roi.get("scanfields") or {"pixelResolutionXY": [roi.get("cols", 4), roi["rows"]], "sizeXY": [8.0, 8.0], "centerXY": roi.get("center", [float(number), 0.0]), "rotationDegrees": roi.get("rotation", 0)},
         })
     return json.dumps({"RoiGroups": {"imagingRoiGroup": {"rois": built}}})
 
@@ -137,9 +137,13 @@ def _matlab_number(value):
     return f"{value:.4f}".rstrip("0").rstrip(".")
 
 
-def split_stack(paths, folder, rois, zs=(10,), lag=0.001, keep_tags=False, software_text=None, artist_text=None):
+def split_stack(paths, folder, rois, zs=(10,), lag=0.001, keep_tags=False, software_text=None, artist_text=None, file_local_depth=False):
     """What the lab's ScanInfo splitter does to a stack: one folder per ROI and depth, negatives clipped into uint16,
-    each ROI's frame time moved by a fixed lag and rounded, and in older runs no Software or Artist tags."""
+    each ROI's frame time moved by a fixed lag and rounded, and in older runs no Software or Artist tags.
+
+    Like the MATLAB, it replaces the old time everywhere in the header, so an I2C packet stamped with exactly the frame's
+    time changes too. `file_local_depth` restarts the depth cycle in each file, as the MATLAB's zIdx does.
+    """
     written = []
     for depth, z in enumerate(zs, start=1):
         row, lag_steps = 0, 0
@@ -151,11 +155,17 @@ def split_stack(paths, folder, rois, zs=(10,), lag=0.001, keep_tags=False, softw
                 stem, file_number = path.stem.rsplit("_", 1)
                 out = where / f"{stem}_ROI{number:02d}_z{depth}_{file_number}.tif"
                 with tifffile.TiffFile(path) as source, tifffile.TiffWriter(out, bigtiff=False) as writer:
-                    pages = [page for page in source.pages if (int(page.description.split("\n")[0].split(" = ")[1]) - 1) % len(zs) == depth - 1]
+                    if file_local_depth:
+                        pages = [page for position, page in enumerate(source.pages) if position % len(zs) == depth - 1]
+                    else:
+                        pages = [page for page in source.pages if (int(page.description.split("\n")[0].split(" = ")[1]) - 1) % len(zs) == depth - 1]
                     for position, page in enumerate(pages):
                         text = page.description
-                        old = float(text.split("frameTimestamps_sec = ")[1].split("\n")[0])
-                        text = text.replace(f"frameTimestamps_sec = {old:.9f}", f"frameTimestamps_sec = {_matlab_number(old + lag * lag_steps)}")
+                        old = text.split("frameTimestamps_sec = ")[1].split("\n")[0]
+                        new = _matlab_number(float(old) + lag * lag_steps)
+                        head, packets = text.split("I2CData = ")
+                        # A whole number would also hit fields like nextFileMarker = -1.000000000, which real times don't.
+                        text = head.replace(f"frameTimestamps_sec = {old}", f"frameTimestamps_sec = {new}") + "I2CData = " + packets.replace(old, new)
                         pixels = np.clip(page.asarray()[row : row + roi["rows"]], 0, None).astype("uint16")
                         options = {}
                         if keep_tags and position == 0:

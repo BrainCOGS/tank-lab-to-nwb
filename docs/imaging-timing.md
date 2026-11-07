@@ -75,6 +75,10 @@ start and stop times.
 More than one saved channel, averaged frames, saved or discarded flyback frames, missing frames or files, and several acquisitions
 in one file. Each stops with an error, because guessing would misplace frames.
 
+Nothing in the TIFFs marks the end of an acquisition: `endOfAcquisition` reads 0 on every frame, including the last. So
+`acquisition.completeness` says `complete` only when every requested volume is there. A short last file gets `no gap found`, which fits a
+recording stopped early but would also fit one cut off on a page boundary. More frames than `numVolumes` asked for stops the conversion.
+
 Files missing from the end of an acquisition can't be seen from their numbering, so two more checks catch them. Any file of the
 acquisition beside the given ones but not listed stops the conversion. So does a last file holding a full `logFramesPerFile` pages
 when fewer than `numVolumes` volumes are present, because later files may exist. ScanImage's `endOfAcquisition` reads 0 on the last
@@ -100,8 +104,18 @@ Use the original stack when it exists. On the one real session checked, the spli
 ROIs 22 and 45 ms into the frame.
 
 Split files are checked against each other: every ROI at a depth must hold the same frames, the same I2C data, and the same clock apart
-from a fixed lag. Each depth's lowest ROI speaks for the frame and packet tables. The alignment is the same either way, because the I2C
-packet times keep their full precision in both.
+from a fixed lag, and each frame must belong to its folder's depth. Each depth's lowest ROI speaks for the frame and packet tables.
+
+I2C packet times keep their full precision in split files, with one exception. The splitter replaces the frame's old time anywhere in the
+header, so a packet stamped with exactly that time takes each ROI's new frame time. The real session has one, of 192,501. It's recognized by
+having the same block, trial and iteration, with a time equal to its own file's frame time, and counted in
+`acquisition.split_packet_changes`. Any other difference between ROIs stops the conversion.
+
+Both forms of that session give the same line to within 0.0002 ppm: +3.8601 ppm, 192,501 packets, 0 unmatched, 0.60 ms of scatter.
+
+`origin_coords` is the outer corner of a field's first pixel, `(center - size / 2) x objectiveResolution`, which equals the translation in the
+header's `affine`. The header's `pixelToRefTransform` is half a pixel away, because it refers to pixel centers. These are ScanImage reference
+coordinates, not measured brain positions. A rotated scanfield, or one whose size or place changes with depth, stops with an error.
 
 ROIs on different planes follow the header's `zs`, and each plane's rows are placed from the top with even gaps, as the splitter does.
 A layout that doesn't divide evenly, a ROI on no plane, a plane with no ROI, a ROI of a different width, or several ROIs with `mroiEnable`
