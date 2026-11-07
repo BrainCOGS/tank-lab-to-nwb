@@ -94,10 +94,24 @@ The initial plane-0/frame-0 reconstruction had RMSE **607.127904** intensity uni
 page with the same offsets gave **662.818332**. Suite2p's own transform on CPU independently gave **607.127844** for
 the correct raw page, while the independent reconstruction differed from that CPU result by only **0.015729** RMSE.
 
-The saved log starts with `FOUND BINARIES AND DBS` and then runs registration on every plane. This proves that it
-registered existing binaries without re-reading the TIFFs in that invocation. It does **not** by itself establish the
-pixels those binaries contained before that invocation or count previous registrations. Re-registration of already
-registered pixels is a plausible explanation, not a demonstrated two-pass history. The saved offsets do not reconstruct
-the raw page tested. Its fluorescence traces may still describe its registered movie, but their biological validity
-and full timing identity were not established by this failed check. A clean TIFF-based rerun was selected rather than
-assigning raw-page timestamps to those results without evidence.
+The saved log starts with `FOUND BINARIES AND DBS` and then runs registration on every plane. Further measurement
+found a mixed history in plane 0. At 98 of 135 samples (first, middle and last frame of each of the 45 files), applying
+the old saved transform to the fresh registered frame reproduces the old movie with RMSE **0.00920–0.01976**. At the
+remaining 37 samples, the old transform applied directly to raw reproduces it with RMSE **0.01693–0.02615**. None of
+these samples is unexplained by those alternatives. The transition is between adjacent frames **12,999 and 13,000**:
+
+| Plane-0 frame | Old transform applied to raw: RMSE | Fresh registration, then old transform: RMSE |
+|---|---:|---:|
+| 12,999 | 713.97584 | 0.01768 |
+| 13,000 | 0.01993 | 709.42511 |
+
+These are intensity RMSEs, not time errors. The sampled early pixels exhibit two registration transforms; the later
+ones exhibit one. An interrupted in-place first registration through the 13,000-frame boundary (26 batches of 500),
+followed by registration of the partially modified binary, explains the pattern. That execution history is an
+inference: the earlier process log is unavailable, and every old frame was not checked. At frame 0 of old planes 1–4,
+the direct raw reconstruction has RMSE **0.01052–0.02447**; those first frames do not show the plane-0 problem.
+
+The old fluorescence files remain untouched and were not declared corrupt. Sampled frame identity is supported by
+the one- or two-stage reconstructions, but mixed resampling changes plane 0's processing history. Its ROI and trace
+biological validity were not assessed. The saved offsets alone do not describe its early raw-to-registered mapping.
+A clean TIFF-based rerun was selected to establish one consistent registration history for this conversion.
