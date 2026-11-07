@@ -133,6 +133,9 @@ Combined adds the derived `iplane`. The report inventories all native dictionary
 **71 nonmovie artifacts** are byte-exact in NWB scratch. The only omitted artifacts are the five registered `data.bin`
 movies (27,496,857,600 bytes total), which remain external. Every nonmovie Suite2p field is retained in the archive.
 
+All 675 samples also passed the trace link: `F` at frame `i` matches what's recomputed from registered frame `i` with RMSE
+**0.0000256–0.0000674**, and all **1,340** neighboring controls are **108.19–199.18**. These are intensity RMSEs, not time errors.
+
 The clock fit used **73,413 packets**, excluded **180 first-iteration packets**, and rejected **382** additional packets
 (0.5216% of eligible packets). Slope is **0.9999948645516386** (−5.13545 ppm), intercept **11.027272188700522 s**,
 and shifted clock offset **11.02732920000016 s**. Kept residual standard deviation is **1.051158 ms**;
@@ -141,25 +144,24 @@ all-packet residual p1/p99 are **−1.785986 / +3.499372 ms**. These are packet 
 The first plane times are **0.000000381, 0.019918908, 0.039837436, 0.059755968, 0.079674495 s**; each response series
 round-trips exactly against its own fitted TIFF times. No behavior-level activity sanity check was used as timing proof.
 
-The file has **1,949,889,971 bytes**. Its organized copy is byte-identical to the independently source-verified staging
-file; both have SHA256 `c50c8205cf88d1742706658727e4ed0e3a1b0554d1929283c54c074c8b1008e7`.
-It was organized with a separate local stub dandiset and the `ses-` filename fix before these serial checks:
+The file has **1,949,976,431 bytes**, SHA256 `0ee1ab3bea6db23c3fbd3621f2a1cb446658beda1d0b354e11033bdf5de7215f`. The raw file it goes
+with has **18,266,980,032 bytes**, SHA256 `d923c30b6a7e99f82226bfa47557bb7f9e052a9892bdbc485bf9550336ecf369`, the value recorded in
+`companion_files`. Both are organized into one local stub dandiset, as `desc-rawtiff` and `desc-suite2p`, and these serial checks ran
+there:
 
-- `pynwb.validate`: **[]**, no errors.
-- NWB Inspector **0.7.2**, via uvx on Python 3.13 with `--config dandi`: exit **0**, **6 BEST_PRACTICE_SUGGESTION** findings;
-  no errors, critical findings or best-practice violations. Suggestions are missing keywords, the reused `scanimage`
-  and `in_progress_trial` module names, a single-row epochs table, and the all-NaN `easyBlock` and `trialID` columns.
-  The reused behavior/provenance tables and their NaNs were retained faithfully.
-- DANDI **0.82.0** `validate`: exit **0**, **No errors found.** It also logged a nonfatal HTTP 500 during the Inspector
-  version lookup; the explicit Inspector run above used the recorded pinned version.
-- Final full suite: **363 passed, 9 skipped**; baseline was **338 passed, 9 skipped**. UserWarnings are errors in tests.
+- `pynwb.validate`: **[]** on both files.
+- NWB Inspector **0.7.2**, via uvx on Python 3.13 with `--config dandi`: exit **0** on both, with **6** best-practice suggestions on the
+  raw file and **7** on this one, and no errors, critical findings or best-practice violations. The suggestions are missing keywords,
+  the `scanimage` and `in_progress_trial` module names, the all-NaN `easyBlock` and `trialID` columns, and single-row tables: epochs
+  on both, and `companion_files` here.
+- DANDI **0.82.0** `validate` on the dandiset: exit **0**, **No errors found.**
+- Full suite at this conversion's code: **478 passed, 9 skipped**. UserWarnings are errors in tests.
 
-The Inspector uvx environment pinned `pynwb==4.2.0`, `hdmf==6.2.0`, `h5py==3.13.0`, and `numpy==2.5.4`, with the local
-schema extension 0.4.1. This avoids an unrelated source-build attempt for a newer h5py. No upstream package was changed.
+The Inspector uvx environment pinned `h5py==3.13.0`, because the newest h5py has no wheel for this platform. No upstream package was changed.
 
 `registration.do_bidiphase=False` stays as configured on this bidirectionally scanned acquisition, by decision. Indicator, location `root`, and NaN wavelengths retain the raw converter's placeholders. The pending behavior
 field decisions were not changed. Biological validity of the ROI detection and deconvolution was not assessed.
-No data was uploaded and no PR was opened or branch pushed.
+No data was uploaded.
 
 
 ### Why the pre-existing run was not reused
