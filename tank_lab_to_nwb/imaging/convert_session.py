@@ -2,16 +2,15 @@
 
 Usage: python -m tank_lab_to_nwb.imaging.convert_session <log.mat> <output folder> <tiff> [<tiff> ...] [--stub FRAMES]
 
-The NWB file goes to <output>/staging with an alignment report beside it. With --stub, each plane keeps only that many
-frames, and the file is named *_stub.nwb. Run organize_for_dandi, then `dandi validate`, on the staging folder afterwards.
+The NWB file goes in <output> with a report beside it. With --stub, each plane keeps only that many
+frames, and the file is named *_stub.nwb. Run organize_for_dandi with description="rawtiff", then `dandi validate`, afterwards.
 """
 
 import argparse
-import json
 import shutil
 from pathlib import Path
 
-from .convert import alignment_summary, convert_session
+from .convert import convert_session
 
 
 def convert(log, output, tiffs, stub=None):
@@ -23,11 +22,7 @@ def convert(log, output, tiffs, stub=None):
     if stub is None and free < source_bytes:
         raise OSError(f"{output}: {free / 1e9:.1f} GB free, and these TIFFs hold {source_bytes / 1e9:.1f} GB")
     path = output / f"{log.stem}{'_stub' if stub else ''}.nwb"
-    prepared = convert_session(log, tiffs, path, max_frames_per_plane=stub)
-    report = dict(alignment=alignment_summary(prepared), coverage=prepared.session.coverage.as_dict())
-    report["coverage"]["dropped"].pop("log.currentTrial", None)
-    report["coverage"]["dropped"].pop("log.currentIt", None)
-    path.with_suffix(".report.json").write_text(json.dumps(report, indent=1))
+    convert_session(log, tiffs, path, max_frames_per_plane=stub)
     return path
 
 

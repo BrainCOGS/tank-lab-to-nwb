@@ -74,3 +74,16 @@ start and stop times.
 
 More than one saved channel, averaged frames, saved or discarded flyback frames, several ROIs in one page, missing frames or files,
 and several acquisitions in one file. Each stops with an error, because guessing would misplace frames.
+
+Files missing from the end of an acquisition can't be seen from their numbering, so two more checks catch them. Any file of the
+acquisition beside the given ones but not listed stops the conversion. So does a last file holding a full `logFramesPerFile` pages
+when fewer than `numVolumes` volumes are present, because later files may exist. ScanImage's `endOfAcquisition` reads 0 on the last
+frame of the data seen so far, so it can't settle this. An acquisition that really does end exactly on a file boundary without
+reaching `numVolumes` is refused too, and would need a person to check it.
+
+## Files for one session
+
+A session's raw and processed files are separate NWB files in one dandiset, told apart by name:
+`sub-<subject>_ses-<session>_desc-rawtiff_behavior+ophys.nwb` and `..._desc-suite2p_behavior+ophys.nwb`. Pass `description` to
+`organize_for_dandi` to name them. They share a `subject_id`, a `session_id`, and `acquisition.id` in
+`processing/scanimage/alignment`, a fingerprint of the acquisition itself.

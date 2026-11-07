@@ -24,9 +24,11 @@ def software(**overrides):
         "SI.hRoiManager.scanFrameRate": "50",
         "SI.hRoiManager.scanVolumeRate": "25",
         "SI.hScan2D.logAverageFactor": "1",
+        "SI.hScan2D.logFramesPerFile": "Inf",
         "SI.hStackManager.actualNumSlices": "2",
         "SI.hStackManager.framesPerSlice": "1",
         "SI.hStackManager.numFramesPerVolumeWithFlyback": "2",
+        "SI.hStackManager.numVolumes": "50000",
         "SI.hStackManager.zs": "[10 50]",
     }
     values.update(overrides)

@@ -62,6 +62,8 @@ class Layout:
     field_of_view_um: tuple
     pixel_size_um: tuple
     version: str
+    frames_per_file: float  # logFramesPerFile, inf when the acquisition isn't split
+    n_volumes: float  # the volumes requested, which a stopped acquisition falls short of
 
 
 @dataclass(frozen=True)
@@ -84,7 +86,7 @@ class Acquisition:
         return (self.frames["frame_number"] - 1) % self.layout.n_planes
 
 
-def _header_values(software, where):
+def _header_values(software):
     values = {}
     for line in software.splitlines():
         key, separator, value = line.partition(" = ")
@@ -117,7 +119,7 @@ def _rois(artist, where):
 
 def _layout(software, artist, where):
     """Read the layout, refusing anything other than whole frames of one channel, one per plane, with one ROI."""
-    values = _header_values(software, where)
+    values = _header_values(software)
     channels = _required(values, "hChannels.channelSave", where)
     if channels != "1":
         raise ScanImageError(f"{where}: channelSave is {channels}; only one saved channel, channel 1, is supported")
@@ -155,6 +157,8 @@ def _layout(software, artist, where):
         field_of_view_um=(size_x, size_y),
         pixel_size_um=(size_x / columns, size_y / rows),
         version=_required(values, "VERSION_MAJOR", where),
+        frames_per_file=_number(values, "hScan2D.logFramesPerFile", where),
+        n_volumes=_number(values, "hStackManager.numVolumes", where),
     )
 
 
@@ -237,7 +241,26 @@ def _sorted_files(paths):
     stems = {stem for _, stem, _ in numbered}
     if len(stems) != 1:
         raise ScanImageError(f"these files belong to different acquisitions: {sorted(stems)}")
+    stem = stems.pop()
+    given = {path.resolve() for _, _, path in numbered}
+    for folder in {path.parent for _, _, path in numbered}:
+        for neighbor in sorted(folder.iterdir()):
+            match = _FILE_NAME.match(neighbor.name)
+            if match and match["stem"] == stem and neighbor.resolve() not in given:
+                raise ScanImageError(f"{neighbor.name} is part of this acquisition but wasn't given, so it would be left out")
     return [path for _, _, path in numbered]
+
+
+def _check_complete(files, layout):
+    """A full last file may have had more after it, unless every requested volume is already here.
+
+    ScanImage's end-of-acquisition field reads 0 on the frames of the data seen so far, so it can't settle this.
+    """
+    if files[-1].n_frames < layout.frames_per_file:
+        return
+    if sum(file.n_frames for file in files) == layout.n_volumes * layout.n_planes:
+        return
+    raise ScanImageError(f"{files[-1].name} is full, with {files[-1].n_frames} frames, and fewer volumes than requested are here, so later files may be missing")
 
 
 def read_acquisition(paths):
@@ -270,6 +293,7 @@ def read_acquisition(paths):
         packet_rows.extend((frame + offset, *rest) for frame, *rest in packets)
         frame_rows.extend(rows)
         files.append(SourceFile(path=path, n_frames=len(rows), software=software, artist=artist))
+    _check_complete(files, layout)
     frames = {name: np.array([row[name] for row in frame_rows], dtype="float64" if name in _FLOAT_FIELDS.values() else "int64") for name in (
         "file_index", "page_index", "data_offset", *_INTEGER_FIELDS.values(), *_FLOAT_FIELDS.values())}
     packet_columns = list(zip(*packet_rows)) or [(), (), (), (), ()]

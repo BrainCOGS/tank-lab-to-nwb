@@ -15,7 +15,7 @@ def test_frames_are_numbered_across_files_in_order(tmp_path):
     assert acquisition.frames["frame_number"].tolist() == list(range(1, 11))
     assert acquisition.frames["file_index"].tolist() == [0] * 4 + [1] * 4 + [2] * 2
     assert acquisition.frames["page_index"].tolist() == [0, 1, 2, 3] * 2 + [0, 1]
-    assert acquisition.frames["timestamp"][3] == pytest.approx(0.06)
+    assert acquisition.frames["timestamp"][3] == 0.06
     assert acquisition.epoch == "[2026  7 15 11 59 50.000]"
 
 
@@ -34,7 +34,7 @@ def test_i2c_packets_decode_to_block_trial_iteration(tmp_path):
     assert found["block"].tolist() == [1, 1, 2]
     assert found["trial"].tolist() == [1, 1, 300]
     assert found["iteration"].tolist() == [595, 597, 65535]
-    assert found["timestamp"].tolist() == pytest.approx([0.03, 0.05, 0.055])
+    assert found["timestamp"].tolist() == [0.03, 0.05, 0.055]
 
 
 def test_no_packets_gives_empty_columns(tmp_path):
@@ -111,7 +111,8 @@ def test_a_file_without_scanimage_metadata_is_an_error(tmp_path):
 def test_two_epochs_are_an_error(tmp_path):
     first = write_acquisition(tmp_path, 2, frames_per_file=2, stem="a_00001")
     (tmp_path / "b").mkdir()
-    write_acquisition(tmp_path / "b", 4, frames_per_file=2, stem="a_00001", epoch="[2026  7 15 11 59 51.000]")
+    second = write_acquisition(tmp_path / "b", 4, frames_per_file=2, stem="a_00001", epoch="[2026  7 15 11 59 51.000]")
+    second[0].unlink()
     with pytest.raises(ScanImageError, match="epoch"):
         read_acquisition([first[0], tmp_path / "b" / "a_00001_00002.tif"])
 
@@ -194,3 +195,57 @@ def test_read_frames_of_nothing_keeps_the_frame_shape(tmp_path):
 def test_no_files_is_an_error():
     with pytest.raises(ScanImageError, match="no TIFF"):
         read_acquisition([])
+
+
+def _split_software(frames_per_file=4, **overrides):
+    return software(**{"SI.hScan2D.logFramesPerFile": str(frames_per_file), **overrides})
+
+
+def test_a_later_file_left_off_the_list_is_an_error(tmp_path):
+    paths = write_acquisition(tmp_path, 10, frames_per_file=4)
+    with pytest.raises(ScanImageError, match=paths[2].name):
+        read_acquisition(paths[:2])
+
+
+def test_a_later_file_missing_from_disk_is_an_error_when_the_last_file_is_full(tmp_path):
+    paths = write_acquisition(tmp_path, 10, frames_per_file=4, software_text=_split_software())
+    paths[2].unlink()
+    with pytest.raises(ScanImageError, match="full"):
+        read_acquisition(paths[:2])
+
+
+def test_a_short_last_file_ends_the_acquisition(tmp_path):
+    paths = write_acquisition(tmp_path, 10, frames_per_file=4, software_text=_split_software())
+    assert read_acquisition(paths).frames["frame_number"].size == 10
+
+
+def test_a_full_last_file_is_fine_when_every_requested_volume_was_saved(tmp_path):
+    text = _split_software(**{"SI.hStackManager.numVolumes": "6"})
+    paths = write_acquisition(tmp_path, 12, frames_per_file=4, software_text=text)
+    assert read_acquisition(paths).frames["frame_number"].size == 12
+
+
+def test_a_full_last_file_short_of_the_requested_volumes_is_an_error(tmp_path):
+    text = _split_software(**{"SI.hStackManager.numVolumes": "7"})
+    paths = write_acquisition(tmp_path, 12, frames_per_file=4, software_text=text)
+    with pytest.raises(ScanImageError, match="full"):
+        read_acquisition(paths)
+
+
+def test_an_unsplit_acquisition_has_no_full_last_file(tmp_path):
+    paths = write_acquisition(tmp_path, 4, frames_per_file=4)  # logFramesPerFile is Inf
+    assert len(read_acquisition(paths).files) == 1
+
+
+def test_other_files_beside_an_acquisition_are_ignored(tmp_path):
+    paths = write_acquisition(tmp_path, 3, frames_per_file=4)
+    write_acquisition(tmp_path, 3, frames_per_file=4, stem="other_00001")
+    (tmp_path / "mouse_00001_notes.tif").write_bytes(b"")
+    assert len(read_acquisition(paths).files) == 1
+
+
+@pytest.mark.parametrize("name", ["SI.hScan2D.logFramesPerFile", "SI.hStackManager.numVolumes"])
+def test_a_header_without_what_completeness_needs_is_an_error(tmp_path, name):
+    paths = write_acquisition(tmp_path, 3, software_text=software(**{name: None}))
+    with pytest.raises(ScanImageError, match=name.removeprefix("SI.")):
+        read_acquisition(paths)

@@ -12,12 +12,14 @@ from pynwb import NWBHDF5IO, TimeSeries
 from pynwb.device import Device
 from pynwb.ophys import OpticalChannel, TwoPhotonSeries
 
+from ..virmen.coerce import coerce
 from ..virmen.convert import PLACEHOLDER_METADATA, build_nwbfile
 from ..virmen.loader import load_log, records
 from ..virmen.session import NormalizedSession, normalize_log
 from .alignment import (
     AlignmentError,
     ClockFit,
+    alignment_rows,
     fit_clock,
     frame_labels,
     in_progress_series,
@@ -34,15 +36,6 @@ COMPRESSION = dict(compression="gzip", compression_opts=4, shuffle=True)
 _CHUNK_BYTES = 10_000_000
 _BUFFER_BYTES = 1_000_000_000
 
-METHOD = (
-    "A straight line from each packet's logged iteration time on ViRMEn's elapsed clock to its arrival on the ScanImage clock. Each trial's "
-    "first iteration is excluded. Start with ordinary least squares. Then reject packets further from the median residual than max(5 x MAD, "
-    "5 ms), with MAD scaled by 1.4826 and taken over the kept packets, refit by least squares on the rest, and repeat until the kept set stops changing."
-)
-SEND_LATENCY = (
-    "A constant, not corrected: the fit can't see the delay between the logged iteration time and the packet's arrival, so frame times run early by "
-    "that delay. It wasn't measured, and the ViRMEn source sets no upper bound, because packets go out from a separate thread after the iteration's work."
-)
 PLACEHOLDER_IMAGING = dict(
     indicator="PLACEHOLDER: indicator not recorded here.",
     location="root",  # Allen's term for the whole brain, the most this file can honestly claim
@@ -129,7 +122,7 @@ class _PlanePixels(GenericDataChunkIterator):
 
 
 def _compressed(data):
-    return H5DataIO(data=data, compression="gzip", compression_opts=4, shuffle=True) if np.size(data) else data
+    return H5DataIO(data=data, **COMPRESSION) if np.size(data) else data
 
 
 def _table(name, description, columns):
@@ -137,73 +130,49 @@ def _table(name, description, columns):
     return DynamicTable(name=name, description=description, columns=built, id=np.arange(len(columns[0][2])))
 
 
-def _small(data, dtype="int32"):
-    return np.asarray(data).astype(dtype)
+def _int32(data, field):
+    """A header column as int32, exactly, or a LossyConversionError naming the column."""
+    return coerce(data, "int32", file="ScanImage headers", field=field)
 
 
-def _alignment_rows(prepared):
-    fit, acquisition = prepared.fit, prepared.acquisition
-    rows = [
-        ("fit.method", METHOD, "How frames were put on the behavior clock. No wall clock is involved."),
-        ("fit.slope", repr(fit.slope), "ScanImage seconds per ViRMEn elapsed second."),
-        ("fit.intercept", repr(fit.intercept), "ScanImage clock reading when ViRMEn's elapsed clock read zero, in seconds."),
-        ("fit.clock_offset", repr(prepared.clock_offset), "Seconds added to elapsed time to get this file's time. Frame time = (frameTimestamps_sec - intercept) / slope + clock_offset."),
-        ("fit.n_packets", str(fit.n_packets), "Packets matched to logged iterations."),
-        ("fit.n_first_iteration", str(fit.n_first_iteration), "Packets from a trial's first iteration, which aren't fit because they're always sent late."),
-        ("fit.n_rejected", str(fit.n_rejected), "Packets rejected from the fit as off the line."),
-        ("fit.residual_min_ms", repr(fit.residual_ms["min"]), "Lowest packet residual, over all packets."),
-        ("fit.residual_p1_ms", repr(fit.residual_ms["p1"]), "1st percentile of packet residuals, over all packets."),
-        ("fit.residual_p50_ms", repr(fit.residual_ms["p50"]), "Median packet residual, over all packets."),
-        ("fit.residual_p99_ms", repr(fit.residual_ms["p99"]), "99th percentile of packet residuals, over all packets."),
-        ("fit.residual_max_ms", repr(fit.residual_ms["max"]), "Highest packet residual, over all packets. Packets are sent late, not early, so this says how late, not how wrong the frame times are."),
-        ("fit.kept_std_ms", repr(fit.kept_std_ms), "Standard deviation of the residuals of the fit packets. Residuals show how far packets sit from the line, not frame-time error."),
-        ("fit.within_5ms_fraction", repr(fit.within_5ms_fraction), "Fraction of all packets within 5 ms of the line."),
-        ("fit.send_latency", "not measured", SEND_LATENCY),
-        ("fit.frame_time_meaning", "start of frame", "Each timestamp marks the start of a frame; later lines in it were scanned up to one frame period later. The animal saw each iteration after a display delay that isn't measured."),
-        ("scanimage.epoch", acquisition.epoch, "ScanImage's wall clock at its clock's zero, on its own computer. Not used for alignment."),
-        ("scanimage.aux_triggers", "empty", "auxTrigger0-3 were empty in every frame, so they aren't stored per frame."),
-    ]
-    return rows
-
-
-def _add_scanimage_tables(nwbfile, prepared, session_time_kept=None):
+def _add_scanimage_tables(nwbfile, prepared):
     acquisition, frames, packets = prepared.acquisition, prepared.acquisition.frames, prepared.acquisition.packets
     module = nwbfile.create_processing_module("scanimage", "ScanImage's per-frame headers and the I2C packets that align frames to behavior.")
     module.add(_table("frames", "One row per TIFF page, in acquisition order.", [
-        ("file_index", "Row of the files table this page is in.", _small(frames["file_index"])),
-        ("page_index", "0-based page within its file.", _small(frames["page_index"])),
-        ("frame_number", "frameNumbers.", _small(frames["frame_number"])),
-        ("acquisition_number", "acquisitionNumbers.", _small(frames["acquisition_number"])),
-        ("frame_number_acquisition", "frameNumberAcquisition.", _small(frames["frame_number_acquisition"])),
-        ("plane", "0-based plane, which names the TwoPhotonSeries that holds this page.", _small(acquisition.planes)),
+        ("file_index", "Row of the files table this page is in.", _int32(frames["file_index"], "file_index")),
+        ("page_index", "0-based page within its file.", _int32(frames["page_index"], "page_index")),
+        ("frame_number", "frameNumbers.", _int32(frames["frame_number"], "frame_number")),
+        ("acquisition_number", "acquisitionNumbers.", _int32(frames["acquisition_number"], "acquisition_number")),
+        ("frame_number_acquisition", "frameNumberAcquisition.", _int32(frames["frame_number_acquisition"], "frame_number_acquisition")),
+        ("plane", "0-based plane, which names the TwoPhotonSeries that holds this page.", _int32(acquisition.planes, "plane")),
         ("timestamp", "frameTimestamps_sec, seconds on the ScanImage clock.", frames["timestamp"]),
         ("session_time", "This frame's time in the file, in seconds since session_start_time.", prepared.frame_times),
         ("acq_trigger_timestamp", "acqTriggerTimestamps_sec.", frames["acq_trigger_timestamp"]),
         ("next_file_marker_timestamp", "nextFileMarkerTimestamps_sec.", frames["next_file_marker_timestamp"]),
-        ("end_of_acquisition", "endOfAcquisition.", _small(frames["end_of_acquisition"])),
-        ("end_of_acquisition_mode", "endOfAcquisitionMode.", _small(frames["end_of_acquisition_mode"])),
-        ("dc_over_voltage", "dcOverVoltage.", _small(frames["dc_over_voltage"])),
-        ("behavior_block", "Behavior block as the pipeline's SyncImagingBehavior labels this frame, 0 for none. These labels mark which header got a packet: at a trial's onset, the first labelled frame can have started just before the trial began, or can run up to a frame late. Use the timestamps to find a trial's frames.", _small(prepared.labels["block"])),
-        ("behavior_trial", "Behavior trial as the pipeline labels this frame. 0 for none, which includes the frames of the trial running when the log was saved, because the pipeline clears that trial. Its packets are in the i2c_packets table.", _small(prepared.labels["trial"])),
-        ("behavior_iteration", "Per-trial iteration as the pipeline labels this frame, 0 for none.", _small(prepared.labels["iteration"])),
+        ("end_of_acquisition", "endOfAcquisition.", _int32(frames["end_of_acquisition"], "end_of_acquisition")),
+        ("end_of_acquisition_mode", "endOfAcquisitionMode.", _int32(frames["end_of_acquisition_mode"], "end_of_acquisition_mode")),
+        ("dc_over_voltage", "dcOverVoltage.", _int32(frames["dc_over_voltage"], "dc_over_voltage")),
+        ("behavior_block", "Behavior block as the pipeline's SyncImagingBehavior labels this frame, 0 for none. These labels mark which header got a packet: at a trial's onset, the first labelled frame can have started just before the trial began, or can run up to a frame late. Use the timestamps to find a trial's frames.", _int32(prepared.labels["block"], "behavior_block")),
+        ("behavior_trial", "Behavior trial as the pipeline labels this frame. 0 for none, which includes the frames of the trial running when the log was saved, because the pipeline clears that trial. Its packets are in the i2c_packets table.", _int32(prepared.labels["trial"], "behavior_trial")),
+        ("behavior_iteration", "Per-trial iteration as the pipeline labels this frame, 0 for none.", _int32(prepared.labels["iteration"], "behavior_iteration")),
     ]))
     module.add(_table("i2c_packets", "Every I2C packet from ViRMEn, as stored in the frame headers.", [
-        ("frame_index", "0-based row of the frames table whose header holds this packet. It can be the frame after the one the packet's time falls in.", _small(packets["frame_index"])),
+        ("frame_index", "0-based row of the frames table whose header holds this packet. It can be the frame after the one the packet's time falls in.", _int32(packets["frame_index"], "frame_index")),
         ("timestamp", "Arrival time in seconds on the ScanImage clock.", packets["timestamp"]),
-        ("block", "1-based block.", _small(packets["block"])),
-        ("trial", "1-based trial within the block.", _small(packets["trial"])),
-        ("iteration", "1-based iteration within the trial.", _small(packets["iteration"])),
+        ("block", "1-based block.", _int32(packets["block"], "block")),
+        ("trial", "1-based trial within the block.", _int32(packets["trial"], "trial")),
+        ("iteration", "1-based iteration within the trial.", _int32(packets["iteration"], "iteration")),
         ("elapsed", "Logged time of that iteration on ViRMEn's elapsed clock, in seconds.", prepared.packet_elapsed),
         ("session_time", "The packet's arrival mapped to this file's time, in seconds since session_start_time.", prepared.packet_times),
         ("used_in_fit", "Whether this packet was used in the fit.", prepared.fit.used),
     ]))
     module.add(_table("files", "The source TIFFs and their full ScanImage metadata.", [
         ("file_name", "File name.", np.array([file.name for file in acquisition.files], dtype=object)),
-        ("n_frames", "Pages in this file.", _small([file.n_frames for file in acquisition.files])),
+        ("n_frames", "Pages in this file.", _int32([file.n_frames for file in acquisition.files], "n_frames")),
         ("software", "The first page's Software tag: all ScanImage settings.", np.array([file.software for file in acquisition.files], dtype=object)),
         ("artist", "The first page's Artist tag: the ROI groups, as JSON.", np.array([file.artist for file in acquisition.files], dtype=object)),
     ]))
-    rows = _alignment_rows(prepared)
+    rows = alignment_rows(prepared)
     module.add(_table("alignment", "How frames were aligned to behavior, and how far to trust it.", [
         ("key", "Name of the value.", np.array([row[0] for row in rows], dtype=object)),
         ("value", "The value, as text.", np.array([row[1] for row in rows], dtype=object)),
@@ -274,7 +243,7 @@ def build_imaging_nwbfile(prepared, metadata=None, imaging=None, max_frames_per_
 
 
 def convert_session(log, tiff_paths, nwbfile_path, file=None, metadata=None, imaging=None, max_frames_per_plane=None, verify=True):
-    """Convert one session and, unless told not to, check every value on disk against the sources. Returns what was prepared."""
+    """Convert one session, check it against the sources unless told not to, and write its report beside it. Returns what was prepared."""
     if max_frames_per_plane is not None and max_frames_per_plane < 1:
         raise ValueError(f"max_frames_per_plane must be at least 1, got {max_frames_per_plane}")
     prepared = prepare_session(log, tiff_paths, file=file)
@@ -282,9 +251,19 @@ def convert_session(log, tiff_paths, nwbfile_path, file=None, metadata=None, ima
         io.write(build_imaging_nwbfile(prepared, metadata, imaging, max_frames_per_plane))
     if verify:
         verify_imaging(prepared, nwbfile_path, tiff_paths, max_frames_per_plane=max_frames_per_plane)
+    Path(nwbfile_path).with_suffix(".report.json").write_text(json.dumps(conversion_report(prepared), indent=1))
     return prepared
 
 
 def alignment_summary(prepared):
     """The alignment as plain data, for a report beside the file."""
-    return {key: value for key, value, _ in _alignment_rows(prepared)} | dict(frames=int(prepared.frame_times.size), first_frame_time=float(prepared.frame_times[0]), last_frame_time=float(prepared.frame_times[-1]), shift_seconds=prepared.shift_microseconds / 1e6)
+    return {key: value for key, value, _ in alignment_rows(prepared)} | dict(frames=int(prepared.frame_times.size), first_frame_time=float(prepared.frame_times[0]), last_frame_time=float(prepared.frame_times[-1]), shift_seconds=prepared.shift_microseconds / 1e6)
+
+
+def conversion_report(prepared):
+    """The alignment and what happened to every log field. The trial in progress counts as dropped unless it was written."""
+    report = dict(alignment=alignment_summary(prepared), coverage=prepared.session.coverage.as_dict())
+    if prepared.in_progress:
+        report["coverage"]["dropped"].pop("log.currentTrial", None)
+        report["coverage"]["dropped"].pop("log.currentIt", None)
+    return report
