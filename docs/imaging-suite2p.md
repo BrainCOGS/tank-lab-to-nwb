@@ -48,7 +48,12 @@ boundaries; its RMSE is measured separately from the byte-exact NWB round trip.
 The same samples tie the traces to those frames. `F.npy` at frame `i` must equal what Suite2p's extraction gives on registered frame
 `i`: each ROI's normalized `lam` over its pixels, leaving out `overlap` pixels unless `allow_overlap` is set. The RMSE must be at
 most 0.01, and registered frames `i-1` and `i+1` must be more than ten times worse. A sampled frame where no ROI has a value isn't
-measured. `Fneu` and `spks` aren't recomputed; they're tied to `F` only by order and length.
+measured.
+
+`Fneu` and `spks` aren't recomputed during conversion, because that would need Suite2p's own neuropil masks and deconvolution. They were
+checked once on the measured run using Suite2p's code, on planes 0 and 4: `Fneu` at 12 random frames per plane matches what its
+`create_masks` gives on the registered frame, at RMSE below 0.000001, against 47.6 to 66.2 for neighboring frames. `spks` for about 40 ROIs per
+plane matches its `preprocess` and `oasis` on `F - 0.7 x Fneu`, at RMSE 0.000005 or less, against 22.1 and 43.6 when shifted a frame.
 
 For each sampled registered frame, neighboring raw pages **within that plane** (`i-1` and `i+1`) are transformed with
 the same target-frame offsets. Each available control must have more than ten times the reconstruction RMSE (with a
