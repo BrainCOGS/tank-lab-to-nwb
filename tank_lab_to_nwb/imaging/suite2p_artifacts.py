@@ -4,11 +4,11 @@ from pathlib import Path
 
 import numpy as np
 
-from .suite2p import _sources
+from .suite2p import _plane_folders, _relative, _roots, _sources, source_base
 
 
 def artifact_inventory(root):
-    """List every artifact and every dictionary field, without changing their values."""
+    """List every artifact and every dictionary field, without changing their values. `root` is one Suite2p folder or several."""
 
     def describe(value):
         if isinstance(value, dict):
@@ -17,6 +17,7 @@ def artifact_inventory(root):
             return dict(shape=list(value.shape), dtype=str(value.dtype))
         return type(value).__name__
 
+    base = source_base(root)
     result = {}
     for path in _sources(root):
         entry = dict(bytes=path.stat().st_size, storage="byte-exact NWB scratch archive")
@@ -35,13 +36,34 @@ def artifact_inventory(root):
             from scipy.io import whosmat
 
             entry["fields"] = {name: dict(shape=list(shape), matlab_class=kind) for name, shape, kind in whosmat(path)}
-        result[str(path.relative_to(root))] = entry
-    for path in sorted(Path(root).rglob("data.bin")):
-        result[str(path.relative_to(root))] = dict(
+        result[_relative(path, base)] = entry
+    for path in sorted(movie for folder in _roots(root) for movie in folder.rglob("data.bin")):
+        result[_relative(path, base)] = dict(
             bytes=path.stat().st_size,
             storage="excluded: registered movie stays external; sampled reconstruction evidence stored in NWB",
         )
     return result
+
+
+def _tile_offsets(dbs):
+    """(dy, dx) of each plane folder in combined, as Suite2p 1.1's compute_dydx places them: a near-square grid of planes,
+    or, when the dbs carry mesoscope dy/dx, those offsets, with planes tiled in a grid of the ROIs' extent."""
+    if any(db.get("dx") is None or db.get("dy") is None for db in dbs):
+        ncols = int(np.ceil(np.sqrt(dbs[0]["Ly"] * dbs[0]["Lx"] * len(dbs)) / dbs[0]["Lx"]))
+        return [((j // ncols) * dbs[0]["Ly"], (j % ncols) * dbs[0]["Lx"]) for j in range(len(dbs))]
+    dy = np.array([int(db["dy"]) for db in dbs])
+    dx = np.array([int(db["dx"]) for db in dbs])
+    nrois = np.unique(np.vstack((dy, dx)), axis=1).shape[1]
+    if nrois < len(dbs):
+        nplanes = len(dbs) // nrois
+        ymax = max(y + db["Ly"] for y, db in zip(dy, dbs))
+        xmax = max(x + db["Lx"] for x, db in zip(dx, dbs))
+        ncols = int(np.ceil(np.sqrt(ymax * xmax * nplanes) / xmax))
+        for j in range(nplanes):
+            for k in range(nrois):
+                dx[j * nrois + k] += (j % ncols) * xmax
+                dy[j * nrois + k] += (j // ncols) * ymax
+    return [(int(y), int(x)) for y, x in zip(dy, dx)]
 
 
 def verify_combined(root):
@@ -53,23 +75,21 @@ def verify_combined(root):
     combined = root / "combined"
     if not combined.exists():
         return {"present": False}
-    folders = sorted(root.glob("plane*"), key=lambda p: int(p.name[5:]))
+    folders = [folder for _, folder in sorted(_plane_folders(root).items())]
     dbs = []
     for folder in folders:
         db = np.load(folder / "db.npy", allow_pickle=True).item()
         for source in ("reg_outputs", "detect_outputs"):
             db = {**db, **np.load(folder / f"{source}.npy", allow_pickle=True).item()}
         dbs.append(db)
-    rows, cols = dbs[0]["Ly"], dbs[0]["Lx"]
-    ncols = int(np.ceil(np.sqrt(rows * cols * len(dbs)) / cols))
+    offsets = _tile_offsets(dbs)
+    canvas = (max(dy + db["Ly"] for (dy, _), db in zip(offsets, dbs)), max(dx + db["Lx"] for (_, dx), db in zip(offsets, dbs)))
     cursor = 0
     stat = np.load(combined / "stat.npy", allow_pickle=True)
     cells = np.load(combined / "iscell.npy")
     matrices = {key: np.load(combined / f"{key}.npy", mmap_mode="r") for key in ("F", "Fneu", "spks")}
     image_keys = ("meanImg", "meanImgE", "Vcorr", "max_proj")
-    tiled = {
-        key: np.zeros((int(np.ceil(len(dbs) / ncols)) * rows, ncols * cols)) for key in image_keys if key in dbs[0]
-    }
+    tiled = {key: np.zeros(canvas) for key in image_keys if key in dbs[0]}
 
     def same(a, b, label):
         if isinstance(a, dict) and isinstance(b, dict):
@@ -86,8 +106,8 @@ def verify_combined(root):
             if aa.shape != bb.shape or not np.array_equal(aa, bb, equal_nan=nan):
                 raise ValueError(label + " differs")
 
-    for plane, (folder, db) in enumerate(zip(folders, dbs)):
-        dy, dx = (plane // ncols) * rows, (plane % ncols) * cols
+    for plane, (folder, db, (dy, dx)) in enumerate(zip(folders, dbs, offsets)):
+        rows, cols = db["Ly"], db["Lx"]
         source_stat = np.load(folder / "stat.npy", allow_pickle=True)
         count = len(source_stat)
         same(cells[cursor : cursor + count], np.load(folder / "iscell.npy"), "combined iscell")

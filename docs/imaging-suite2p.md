@@ -5,8 +5,12 @@ with NumPy; Suite2p and torch are not converter dependencies. Object NPY files c
 trusted run. Nothing uploads.
 
 ```
-python -m tank_lab_to_nwb.imaging.convert_suite2p LOG.mat SUITE2P_DIR OUTPUT_DIR TIFF [TIFF ...] [--raw-nwb RAW.nwb]
+python -m tank_lab_to_nwb.imaging.convert_suite2p LOG.mat SUITE2P_DIR OUTPUT_DIR TIFF [TIFF ...] [--extra-suite2p DIR ...] [--raw-nwb RAW.nwb] [--allow-incomplete]
 ```
+
+`SUITE2P_DIR` is the folder holding `plane0`, `plane1`... A multi-ROI session processed the lab's way has one such folder per
+split ROI folder; give the others with `--extra-suite2p` (see [Multi-ROI sessions](#multi-roi-sessions)). A TIFF argument can be a
+folder, read as `convert_session` reads it.
 
 The output is `OUTPUT_DIR/staging/suite2p.nwb`, with a report beside it. Organize it using
 `virmen.layout.organize_for_dandi(staging, dandiset, description="suite2p")` before local DANDI validation. It can share a
@@ -15,7 +19,7 @@ dandiset with the raw file, named with `description="rawtiff"`: the two get the 
 The two files are tied together by what was recorded, not by a derived ID. Both carry the same `subject_id`, `session_id` and
 `session_start_time`, and the same ScanImage record in `processing/ophys`: `scanimage.epoch`, the TIFF names and page counts, and
 every frame's number and time. With `--raw-nwb`, this converter checks all of those against the raw file, plus every frame's
-session time, refusing the file if any differs, and records its NWB identifier and SHA256 in its `companion.rawtiff.*` rows.
+session time and each field's frame times, refusing the file if any differs, and records its NWB identifier and SHA256 in its `companion.rawtiff.*` rows.
 The raw file can't name this one, because it's written first.
 
 ## Alignment and what it means
@@ -24,8 +28,9 @@ The raw file can't name this one, because it's written first.
 I2C packets and fit provenance. The raw converter and its tests are unchanged. The processed and raw NWB files describe
 the same acquisition and behavior on the same clock; the processed file does not duplicate raw pixels.
 
-Every response series uses `prepared.frame_times[acquisition.plane_frames(plane)]`. Neither `fs` nor a volume-average
-time supplies timestamps. A partial last volume therefore produces unequal series lengths. Bad frames are retained,
+Every response series uses its field's times, `prepared.field_times(field)`: the frame times of its plane, plus, for a ROI
+below the top of a multi-ROI page, the time to scan down to its first row. Neither `fs` nor a volume-average time supplies
+timestamps. A partial last volume therefore produces unequal series lengths. Bad frames are retained,
 with their original flags and samples. All ROIs are retained, including ones classified as noncells.
 
 The clock fit is described in [imaging-timing.md](imaging-timing.md). Residuals measure packet scatter around a line,
@@ -99,6 +104,53 @@ coercion rules. No new missing sentinel is introduced. Float32 conversion has to
 `error::UserWarning`. A separate verification path rereads NPY files, TIFF descriptions and HDF5 datasets; it checks
 behavior, provenance, times, traces, masks, stat values, images, registration values and every archived artifact byte.
 A mismatch raises rather than being rounded away.
+
+## Multi-ROI sessions
+
+A multi-ROI (mesoscope) acquisition has several fields, one per ROI and plane, and each Suite2p plane folder holds one of
+them. Which one is decided from what Suite2p recorded in that folder's `db.npy`, never from folder order alone.
+
+### How the lab runs Suite2p on them
+
+In U19-pipeline-python, the MATLAB `TiffSplit` step writes one `ROI<r>_z<d>` folder per ROI and depth, each folder becomes its
+own recording process, and the Suite2p job (`automatic_job/suite2p_slurm_job.py`, settings from element-calcium-imaging's
+`suite2p_settings.build_suite2p_inputs`) runs Suite2p 1.1 on that folder's files, with `nplanes`, `nchannels` and `fs` from
+its ScanInfo. So each split folder has its own Suite2p output, `.../suite2p/plane0`. The settings builder also accepts
+Suite2p's own multi-ROI keys, `lines`, `dy` and `dx`, which crop each ROI's rows from the original pages (the 0.x `mesoscan`
+key no longer exists). Both are converted:
+
+| Suite2p read | Converter given | Each plane folder's field comes from | Registered frames rebuilt from |
+|---|---|---|---|
+| Split folders, one run each (the lab's way) | The original stack (preferred) | The split file names: the stack's stem, the ROI number, and the depth, with one file per stack file | The field's rows of the stack, negatives set to 0 in uint16 as the splitter copies them, then halved as Suite2p reads uint16 |
+| Split folders, one run each | The split folders (`--allow-incomplete` when they kept no ScanImage settings) | The exact list of the field's split files | The split pages, halved |
+| The original stack, with `lines` | The original stack | `iplane`, and `lines` equal to one ROI's rows on that plane | The stack rows, unchanged `int16` |
+| The original stack, whole pages | The original stack, one ROI per plane | `iplane` | The pages |
+
+Giving the stack is better wherever it exists: its fields' times include the scan time down to each ROI's first row, while the
+split copies carry the splitter's rounded times and its lag, which understates that time (see
+[imaging-timing.md](imaging-timing.md#multi-roi-imaging)). The splitter's copy is checked rather than assumed, by the frame
+mapping below: a run whose pixels weren't the clipped rows fails it.
+
+Refused, each with an error naming the folder: a plane folder whose `file_list` differs from the given TIFFs or their split
+copies, or mixes original and split names, or several ROIs or depths; a run over one split folder with more than one plane or
+with `lines`; `lines` that aren't one block of rows equal to a ROI's; whole pages of a plane holding several ROIs; a folder
+number other than `iplane x nrois + iroi`; a plane folder missing from, or extra to, what its `db.npy` describes, or named
+`plane*` without a number; any field held by no folder or by two; the same or nested Suite2p folders given twice; split runs
+of a stack whose planes aren't in ascending z, since the splitter numbers depths that way; and a stack run against split TIFFs,
+which have lost the stack's page layout. Frame counts, frames per file, frame shape and trace lengths are then checked per field.
+
+### What the file holds
+
+Each field gets its own `ImagingPlane`, `PlaneSegmentation`, response series, registration series and summary images, named for
+the field: `ImagingPlane0Roi2`, `PlaneSegmentation0Roi2`, `Fluorescence/Plane0Roi2`, `Plane0Roi2_xoff`, `SummaryImages0Roi2`,
+as the raw file's `TwoPhotonSeriesPlane0Roi2`. A session with one ROI per plane keeps the plane names (`PlaneSegmentation0`,
+`Fluorescence/Plane0`). An imaging plane of a multi-ROI field carries its ROI's grid spacing and `origin_coords`, as in the raw file.
+`processing/ophys/suite2p_fields` lists each field's plane, ROI number and name, rows, time offset, Suite2p folder and the
+pixels Suite2p read. Settings keys and source paths start with the plane folder, relative to the given Suite2p folder, or to
+the folder several have in common (`ROI01_z1/suite2p/plane0/...`).
+
+The frame mapping runs for every field: the first, middle and last frame of each file holding it, with the same thresholds and
+controls as for planes, and each sample records its field, plane, ROI, folder and input.
 
 ## Session measurements
 

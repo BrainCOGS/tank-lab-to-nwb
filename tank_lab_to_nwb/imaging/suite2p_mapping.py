@@ -75,59 +75,81 @@ def _trace_errors(movie, trace_at_frame, stat, allow_overlap, frame):
     return errors
 
 
-def prove_frame_mapping(acquisition, root):
-    """Check each plane's first, middle and last pages of every file, with ±1 controls, in two links.
+def sample_positions(field):
+    """The first, middle and last frame of this field in every file holding it, as positions in the field."""
+    positions = []
+    for file in sorted(set(field.file_index.tolist())):
+        inside = np.flatnonzero(field.file_index == file)
+        positions.extend(np.linspace(inside[0], inside[-1], 3, dtype=int))
+    return sorted(set(int(position) for position in positions))
+
+
+def suite2p_input(acquisition, plane, positions):
+    """The pages Suite2p read for these positions of a field: its rows as stored, or as the lab's splitter copies them,
+    with negative pixels set to 0 in uint16."""
+    from .scanimage import read_field
+
+    pages = read_field(acquisition, plane.field, positions)
+    return np.clip(pages, 0, None).astype("uint16") if plane.split_copy else pages
+
+
+def prove_frame_mapping(acquisition, roots):
+    """Check each field's first, middle and last pages of every file, with ±1 controls, in two links.
 
     TIFF page to registered frame: reconstruction RMSE at most 2 intensity units. Registered frame to F.npy: traces
     recomputed from the frame within 0.01. In both, each neighboring frame must be more than ten times worse, or the
     conversion is refused. Returns per-sample evidence. Fneu and spks aren't recomputed; they share F's order and length.
     This is sampled evidence across every file, not an assertion that every pixel was checked.
-    """
-    from pathlib import Path
-    from .scanimage import read_frames
 
-    root = Path(root)
+    `roots` is one Suite2p output folder or several; `suite2p.match_planes` says which folder holds which field. A field's
+    pages are its rows of the stack, or its split pages, or, when Suite2p read the lab's split copies of the given stack,
+    those rows as the splitter copies them.
+    """
+    from .suite2p import _relative, match_planes, source_base
+
+    base = source_base(roots)
     evidence = []
-    for plane in range(acquisition.layout.n_planes):
-        folder = root / f"plane{plane}"
+    for plane in match_planes(roots, acquisition):
+        field, folder = plane.field, plane.folder
         reg = np.load(folder / "reg_outputs.npy", allow_pickle=True).item()
         all_settings = np.load(folder / "settings.npy", allow_pickle=True).item()
         settings = all_settings["registration"]
         allow_overlap = all_settings.get("extraction", {}).get("allow_overlap", False)
         stat = np.load(folder / "stat.npy", allow_pickle=True)
         traces = np.load(folder / "F.npy", mmap_mode="r")
-        indices = acquisition.plane_frames(plane)
-        movie = np.memmap(
-            folder / "data.bin", mode="r", dtype="int16", shape=(len(indices), *acquisition.layout.frame_shape)
-        )
-        if (folder / "data.bin").stat().st_size != movie.nbytes:
-            raise ValueError(f"plane {plane}: registered movie frame count differs")
-        positions = []
-        for file in range(len(acquisition.files)):
-            inside = np.flatnonzero(acquisition.frames["file_index"][indices] == file)
-            if inside.size:  # a recording can stop before reaching this plane in the last file
-                positions.extend(np.linspace(inside[0], inside[-1], 3, dtype=int))
-        for i in sorted(set(positions)):
+        count = field.frame_indices.size
+        expected_bytes = count * field.shape[0] * field.shape[1] * 2
+        if (folder / "data.bin").stat().st_size != expected_bytes:
+            raise ValueError(f"{field.label}: registered movie frame count differs")
+        movie = np.memmap(folder / "data.bin", mode="r", dtype="int16", shape=(count, *field.shape))
+        for i in sample_positions(field):
             errors = {}
             for delta in (-1, 0, 1):
-                if not 0 <= i + delta < len(indices):
+                if not 0 <= i + delta < count:
                     continue
-                raw = read_frames(acquisition, [indices[i + delta]])[0]
+                raw = suite2p_input(acquisition, plane, [i + delta])[0]
                 predicted = reconstruct_frame(raw, reg, settings, i)
                 diff = predicted.astype("float64") - movie[i]
                 errors[str(delta)] = float(np.sqrt(np.mean(diff**2)))
             if not is_separated(errors, limit=2):
-                raise ValueError(f"plane {plane}, frame {i}: frame mapping not demonstrated: {errors}")
+                raise ValueError(f"{field.label}, frame {i}: frame mapping not demonstrated: {errors}")
             trace_errors = _trace_errors(movie, np.asarray(traces[:, i]), stat, allow_overlap, i) if len(stat) else None
             if trace_errors is not None and not is_separated(trace_errors, limit=0.01):
-                raise ValueError(f"plane {plane}, frame {i}: traces don't match the registered movie: {trace_errors}")
+                raise ValueError(f"{field.label}, frame {i}: traces don't match the registered movie: {trace_errors}")
+            file_index = int(field.file_index[i])
             evidence.append(
                 dict(
-                    plane=plane,
+                    field=field.label,
+                    plane=int(field.plane),
+                    roi=int(field.number),
+                    folder=_relative(folder, base),
+                    input=plane.input,
                     frame=int(i),
-                    tiff_frame=int(indices[i]),
-                    file_index=int(acquisition.frames["file_index"][indices[i]]),
-                    page_index=int(acquisition.frames["page_index"][indices[i]]),
+                    tiff_frame=int(field.frame_indices[i]),
+                    file_index=file_index,
+                    file=acquisition.files[file_index].name,
+                    # Every ROI at a depth has the same pages in its split files, so the frame table's page is this one's too.
+                    page_index=int(acquisition.frames["page_index"][field.frame_indices[i]]),
                     rmse=errors,
                     trace_rmse=trace_errors,
                 )

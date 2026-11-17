@@ -119,7 +119,8 @@ coordinates, not measured brain positions. A rotated scanfield, or one whose siz
 
 ROIs on different planes follow the header's `zs`, and each plane's rows are placed from the top with even gaps, as the splitter does.
 A layout that doesn't divide evenly, a ROI on no plane, a plane with no ROI, a ROI of a different width, or several ROIs with `mroiEnable`
-off stops with an error. Suite2p output from a multi-ROI session isn't converted yet.
+off stops with an error. Suite2p output from a multi-ROI session is converted per field; see
+[imaging-suite2p.md](imaging-suite2p.md#multi-roi-sessions).
 
 ## Files for one session
 
