@@ -75,8 +75,10 @@ def description(frame_number, *, time=None, i2c_text="{}", epoch=EPOCH, aux="[]"
     )
 
 
-def write_acquisition(folder, n_frames, frames_per_file=4, *, packets=None, software_text=None, artist_text=None, rows=3, cols=4, stem="mouse_00001", skip_frames=(), raw_i2c=None, **description_options):
-    """Write one acquisition split across files, and return the paths. `packets` maps a frame number to its packets."""
+def write_acquisition(folder, n_frames, frames_per_file=4, *, packets=None, software_text=None, artist_text=None, rows=3, cols=4, stem="mouse_00001", skip_frames=(), raw_i2c=None, pixels=None, **description_options):
+    """Write one acquisition split across files, and return the paths. `packets` maps a frame number to its packets.
+    `pixels(frame_number, rows, cols)` gives each page, frame_pixels by default."""
+    pixels = pixels or frame_pixels
     packets = packets or {}
     numbers = [n for n in range(1, n_frames + 1) if n not in skip_frames]
     paths = []
@@ -91,7 +93,7 @@ def write_acquisition(folder, n_frames, frames_per_file=4, *, packets=None, soft
                     contiguous=False,
                     metadata=None,
                 )
-                writer.write(frame_pixels(number, rows, cols), **options)
+                writer.write(pixels(number, rows, cols), **options)
         paths.append(path)
     return paths
 
