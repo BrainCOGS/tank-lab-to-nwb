@@ -2016,7 +2016,7 @@ wheels = [
 [[package]]
 name = "ndx-tank-metadata"
 version = "0.5.0"
-source = { git = "https://github.com/BrainCOGS/ndx-tank-metadata?branch=tabedzki%2Ffeat%2Fvirmen-schema-expansion#effe9776fc37438e97939aa5a887717bde168932" }
+source = { git = "https://github.com/BrainCOGS/ndx-tank-metadata?branch=tabedzki%2Ffeat%2Fvirmen-schema-expansion#afe2551286d3cf22ba4345d291051f0dc88f90ee" }
 dependencies = [
     { name = "hdmf" },
     { name = "pynwb" },
