@@ -1,6 +1,7 @@
 """Multi-ROI imaging, from a full ScanImage stack or from the lab's per-ROI split folders."""
 
 import json
+import tracemalloc
 
 import h5py
 import numpy as np
@@ -9,7 +10,7 @@ from pynwb import validate
 
 from tank_lab_to_nwb.imaging import convert_session as cli
 from tank_lab_to_nwb.imaging.convert import convert_session, prepare_session
-from tank_lab_to_nwb.imaging.scanimage import ScanImageError, find_tiffs, read_acquisition, read_field
+from tank_lab_to_nwb.imaging.scanimage import ScanImageError, find_tiffs, read_acquisition, read_field, read_flyback, read_frames
 from tank_lab_to_nwb.imaging.verify import RoundTripError, verify_imaging
 from tests.synthetic_log import make_block, make_log, make_trial, scalar
 from tests.synthetic_tiff import FLYBACK_ROWS, FRAME_PERIOD, frame_pixels, mroi_artist, mroi_software, software, split_stack, write_stack
@@ -139,6 +140,59 @@ class TestStack:
         acquisition = read_acquisition(write_stack(tmp_path, 3, [dict(rows=3)], software_text=mroi_software()))
         assert [field.label for field in acquisition.fields] == ["Plane0"]
         assert acquisition.layout.flyback_rows == {0: ()}
+
+
+TALL = [dict(rows=120, name="a"), dict(rows=120, name="b")]
+
+
+def _peak(read):
+    """What `read` returns, and the most memory it held at once while reading."""
+    tracemalloc.start()
+    try:
+        result = read()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return result, peak
+
+
+class TestReadMemory:
+    # Regression: the readers loaded whole pages and sliced afterwards, so a buffer sized for the stored rows held the full
+    # pages. For the flyback rows of the 3-ROI test session (52 of 1,588 rows) a 1 GB buffer held about 30 GB, and the
+    # conversion was killed for running out of memory.
+    @pytest.fixture
+    def acquisition(self, tmp_path):
+        return read_acquisition(write_stack(tmp_path, 400, TALL, frames_per_file=400))
+
+    def test_flyback_rows_are_read_without_their_pages(self, acquisition):
+        positions = np.arange(400)
+        got, peak = _peak(lambda: read_flyback(acquisition, 0, positions))
+        pages = read_frames(acquisition, positions)
+        np.testing.assert_array_equal(got, pages[:, 120:122])
+        assert peak < 2 * got.nbytes + 100_000, f"held {peak} bytes for {got.nbytes} bytes of rows"
+
+    def test_a_field_is_read_without_the_rest_of_its_pages(self, acquisition):
+        positions = np.arange(400)
+        field = acquisition.fields[1]
+        got, peak = _peak(lambda: read_field(acquisition, field, positions))
+        np.testing.assert_array_equal(got, read_frames(acquisition, positions)[:, field.rows[0] : field.rows[1]])
+        assert peak < 1.2 * got.nbytes + 100_000, f"held {peak} bytes for {got.nbytes} bytes of rows"
+        assert got.base is None or got.base.nbytes == got.nbytes, "the rows are a view that keeps the whole pages alive"
+
+    @pytest.mark.parametrize("positions", [[], [0], [399, 0, 7]], ids=["none", "one", "out-of-order"])
+    def test_any_selection_of_frames_reads_the_same_rows(self, acquisition, positions):
+        pages = read_frames(acquisition, np.arange(400))
+        field = acquisition.fields[0]
+        np.testing.assert_array_equal(read_field(acquisition, field, positions), pages[positions][:, field.rows[0] : field.rows[1]])
+        np.testing.assert_array_equal(read_flyback(acquisition, 0, positions), pages[positions][:, 120:122])
+        assert read_field(acquisition, field, positions).dtype == np.int16
+
+
+    def test_a_page_cut_short_on_disk_stops_the_read(self, acquisition):
+        path = acquisition.files[0].path
+        path.write_bytes(path.read_bytes()[: acquisition.frames["data_offset"][-1] + 10])
+        with pytest.raises(ScanImageError, match="ends early"):
+            read_flyback(acquisition, 0, [399])
 
 
 class TestStackFile:
