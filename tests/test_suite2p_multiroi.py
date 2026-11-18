@@ -432,3 +432,81 @@ def test_the_cli_takes_one_run_per_split_folder_and_reports_each_field(tmp_path,
     assert report["roi_counts"] == {"Plane0Roi1": 1, "Plane0Roi2": 1, "Plane0Roi3": 1}
     assert report["frame_counts"] == {"Plane0Roi1": N_FRAMES, "Plane0Roi2": N_FRAMES, "Plane0Roi3": N_FRAMES}
     assert {e["field"] for e in report["mapping"]} == {"Plane0Roi1", "Plane0Roi2", "Plane0Roi3"}
+
+
+def to_pre_1_0(root):
+    """Rewrite Suite2p 1.x plane folders as pre-1.0 Suite2p left them: one flat ops.npy, with filelist, the registration
+    outputs and settings together, and no db.npy, settings.npy, reg_outputs.npy or detect_outputs.npy."""
+    for folder in sorted(root.glob("plane*")):
+        parts = {name: np.load(folder / f"{name}.npy", allow_pickle=True).item() for name in ("db", "settings", "reg_outputs", "detect_outputs")}
+        ops = {"suite2p_version": "0.10.3", "nonrigid": False, "do_bidiphase": False, "bidiphase": 0, "two_step_registration": False, "allow_overlap": False, "block_size": [128, 128]}
+        db = dict(parts["db"])
+        ops.update(filelist=db.pop("file_list"), **db, **parts["reg_outputs"], **parts["detect_outputs"])
+        ops["regPC"] = np.zeros((2, 2, 30, 40), dtype="float32")  # too big for the settings table; kept in the archived ops.npy
+        np.save(folder / "ops.npy", ops)
+        for name in parts:
+            (folder / f"{name}.npy").unlink()
+    return root
+
+
+class TestPre10Layout:
+    """Suite2p before 1.0 (the lab's mesoscope output may be from 2021) kept everything in ops.npy."""
+
+    def test_split_runs_convert_and_keep_ops_settings(self, tmp_path, log, stack, split):
+        roots = [to_pre_1_0(root) for root in split_runs(tmp_path / "s2p", split, stack=stack)]
+        path = tmp_path / "out.nwb"
+        prepared = convert_suite2p(log, stack, roots, path, file="session.mat")
+        assert not validate(path=str(path))
+        with h5py.File(path) as file:
+            ophys = file["processing/ophys"]
+            for field in prepared.acquisition.fields:
+                np.testing.assert_array_equal(ophys[f"Fluorescence/{field.label}/timestamps"][()], prepared.field_times(field))
+            settings = dict(zip(ophys["suite2p_settings/key"].asstr()[()], ophys["suite2p_settings/value"].asstr()[()]))
+            assert settings["ROI01_z1/suite2p/plane0.suite2p_version"] == '"0.10.3"'
+            assert "ROI01_z1/suite2p/plane0.regPC" not in settings and "ROI01_z1/suite2p/plane0.xoff" not in settings
+            assert "ROI01_z1/suite2p/plane0/ops.npy" in list(ophys["source_inventory/path"].asstr()[()])
+            assert "Plane0Roi1_xoff" in ophys and "SummaryImages0Roi1" in ophys
+
+    def test_a_stack_run_with_lines_maps(self, tmp_path, stack):
+        root = to_pre_1_0(stack_run(tmp_path / "s2p", stack))
+        planes = match_planes(root, read_acquisition(stack))
+        assert [(p.folder.name, p.field.label, p.meta["layout"]) for p in planes] == [
+            ("plane0", "Plane0Roi1", "pre-1.0"),
+            ("plane1", "Plane0Roi2", "pre-1.0"),
+            ("plane2", "Plane0Roi3", "pre-1.0"),
+        ]
+        prove_frame_mapping(read_acquisition(stack), root)
+
+    @pytest.mark.parametrize("key", ["filelist", "frames_per_file", "iplane", "xoff"])
+    def test_ops_without_what_places_and_checks_the_plane_is_refused(self, tmp_path, stack, key):
+        root = to_pre_1_0(stack_run(tmp_path / "s2p", stack))
+        path = root / "plane1/ops.npy"
+        ops = np.load(path, allow_pickle=True).item()
+        del ops[key]
+        np.save(path, ops)
+        with pytest.raises(ValueError, match=f"pre-1.0.*{key}"):
+            match_planes(root, read_acquisition(stack))
+
+
+def test_a_folder_with_neither_db_nor_ops_is_refused(tmp_path, stack):
+    root = stack_run(tmp_path / "s2p", stack)
+    (root / "plane1/db.npy").unlink()
+    with pytest.raises(ValueError, match="neither db.npy.*nor ops.npy"):
+        match_planes(root, read_acquisition(stack))
+
+
+def test_a_1x_folder_without_its_settings_is_refused(tmp_path, stack):
+    root = stack_run(tmp_path / "s2p", stack)
+    (root / "plane2/settings.npy").unlink()
+    with pytest.raises(ValueError, match="settings"):
+        match_planes(root, read_acquisition(stack))
+
+
+@pytest.mark.parametrize("pre_1_0", [False, True], ids=["1.x", "pre-1.0"])
+def test_a_plane_without_its_registered_movie_is_refused(tmp_path, stack, pre_1_0):
+    root = stack_run(tmp_path / "s2p", stack)
+    if pre_1_0:
+        to_pre_1_0(root)
+    (root / "plane0/data.bin").unlink()
+    with pytest.raises(ValueError, match="Plane0Roi1.*data.bin.*can't be proven"):
+        prove_frame_mapping(read_acquisition(stack), root)
