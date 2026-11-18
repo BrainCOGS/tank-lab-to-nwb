@@ -1,5 +1,6 @@
 """Read per-plane Suite2p results without importing Suite2p or torch."""
 
+import datetime
 import hashlib
 import json
 import os
@@ -300,15 +301,19 @@ def load_suite2p(roots, prepared):
     return planes
 
 
-def _json_value(value):
-    def numeric(item):
-        if isinstance(item, np.ndarray):
-            return item.tolist()
-        if isinstance(item, np.generic):
-            return item.item()
-        raise TypeError(f"Unsupported source value: {type(item).__name__}")
+def _json_ready(item):
+    """A source value JSON can't hold as is, in a form it can: arrays as lists, datetimes as ISO 8601 text."""
+    if isinstance(item, np.ndarray):
+        return item.tolist()
+    if isinstance(item, np.generic):
+        return item.item()
+    if isinstance(item, (datetime.date, datetime.time)):  # pre-1.0 Suite2p records date_proc as a datetime
+        return item.isoformat()
+    raise TypeError(f"Unsupported source value: {type(item).__name__}")
 
-    return json.dumps(value, default=numeric, allow_nan=True)
+
+def _json_value(value):
+    return json.dumps(value, default=_json_ready, allow_nan=True)
 
 
 def _sources(roots):
@@ -614,7 +619,7 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
             "Suite2p settings and version as recorded, without changing any value. Keys start with the plane folder. fs is processing provenance, not the source of timestamps.",
             [
                 ("key", "Plane folder and original setting path.", np.array([r[0] for r in setting_rows], dtype=object)),
-                ("value", "Original value as JSON.", np.array([r[1] for r in setting_rows], dtype=object)),
+                ("value", "Original value as JSON; a date or time as ISO 8601 text.", np.array([r[1] for r in setting_rows], dtype=object)),
             ],
         )
     )
@@ -818,7 +823,9 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None, mapping=None):
         if set(stored) != set(expected):
             raise RoundTripError(f"Suite2p settings differ: {sorted(set(stored) ^ set(expected))}")
         for key, value in expected.items():
-            equal(json.loads(stored[key]), value, "Suite2p setting " + key)
+            # JSON holds a date or time as ISO 8601 text; compare with the source value written that way.
+            written = value.isoformat() if isinstance(value, (datetime.date, datetime.time)) else value
+            equal(json.loads(stored[key]), written, "Suite2p setting " + key)
         inventory = ophys["source_inventory"]
         sources = _sources(root)
         if list(inventory["path"].asstr()[()]) != [_relative(p, base) for p in sources]:

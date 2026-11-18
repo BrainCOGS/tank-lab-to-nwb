@@ -2,6 +2,7 @@
 
 import json
 import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import h5py
@@ -496,6 +497,21 @@ class TestPre10Layout:
         assert [p.field.label for p in planes] == ["Plane0Roi1", "Plane0Roi2", "Plane0Roi3"]
         assert all(p.split_copy for p in planes)
         prove_frame_mapping(acquisition, roots)
+
+    def test_the_processing_date_is_kept_as_iso_text(self, tmp_path, log, stack, split):
+        """Pre-1.0 Suite2p records date_proc as a datetime, with or without a time zone."""
+        roots = [to_pre_1_0(root) for root in split_runs(tmp_path / "s2p", split, stack=stack)]
+        dates = [datetime(2021, 11, 3, 15, 40, 6, 29597), datetime(2022, 12, 26, 18, 32, 53, 782737, tzinfo=timezone(timedelta(hours=-5)))]
+        for root, date in zip(roots, dates):
+            path = root / "plane0/ops.npy"
+            np.save(path, {**np.load(path, allow_pickle=True).item(), "date_proc": date})
+        path = tmp_path / "out.nwb"
+        convert_suite2p(log, stack, roots, path, file="session.mat")
+        with h5py.File(path) as file:
+            settings = dict(zip(file["processing/ophys/suite2p_settings/key"].asstr()[()], file["processing/ophys/suite2p_settings/value"].asstr()[()]))
+        assert json.loads(settings["ROI01_z1/suite2p/plane0.date_proc"]) == "2021-11-03T15:40:06.029597"
+        assert json.loads(settings["ROI02_z1/suite2p/plane0.date_proc"]) == "2022-12-26T18:32:53.782737-05:00"
+        assert "ROI03_z1/suite2p/plane0.date_proc" not in settings
 
     def test_a_one_plane_run_without_iplane_maps(self, tmp_path, stack, split):
         """Pre-1.0 Suite2p leaves iplane out of a run with one plane and one ROI, where it can only be plane 0."""
