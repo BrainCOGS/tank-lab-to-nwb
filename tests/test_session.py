@@ -109,6 +109,36 @@ def _settings(session):
     return {key: value for key, value, _ in session.settings}
 
 
+class TestMotionBlurRange:
+    """ViRMEn logs [] for a block with no blur and a 1x2 [low high] otherwise (issue #3)."""
+
+    @staticmethod
+    def _blocks(*ranges):
+        return [make_block(make_trial(start=2.0 + 10 * i), start=(2026, 7, 15, 12, 0, 10.0 * i), motionBlurRange=value)
+                for i, value in enumerate(ranges)]
+
+    def test_set_range_is_kept_per_block(self):
+        session = _normalize(make_log(self._blocks(np.array([[1.0, 50.0]]), np.array([[2.0, 40.0]]))))
+        np.testing.assert_array_equal(_column(session.epochs, "motionBlurRange").data, [[1.0, 50.0], [2.0, 40.0]])
+        assert session.coverage.written["log.block.motionBlurRange"] == ["motionBlurRange"]
+
+    def test_block_without_a_range_is_nan_nan(self):
+        session = _normalize(make_log(self._blocks(np.zeros((0, 0)), np.array([[0.0, 50.0]]))))
+        data = _column(session.epochs, "motionBlurRange").data
+        assert np.isnan(data[0]).all()
+        np.testing.assert_array_equal(data[1], [0.0, 50.0])
+
+    def test_no_range_in_any_block_leaves_the_column_out(self):
+        session = _normalize(make_log(self._blocks(np.zeros((0, 0)), np.zeros((0, 0)))))
+        assert all(column.name != "motionBlurRange" for column in session.epochs)
+        assert "log.block.motionBlurRange" in session.coverage.omitted
+
+    @pytest.mark.parametrize("value", [np.array([[1.0, 2.0, 3.0]]), np.array([[1.0]])])
+    def test_a_range_of_the_wrong_width_is_refused(self, value):
+        with pytest.raises(ConversionError, match="motionBlurRange"):
+            _normalize(make_log(self._blocks(value)))
+
+
 class TestClockAnchor:
     def test_ordinary_block_uses_its_stamp_and_needs_no_review(self):
         session = _normalize(make_log())
