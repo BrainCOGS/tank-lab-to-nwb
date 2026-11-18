@@ -2015,25 +2015,12 @@ wheels = [
 
 [[package]]
 name = "ndx-tank-metadata"
-version = "0.4.1"
-source = { editable = "../../../../ndx-tank-metadata/.claude/worktrees/maze-extension-spec" }
+version = "0.5.0"
+source = { git = "https://github.com/BrainCOGS/ndx-tank-metadata?branch=tabedzki%2Ffeat%2Fvirmen-schema-expansion#effe9776fc37438e97939aa5a887717bde168932" }
 dependencies = [
     { name = "hdmf" },
     { name = "pynwb" },
     { name = "ruamel-yaml" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "hdmf", specifier = ">=6.2.0" },
-    { name = "pynwb", specifier = ">=4.2.0" },
-    { name = "ruamel-yaml" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8.3.5" },
-    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2" },
 ]
 
 [[package]]
@@ -3287,7 +3274,7 @@ requires-dist = [
     { name = "ipywidgets" },
     { name = "isodate" },
     { name = "mat-io", specifier = ">=1.0.2" },
-    { name = "ndx-tank-metadata", editable = "../../../../ndx-tank-metadata/.claude/worktrees/maze-extension-spec" },
+    { name = "ndx-tank-metadata", git = "https://github.com/BrainCOGS/ndx-tank-metadata?branch=tabedzki%2Ffeat%2Fvirmen-schema-expansion" },
     { name = "neuroconv", extras = ["kilosort", "openephys", "spikeglx"], specifier = ">=0.10.2" },
     { name = "notebook" },
     { name = "numpy" },
