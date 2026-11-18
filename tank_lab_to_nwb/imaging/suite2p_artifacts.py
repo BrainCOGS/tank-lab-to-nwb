@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .suite2p import _plane_folders, _relative, _roots, _sources, source_base
+from .suite2p import _plane_folders, _relative, _roots, _sources, read_plane, source_base
 
 
 def artifact_inventory(root):
@@ -78,10 +78,10 @@ def verify_combined(root):
     folders = [folder for _, folder in sorted(_plane_folders(root).items())]
     dbs = []
     for folder in folders:
-        db = np.load(folder / "db.npy", allow_pickle=True).item()
-        for source in ("reg_outputs", "detect_outputs"):
-            db = {**db, **np.load(folder / f"{source}.npy", allow_pickle=True).item()}
-        dbs.append(db)
+        meta = read_plane(folder)
+        if meta["layout"] != "1.x":
+            return {"present": True, "checked": False, "reason": f"{meta['layout']} Suite2p combined/ isn't checked; it's archived byte-exact and never supplies traces"}
+        dbs.append({**meta["db"], **meta["reg_outputs"], **meta["detect_outputs"]})
     offsets = _tile_offsets(dbs)
     canvas = (max(dy + db["Ly"] for (dy, _), db in zip(offsets, dbs)), max(dx + db["Lx"] for (_, dx), db in zip(offsets, dbs)))
     cursor = 0

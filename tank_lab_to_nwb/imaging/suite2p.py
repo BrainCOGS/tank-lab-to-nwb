@@ -15,6 +15,62 @@ from .scanimage import _FILE_NAME, _SPLIT_NAME, SPLIT_SOURCE
 
 REGISTRATION_SERIES = ("xoff", "yoff", "corrXY", "xoff1", "yoff1", "corrXY1", "badframes", "badframes0")
 TRACE_SERIES = (("Fluorescence", "F"), ("Neuropil", "Fneu"), ("Deconvolved", "spks"))
+SUMMARY_IMAGES = ("meanImg", "meanImgE", "max_proj", "Vcorr", "refImg", "meanImg_crop")
+# What a pre-1.0 ops.npy must hold to place a plane folder in a field and check it against the TIFFs.
+PRE_1_0_REQUIRED = ("filelist", "nframes", "Ly", "Lx", "nplanes", "iplane", "frames_per_file", "xoff", "yoff")
+# Pre-1.0 ops arrays larger than this, other than registration series and images, stay only in the archived ops.npy.
+SETTINGS_ARRAY_LIMIT = 1000
+
+
+def _npy(folder, name):
+    value = np.load(folder / f"{name}.npy", allow_pickle=True)
+    return value.item() if value.shape == () else value
+
+
+def read_plane(folder):
+    """A Suite2p plane folder's metadata in one shape, whichever Suite2p wrote it.
+
+    Suite2p 1.x writes db.npy, settings.npy, reg_outputs.npy and detect_outputs.npy. Suite2p before 1.0 kept all of it in
+    one flat ops.npy, with the file list as `filelist`. Returns layout, db (file_list, nframes, Ly, Lx, nplanes, iplane,
+    nrois, iroi, lines, frames_per_file), settings (as recorded), registration (the settings that rebuild registered frames),
+    allow_overlap, reg_outputs, detect_outputs and version. Anything it can't read that way is refused, saying why.
+    """
+    folder = Path(folder)
+    if (folder / "db.npy").exists():
+        missing = [name for name in ("settings", "reg_outputs") if not (folder / f"{name}.npy").exists()]
+        if missing:
+            raise ValueError(f"{folder}: a Suite2p 1.x plane folder (it has db.npy) without {', '.join(f'{m}.npy' for m in missing)}")
+        settings = _npy(folder, "settings")
+        return dict(
+            layout="1.x",
+            db=_npy(folder, "db"),
+            settings=settings,
+            registration=settings.get("registration", {}),
+            allow_overlap=settings.get("extraction", {}).get("allow_overlap", False),
+            reg_outputs=_npy(folder, "reg_outputs"),
+            detect_outputs=_npy(folder, "detect_outputs") if (folder / "detect_outputs.npy").exists() else {},
+            version=settings.get("version"),
+        )
+    if (folder / "ops.npy").exists():
+        ops = _npy(folder, "ops")
+        missing = [key for key in PRE_1_0_REQUIRED if key not in ops]
+        if missing:
+            raise ValueError(f"{folder}: a pre-1.0 Suite2p plane folder (ops.npy, no db.npy) whose ops lack {', '.join(missing)}, so it can't be placed and checked")
+        reg = {key: ops[key] for key in (*REGISTRATION_SERIES, "meanImg", "meanImgE", "refImg", "meanImg_crop", "xrange", "yrange") if key in ops}
+        detect = {key: ops[key] for key in ("max_proj", "Vcorr") if key in ops}
+        db = dict(
+            file_list=list(ops["filelist"]),
+            **{key: ops[key] for key in ("nframes", "Ly", "Lx", "nplanes", "iplane", "frames_per_file")},
+            **{key: ops.get(key) for key in ("nrois", "iroi", "lines", "dy", "dx")},
+        )
+        settings = {
+            key: value
+            for key, value in ops.items()
+            if key not in reg and key not in detect and not (isinstance(value, np.ndarray) and value.size > SETTINGS_ARRAY_LIMIT)
+        }
+        return dict(layout="pre-1.0", db=db, settings=settings, registration=ops, allow_overlap=ops.get("allow_overlap", False),
+                    reg_outputs=reg, detect_outputs=detect, version=ops.get("suite2p_version"))
+    raise ValueError(f"{folder}: neither db.npy (Suite2p 1.x) nor ops.npy (Suite2p before 1.0), so it isn't a Suite2p plane folder this can read")
 
 
 SPLIT_COPY = "split copy of the given TIFFs: negatives set to 0, as uint16"
@@ -34,6 +90,7 @@ class Suite2pPlane:
     field: object
     db: dict
     split_copy: bool = False
+    meta: dict = None  # read_plane's result
 
     @property
     def input(self):
@@ -161,14 +218,15 @@ def match_planes(roots, acquisition):
     found = []
     for root in _roots(roots):
         folders = _plane_folders(root)
-        dbs = {number: np.load(folder / "db.npy", allow_pickle=True).item() for number, folder in folders.items()}
+        metas = {number: read_plane(folder) for number, folder in folders.items()}
+        dbs = {number: meta["db"] for number, meta in metas.items()}
         first = next(iter(dbs.values()))
         expected = int(first.get("nplanes", 1)) * int(first.get("nrois") or 1)
         if set(folders) != set(range(expected)):
             raise ValueError(f"{root}: Suite2p plane folders {sorted(folders)} differ from the {expected} its db describes")
         for number, folder in folders.items():
             field, split_copy = _field_for(f"Suite2p plane {number} in {root}", number, dbs[number], acquisition)
-            found.append(Suite2pPlane(folder=folder, field=field, db=dbs[number], split_copy=split_copy))
+            found.append(Suite2pPlane(folder=folder, field=field, db=dbs[number], split_copy=split_copy, meta=metas[number]))
     by_field = {}
     for plane in found:
         if plane.field.label in by_field:
@@ -198,10 +256,8 @@ def load_suite2p(roots, prepared):
     for source in match_planes(roots, acquisition):
         field, folder = source.field, source.folder
         where = f"{field.label} (Suite2p plane {folder.name[5:]} in {folder.parent})"
-        data = {}
-        for path in folder.glob("*.npy"):
-            value = np.load(path, allow_pickle=True)
-            data[path.stem] = value.item() if value.shape == () else value
+        data = {name: _npy(folder, name) for name in ("stat", "iscell", "F", "Fneu", "spks")}
+        data.update({key: source.meta[key] for key in ("db", "settings", "reg_outputs", "detect_outputs")})
         nframes = field.frame_indices.size
         if not nframes:
             raise ValueError(f"{where}: empty plane cannot be converted")
@@ -393,14 +449,15 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
             **(metadata or {}),
         },
     )
-    bidiphase = sorted({repr(data["settings"]["registration"].get("do_bidiphase")) for data in planes})
+    bidiphase = sorted({repr(data["source"].meta["registration"].get("do_bidiphase")) for data in planes})
+    versions = sorted({str(data["source"].meta["version"]) for data in planes})
     several = any(data["source"].field.label != f"Plane{data['source'].field.plane}" for data in planes)
     nwb.notes = (
         "Companion to the raw TIFF NWB conversion of this acquisition: both use prepare_session, the same behavior, "
         "session-start shift and frame-time fit. Raw pixels are external and are not duplicated here. "
         "Per-plane Suite2p folders define lengths; combined contains padded display traces. "
         "Original Suite2p artifacts except data.bin are preserved byte-for-byte in scratch; object NPY files require a trusted pickle reader. "
-        f"registration.do_bidiphase is {' or '.join(bidiphase)} in the Suite2p settings. "
+        f"registration.do_bidiphase is {' or '.join(bidiphase)} in the Suite2p settings. Suite2p version: {', '.join(versions)}. "
         + (
             "Each field, one ROI on one plane, has its own ImagingPlane, PlaneSegmentation and response series, named Plane<p>Roi<r>; "
             "processing/ophys/suite2p_fields says which Suite2p folder holds which field, and its times are when the field's first row was scanned. "
@@ -501,7 +558,7 @@ def build_suite2p_nwbfile(prepared, root, metadata=None, mapping=None, companion
                 if (
                     isinstance(value, np.ndarray)
                     and value.ndim == 2
-                    and key in ("meanImg", "meanImgE", "max_proj", "Vcorr", "refImg", "meanImg_crop")
+                    and key in SUMMARY_IMAGES
                 ):
                     rows, cols = field.shape
                     xr = data["reg_outputs"].get("xrange", [0, cols])
@@ -688,6 +745,7 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None, mapping=None):
         for plane in planes:
             field, folder, suffix = plane.field, plane.folder, plane.suffix
             field_times = (_expected_field_times(field, headers, prepared.acquisition) - intercept) / slope + offset
+            meta = read_plane(folder)
             stat = np.load(folder / "stat.npy", allow_pickle=True)
             cells = np.load(folder / "iscell.npy")
             segmentation = ophys[f"ImageSegmentation/PlaneSegmentation{suffix}"]
@@ -695,8 +753,7 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None, mapping=None):
             if link != f"/general/optophysiology/ImagingPlane{suffix}":
                 raise RoundTripError(f"PlaneSegmentation{suffix}: its imaging plane is {link}")
             equal(segmentation["id"][()], np.arange(len(stat)), "ROI ids")
-            db = np.load(folder / "db.npy", allow_pickle=True).item()
-            reg = np.load(folder / "reg_outputs.npy", allow_pickle=True).item()
+            db, reg = meta["db"], meta["reg_outputs"]
             equal(segmentation["iscell"][()], cells[:, 0], "iscell")
             equal(segmentation["cell_probability"][()], cells[:, 1], "probability")
             cursor = 0
@@ -725,8 +782,7 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None, mapping=None):
                     equal(series["rois"][()], np.arange(len(stat)), f"{key} rois")
                     equal(series["timestamps"][()], field_times, f"{field.label} {key} times")
             for source in ("reg_outputs", "detect_outputs"):
-                meta = np.load(folder / f"{source}.npy", allow_pickle=True).item()
-                for key, value in meta.items():
+                for key, value in meta[source].items():
                     if key in REGISTRATION_SERIES:
                         if f"{field.label}_{key}" not in ophys:
                             raise RoundTripError("missing registration " + key)
@@ -735,7 +791,7 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None, mapping=None):
                     if (
                         isinstance(value, np.ndarray)
                         and value.ndim == 2
-                        and key in ("meanImg", "meanImgE", "max_proj", "Vcorr", "refImg", "meanImg_crop")
+                        and key in SUMMARY_IMAGES
                     ):
                         if f"SummaryImages{suffix}/{key}" not in ophys:
                             raise RoundTripError("missing summary image " + key)
@@ -752,7 +808,7 @@ def verify_suite2p(prepared, output, root, tiffs, companion=None, mapping=None):
         stored = dict(zip(table["key"].asstr()[()], table["value"].asstr()[()]))
         expected = {}
         for plane in planes:
-            original = np.load(plane.folder / "settings.npy", allow_pickle=True).item()
+            original = read_plane(plane.folder)["settings"]
             expected.update(_flatten_settings(_settings_prefix(plane.folder, base), original))
         if set(stored) != set(expected):
             raise RoundTripError(f"Suite2p settings differ: {sorted(set(stored) ^ set(expected))}")

@@ -139,6 +139,21 @@ number other than `iplane x nrois + iroi`; a plane folder missing from, or extra
 of a stack whose planes aren't in ascending z, since the splitter numbers depths that way; and a stack run against split TIFFs,
 which have lost the stack's page layout. Frame counts, frames per file, frame shape and trace lengths are then checked per field.
 
+### Suite2p before 1.0
+
+Suite2p 1.x writes `db.npy`, `settings.npy`, `reg_outputs.npy` and `detect_outputs.npy` in each plane folder. Before 1.0 it kept
+all of that in one flat `ops.npy`, with the file list as `filelist`. Both are read (`suite2p.read_plane`), and placed and
+checked the same way. A pre-1.0 `ops.npy` must hold `filelist`, `nframes`, `Ly`, `Lx`, `nplanes`, `iplane`, `frames_per_file`,
+`xoff` and `yoff`, or the folder is refused, naming what's missing. Its registration series and images go where 1.x's do; its
+other values go in `suite2p_settings`, except arrays of more than 1,000 elements (such as `regPC` or `tPC`), which are kept only in the
+byte-exact `ops.npy` archive. `combined/` of a pre-1.0 run is archived but not checked against the planes. A folder with neither
+`db.npy` nor `ops.npy`, or a 1.x folder without `settings.npy` or `reg_outputs.npy`, is refused.
+
+Every plane folder needs its registered movie, `data.bin`, to prove its frame order; without it the conversion stops. Suite2p keeps
+it unless `delete_bin` is set, sometimes on a separate fast disk, so it may have to be put back in the plane folder. The rebuild of
+registered frames follows Suite2p 1.1. No real pre-1.0 output has been checked: if its nonrigid interpolation differs, the mapping
+gate refuses the run rather than converting it.
+
 ### What the file holds
 
 Each field gets its own `ImagingPlane`, `PlaneSegmentation`, response series, registration series and summary images, named for
@@ -151,6 +166,24 @@ the folder several have in common (`ROI01_z1/suite2p/plane0/...`).
 
 The frame mapping runs for every field: the first, middle and last frame of each file holding it, with the same thresholds and
 controls as for planes, and each sample records its field, plane, ROI, folder and input.
+
+### Measured on the 3-ROI test session, two fields
+
+Suite2p 1.1.0 (Python 3.12.15, torch 2.15.0+cu132, the 6 GB GTX 1660 Ti) ran the lab's way, once per split folder, with the
+single-ROI run's settings, `fs` 14.3017 (the session's `scanVolumeRate`) and `registration.batch_size` 200, because 500 ran out of
+GPU memory on 512 x 512 frames. Shifts are estimated frame by frame (`smooth_sigma_time` 0), so the batch size changes only how many
+frames go to the GPU at a time and the summation order of the mean image. `ROI01_z1` and `ROI02_z1` finished (311 and 335 ROIs, 63,483
+frames each); `ROI03_z1` didn't, so no whole-session file was written here. Against the original stack, each finished folder was
+placed in its field by its split file names, passed the per-field load checks, and passed the mapping gate at all 96 samples (the
+first, middle and last frame of each of 32 files), with the stack rows clipped as the splitter copies them:
+
+| Field | Matching RMSE | Smallest ±1 control | Smallest control / max(match, 0.01) | F match | Smallest F control | Time offset |
+|---|---:|---:|---:|---:|---:|---:|
+| Plane0Roi1 | 0.00195–0.00756 | 46.38 | 4,638 | 0.0000015–0.0000028 | 6.77 | 0 ms |
+| Plane0Roi2 | 0.00276–0.00781 | 38.49 | 3,849 | 0.0000013–0.0000025 | 6.07 | 22.312 ms |
+
+These are intensity RMSEs, not time errors. Plane0Roi2's frames start 22.311936 ms after Plane0Roi1's, its first row times the
+line period; the split copies' own times put it 1 ms later.
 
 ## Session measurements
 

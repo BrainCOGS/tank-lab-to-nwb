@@ -105,53 +105,58 @@ def prove_frame_mapping(acquisition, roots):
     pages are its rows of the stack, or its split pages, or, when Suite2p read the lab's split copies of the given stack,
     those rows as the splitter copies them.
     """
-    from .suite2p import _relative, match_planes, source_base
+    from .suite2p import match_planes, source_base
 
     base = source_base(roots)
+    return [sample for plane in match_planes(roots, acquisition) for sample in prove_plane(acquisition, plane, base)]
+
+
+def prove_plane(acquisition, plane, base):
+    """prove_frame_mapping for one Suite2pPlane. `base` is what its folder is named relative to."""
+    from .suite2p import _relative
+
+    field, folder, meta = plane.field, plane.folder, plane.meta
+    reg, settings, allow_overlap = meta["reg_outputs"], meta["registration"], meta["allow_overlap"]
+    stat = np.load(folder / "stat.npy", allow_pickle=True)
+    traces = np.load(folder / "F.npy", mmap_mode="r")
+    count = field.frame_indices.size
+    if not (folder / "data.bin").exists():
+        raise ValueError(f"{field.label}: no registered movie, data.bin, in {folder}, so its frame order can't be proven. Suite2p keeps it unless delete_bin is set, sometimes on a separate fast disk; put it in the plane folder")
+    expected_bytes = count * field.shape[0] * field.shape[1] * 2
+    if (folder / "data.bin").stat().st_size != expected_bytes:
+        raise ValueError(f"{field.label}: registered movie frame count differs")
+    movie = np.memmap(folder / "data.bin", mode="r", dtype="int16", shape=(count, *field.shape))
     evidence = []
-    for plane in match_planes(roots, acquisition):
-        field, folder = plane.field, plane.folder
-        reg = np.load(folder / "reg_outputs.npy", allow_pickle=True).item()
-        all_settings = np.load(folder / "settings.npy", allow_pickle=True).item()
-        settings = all_settings["registration"]
-        allow_overlap = all_settings.get("extraction", {}).get("allow_overlap", False)
-        stat = np.load(folder / "stat.npy", allow_pickle=True)
-        traces = np.load(folder / "F.npy", mmap_mode="r")
-        count = field.frame_indices.size
-        expected_bytes = count * field.shape[0] * field.shape[1] * 2
-        if (folder / "data.bin").stat().st_size != expected_bytes:
-            raise ValueError(f"{field.label}: registered movie frame count differs")
-        movie = np.memmap(folder / "data.bin", mode="r", dtype="int16", shape=(count, *field.shape))
-        for i in sample_positions(field):
-            errors = {}
-            for delta in (-1, 0, 1):
-                if not 0 <= i + delta < count:
-                    continue
-                raw = suite2p_input(acquisition, plane, [i + delta])[0]
-                predicted = reconstruct_frame(raw, reg, settings, i)
-                diff = predicted.astype("float64") - movie[i]
-                errors[str(delta)] = float(np.sqrt(np.mean(diff**2)))
-            if not is_separated(errors, limit=2):
-                raise ValueError(f"{field.label}, frame {i}: frame mapping not demonstrated: {errors}")
-            trace_errors = _trace_errors(movie, np.asarray(traces[:, i]), stat, allow_overlap, i) if len(stat) else None
-            if trace_errors is not None and not is_separated(trace_errors, limit=0.01):
-                raise ValueError(f"{field.label}, frame {i}: traces don't match the registered movie: {trace_errors}")
-            file_index = int(field.file_index[i])
-            evidence.append(
-                dict(
-                    field=field.label,
-                    plane=int(field.plane),
-                    roi=int(field.number),
-                    folder=_relative(folder, base),
-                    input=plane.input,
-                    frame=int(i),
-                    tiff_frame=int(field.frame_indices[i]),
-                    file_index=file_index,
-                    file=acquisition.files[file_index].name,
-                    # Every ROI at a depth has the same pages in its split files, so the frame table's page is this one's too.
-                    page_index=int(acquisition.frames["page_index"][field.frame_indices[i]]),
-                    rmse=errors,
-                    trace_rmse=trace_errors,
-                )
+    for i in sample_positions(field):
+        errors = {}
+        for delta in (-1, 0, 1):
+            if not 0 <= i + delta < count:
+                continue
+            raw = suite2p_input(acquisition, plane, [i + delta])[0]
+            predicted = reconstruct_frame(raw, reg, settings, i)
+            diff = predicted.astype("float64") - movie[i]
+            errors[str(delta)] = float(np.sqrt(np.mean(diff**2)))
+        if not is_separated(errors, limit=2):
+            raise ValueError(f"{field.label}, frame {i}: frame mapping not demonstrated: {errors}")
+        trace_errors = _trace_errors(movie, np.asarray(traces[:, i]), stat, allow_overlap, i) if len(stat) else None
+        if trace_errors is not None and not is_separated(trace_errors, limit=0.01):
+            raise ValueError(f"{field.label}, frame {i}: traces don't match the registered movie: {trace_errors}")
+        file_index = int(field.file_index[i])
+        evidence.append(
+            dict(
+                field=field.label,
+                plane=int(field.plane),
+                roi=int(field.number),
+                folder=_relative(folder, base),
+                input=plane.input,
+                frame=int(i),
+                tiff_frame=int(field.frame_indices[i]),
+                file_index=file_index,
+                file=acquisition.files[file_index].name,
+                # Every ROI at a depth has the same pages in its split files, so the frame table's page is this one's too.
+                page_index=int(acquisition.frames["page_index"][field.frame_indices[i]]),
+                rmse=errors,
+                trace_rmse=trace_errors,
             )
+        )
     return evidence
