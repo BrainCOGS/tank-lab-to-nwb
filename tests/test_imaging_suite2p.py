@@ -1,6 +1,7 @@
 """Synthetic Suite2p output: all coordinates and counts are deliberately small."""
 
 import hashlib
+import shutil
 import json
 
 import h5py
@@ -206,7 +207,8 @@ def test_empty_plane_is_refused(log, tiffs, run):
     from dataclasses import replace
 
     prepared = prepare_session(log, tiffs, file="session.mat")
-    empty = replace(prepared.acquisition, frames={k: v[:0] for k, v in prepared.acquisition.frames.items()})
+    fields = tuple(replace(f, frame_indices=f.frame_indices[:0], file_index=f.file_index[:0], data_offset=f.data_offset[:0], timestamps=f.timestamps[:0]) for f in prepared.acquisition.fields)
+    empty = replace(prepared.acquisition, frames={k: v[:0] for k, v in prepared.acquisition.frames.items()}, fields=fields)
     with pytest.raises(ValueError, match="empty plane"):
         load_suite2p(run, replace(prepared, acquisition=empty))
 
@@ -441,7 +443,8 @@ def test_verify_catches_a_changed_companion_record(tmp_path, log, tiffs, run, ra
         verify_suite2p(prepared, output, run, tiffs, companion=expected)
 
 
-def test_a_multi_roi_session_is_refused_for_now(tmp_path, log, run):
+def test_a_whole_page_run_of_a_multi_roi_session_is_refused(tmp_path, log, run):
+    """Suite2p plane folders of another acquisition, or of whole pages holding several ROIs, can't be placed in its fields."""
     folder = tmp_path / "stack"
     folder.mkdir()
     rois = [dict(rows=3), dict(rows=3)]
@@ -453,7 +456,13 @@ def test_a_multi_roi_session_is_refused_for_now(tmp_path, log, run):
         if frame <= 801:
             packets.setdefault(frame, []).append((time, (1, 1, iteration)))
     stack = write_stack(folder, 801, rois, frames_per_file=300, packets=packets)
-    with pytest.raises(ValueError, match="multi-ROI"):
+    with pytest.raises(ValueError, match="plane 0"):
+        convert_suite2p(log, stack, run, tmp_path / "out.nwb", file="session.mat")
+    for plane in (0, 1):
+        path = run / f"plane{plane}/db.npy"
+        np.save(path, {**np.load(path, allow_pickle=True).item(), "file_list": [str(p) for p in stack], "nplanes": 1, "iplane": 0})
+    shutil.rmtree(run / "plane1")
+    with pytest.raises(ValueError, match="2 ROIs.*lines"):
         convert_suite2p(log, stack, run, tmp_path / "out.nwb", file="session.mat")
 
 
@@ -552,6 +561,7 @@ def test_a_plane_with_no_pages_in_the_last_file_is_still_checked(tmp_path, log):
         where.mkdir(parents=True)
         movie = np.stack([frame_pixels(i) for i in range(plane + 1, 8, 2)])
         movie.tofile(where / "data.bin")
+        np.save(where / "db.npy", dict(nplanes=2, iplane=plane, file_list=[str(p) for p in tiffs], nframes=count, Ly=3, Lx=4))
         np.save(where / "reg_outputs.npy", dict(xoff=np.zeros(count, dtype="int64"), yoff=np.zeros(count, dtype="int64")))
         np.save(where / "settings.npy", dict(registration=dict(do_bidiphase=False, nonrigid=False)))
         np.save(where / "stat.npy", [dict(xpix=np.array([2]), ypix=np.array([1]), lam=np.array([0.5], dtype="float32"))])
