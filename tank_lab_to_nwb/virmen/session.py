@@ -171,6 +171,8 @@ class _Normalizer:
     def fixed_array(self, field, value, row=None):
         """A value of a fixed-width field as a 1-D array of that width."""
         width = field.shape[0]
+        if _is_empty(value) and value is not ABSENT and field.transform == "empty_to_missing":
+            return np.full(width, np.nan)
         if not isinstance(value, np.ndarray):
             self.fail(field.path, f"expected {width} values, got {value!r}", row)
         flat = value.ravel()
