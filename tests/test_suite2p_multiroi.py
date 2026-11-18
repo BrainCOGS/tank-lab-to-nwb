@@ -2,6 +2,7 @@
 
 import json
 import shutil
+from pathlib import Path
 
 import h5py
 import numpy as np
@@ -476,6 +477,25 @@ class TestPre10Layout:
             ("plane2", "Plane0Roi3", "pre-1.0"),
         ]
         prove_frame_mapping(read_acquisition(stack), root)
+
+    @pytest.mark.parametrize(
+        "prefix",
+        ["//server/share/session/{folder}\\", "Z:\\session\\{folder}\\", "C:/session/{folder}/"],
+        ids=["unc-then-backslash", "drive-backslashes", "drive-slashes"],
+    )
+    def test_split_runs_recorded_on_windows_map(self, tmp_path, stack, split, prefix):
+        """A run on a Windows rig records its file list with backslashes, sometimes after a forward-slash share path."""
+        roots = [to_pre_1_0(root) for root in split_runs(tmp_path / "s2p", split, stack=stack)]
+        for root in roots:
+            path = root / "plane0/ops.npy"
+            ops = np.load(path, allow_pickle=True).item()
+            ops["filelist"] = [prefix.format(folder=root.parent.name) + Path(name).name for name in ops["filelist"]]
+            np.save(path, ops)
+        acquisition = read_acquisition(stack)
+        planes = match_planes(roots, acquisition)
+        assert [p.field.label for p in planes] == ["Plane0Roi1", "Plane0Roi2", "Plane0Roi3"]
+        assert all(p.split_copy for p in planes)
+        prove_frame_mapping(acquisition, roots)
 
     @pytest.mark.parametrize("key", ["filelist", "frames_per_file", "iplane", "xoff"])
     def test_ops_without_what_places_and_checks_the_plane_is_refused(self, tmp_path, stack, key):

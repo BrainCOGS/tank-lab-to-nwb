@@ -5,7 +5,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import numpy as np
 
@@ -152,7 +152,8 @@ def _split_names(names):
 
 def _field_for(where, number, db, acquisition):
     """The field a plane folder holds, and whether Suite2p read split copies of the given stack. Refuses anything ambiguous."""
-    names = [Path(name).name for name in db.get("file_list", [])]
+    # A run on a Windows rig records paths with backslashes, sometimes after a forward-slash share; take the name either way.
+    names = [PureWindowsPath(name).name for name in db.get("file_list", [])]
     try:
         split = _split_names(names)
     except ValueError as error:
