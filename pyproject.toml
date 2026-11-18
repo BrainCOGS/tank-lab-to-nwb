@@ -21,7 +21,7 @@ dependencies = [
     "ipywidgets",
     "isodate",
     "mat-io>=1.0.2",
-    "ndx-tank-metadata>=0.4.0",
+    "ndx-tank-metadata>=0.5.0",
     "neuroconv[kilosort,openephys,spikeglx]>=0.10.2",
     "notebook",
     "numpy",
@@ -77,6 +77,7 @@ filterwarnings = ["error::UserWarning"]
 constraint-dependencies = ["zarr<3"]
 
 [tool.uv.sources]
-# The schema expansion isn't released yet; this is its local worktree.
-ndx-tank-metadata = { path = "../../../../ndx-tank-metadata/.claude/worktrees/maze-extension-spec", editable = true }
+# 0.5.0 (the registry-generated schema, BrainCOGS/ndx-tank-metadata#2) isn't released yet, so install it from that
+# PR's branch. Switch to the PyPI release once it's out. To work on both at once, `uv pip install -e` a local checkout.
+ndx-tank-metadata = { git = "https://github.com/BrainCOGS/ndx-tank-metadata", branch = "tabedzki/feat/virmen-schema-expansion" }
 
