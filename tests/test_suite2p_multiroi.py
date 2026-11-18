@@ -497,6 +497,21 @@ class TestPre10Layout:
         assert all(p.split_copy for p in planes)
         prove_frame_mapping(acquisition, roots)
 
+    def test_a_one_plane_run_without_iplane_maps(self, tmp_path, stack, split):
+        """Pre-1.0 Suite2p leaves iplane out of a run with one plane and one ROI, where it can only be plane 0."""
+        roots = [to_pre_1_0(root) for root in split_runs(tmp_path / "s2p", split, stack=stack)]
+        for root in roots:
+            path = root / "plane0/ops.npy"
+            ops = np.load(path, allow_pickle=True).item()
+            del ops["iplane"]
+            np.save(path, ops)
+        acquisition = read_acquisition(stack)
+        planes = match_planes(roots, acquisition)
+        assert [p.field.label for p in planes] == ["Plane0Roi1", "Plane0Roi2", "Plane0Roi3"]
+        assert all(p.db["iplane"] == 0 for p in planes)
+        assert not any("iplane" in p.meta["settings"] for p in planes)  # settings stay as recorded
+        prove_frame_mapping(acquisition, roots)
+
     @pytest.mark.parametrize("key", ["filelist", "frames_per_file", "iplane", "xoff"])
     def test_ops_without_what_places_and_checks_the_plane_is_refused(self, tmp_path, stack, key):
         root = to_pre_1_0(stack_run(tmp_path / "s2p", stack))

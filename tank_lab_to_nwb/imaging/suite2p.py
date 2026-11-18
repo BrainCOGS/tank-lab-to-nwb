@@ -53,14 +53,18 @@ def read_plane(folder):
         )
     if (folder / "ops.npy").exists():
         ops = _npy(folder, "ops")
-        missing = [key for key in PRE_1_0_REQUIRED if key not in ops]
+        # Pre-1.0 Suite2p leaves iplane out of a run with one plane and one ROI, where plane0 is the only plane. The
+        # settings table keeps ops as recorded, without it.
+        one_field = ops.get("nplanes") == 1 and int(ops.get("nrois") or 1) == 1
+        missing = [key for key in PRE_1_0_REQUIRED if key not in ops and not (key == "iplane" and one_field)]
         if missing:
             raise ValueError(f"{folder}: a pre-1.0 Suite2p plane folder (ops.npy, no db.npy) whose ops lack {', '.join(missing)}, so it can't be placed and checked")
         reg = {key: ops[key] for key in (*REGISTRATION_SERIES, "meanImg", "meanImgE", "refImg", "meanImg_crop", "xrange", "yrange") if key in ops}
         detect = {key: ops[key] for key in ("max_proj", "Vcorr") if key in ops}
         db = dict(
             file_list=list(ops["filelist"]),
-            **{key: ops[key] for key in ("nframes", "Ly", "Lx", "nplanes", "iplane", "frames_per_file")},
+            **{key: ops[key] for key in ("nframes", "Ly", "Lx", "nplanes", "frames_per_file")},
+            iplane=ops.get("iplane", 0),
             **{key: ops.get(key) for key in ("nrois", "iroi", "lines", "dy", "dx")},
         )
         settings = {
