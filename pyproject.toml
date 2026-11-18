@@ -76,7 +76,7 @@ filterwarnings = ["error::UserWarning"]
 constraint-dependencies = ["zarr<3"]
 
 [tool.uv.sources]
-# 0.5.0 (the registry-generated schema, BrainCOGS/ndx-tank-metadata#2) isn't released yet, so install it from that
-# PR's branch. Switch to the PyPI release once it's out. To work on both at once, `uv pip install -e` a local checkout.
-ndx-tank-metadata = { git = "https://github.com/BrainCOGS/ndx-tank-metadata", branch = "tabedzki/feat/virmen-schema-expansion" }
+# 0.5.0 (the registry-generated schema) is released on GitHub but not yet on PyPI, so install it from its tag.
+# Drop this source once it's on PyPI. To work on both at once, `uv pip install -e` a local checkout.
+ndx-tank-metadata = { git = "https://github.com/BrainCOGS/ndx-tank-metadata", tag = "v0.5.0" }
 

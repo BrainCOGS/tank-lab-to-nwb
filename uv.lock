@@ -2016,7 +2016,7 @@ wheels = [
 [[package]]
 name = "ndx-tank-metadata"
 version = "0.5.0"
-source = { git = "https://github.com/BrainCOGS/ndx-tank-metadata?branch=tabedzki%2Ffeat%2Fvirmen-schema-expansion#afe2551286d3cf22ba4345d291051f0dc88f90ee" }
+source = { git = "https://github.com/BrainCOGS/ndx-tank-metadata?tag=v0.5.0#afe2551286d3cf22ba4345d291051f0dc88f90ee" }
 dependencies = [
     { name = "hdmf" },
     { name = "pynwb" },
@@ -3273,7 +3273,7 @@ requires-dist = [
     { name = "ipywidgets" },
     { name = "isodate" },
     { name = "mat-io", specifier = ">=1.0.2" },
-    { name = "ndx-tank-metadata", git = "https://github.com/BrainCOGS/ndx-tank-metadata?branch=tabedzki%2Ffeat%2Fvirmen-schema-expansion" },
+    { name = "ndx-tank-metadata", git = "https://github.com/BrainCOGS/ndx-tank-metadata?tag=v0.5.0" },
     { name = "neuroconv", extras = ["kilosort", "openephys", "spikeglx"], specifier = ">=0.10.2" },
     { name = "notebook" },
     { name = "numpy" },
