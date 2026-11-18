@@ -15,18 +15,22 @@ authors = [
     { name = "and Ben Dichter" },
 ]
 dependencies = [
+    "dandi>=0.82",
     "h5py",
-    "hdmf>=4",
+    "hdmf>=6.2",
     "ipywidgets",
     "isodate",
-    "ndx-tank-metadata>=0.2.0",
-    "neuroconv[kilosort,openephys,spikeglx]",
+    "mat-io>=1.0.2",
+    "ndx-tank-metadata>=0.5.0",
+    "neuroconv[kilosort,openephys,spikeglx]>=0.10.2",
     "notebook",
     "numpy",
     "nwbwidgets",
-    "pynwb>=3",
+    # mat-io needs pandas 3 (or pyarrow) to decode MATLAB tables.
+    "pandas>=3",
+    "pynwb>=4.2",
     "spikeinterface>=0.102.1",
-    "u19-pipeline[pipeline]",
+    "tifffile",
 ]
 
 requires-python = ">=3.12,<3.14"
@@ -61,10 +65,18 @@ dev = [
 
 
 [tool.pytest.ini_options]
-addopts = "--doctest-modules"
 testpaths = ["tests"]
+markers = ["corpus: reads the real ViRMEn logs named by the VIRMEN_CORPUS environment variable"]
+# hdmf casts to the declared dtype on write and only warns, so a silent cast fails the tests.
+filterwarnings = ["error::UserWarning"]
+
+[tool.uv]
+# neuroconv 0.10.2 needs the zarr 2 API at import (catalystneuro/neuroconv#2062). We write HDF5, so zarr only has to
+# import. Remove this once a neuroconv release includes the fix.
+constraint-dependencies = ["zarr<3"]
 
 [tool.uv.sources]
-ndx-tank-metadata = { path = "../ndx-tank-metadata-clean", editable = true }
-u19-pipeline = { path = "../U19-pipeline_python", editable = true }
+# 0.5.0 (the registry-generated schema) is released on GitHub but not yet on PyPI, so install it from its tag.
+# Drop this source once it's on PyPI. To work on both at once, `uv pip install -e` a local checkout.
+ndx-tank-metadata = { git = "https://github.com/BrainCOGS/ndx-tank-metadata", tag = "v0.5.0" }
 
