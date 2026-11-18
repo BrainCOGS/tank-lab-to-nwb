@@ -29,6 +29,7 @@ dependencies = [
     # mat-io needs pandas 3 (or pyarrow) to decode MATLAB tables.
     "pandas>=3",
     "pynwb>=4.2",
+    "scipy",
     "spikeinterface>=0.102.1",
     "tifffile",
 ]
