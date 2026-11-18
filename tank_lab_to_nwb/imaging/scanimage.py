@@ -727,20 +727,33 @@ def find_tiffs(folder):
     raise ScanImageError(f"{folder}: no TIFF files in it, in originalStacks, or in ROI folders")
 
 
-def _read_pages(acquisition, file_index, data_offset, shape):
-    """Pages by file and offset, in order, as (frames, rows, columns), read straight from the files."""
+def _read_pages(acquisition, file_index, data_offset, shape, keep=None):
+    """Pages by file and offset, in order, as (frames, rows, columns), read straight from the files.
+
+    `keep` is the (start, stop) row ranges to read from each page, joined top to bottom; all rows if None. Only those
+    bytes are read, so memory is what's returned, not whole pages.
+    """
     rows, columns = shape
+    keep = [(0, rows)] if keep is None else list(keep)
+    if any(not 0 <= start < stop <= rows for start, stop in keep):
+        raise ValueError(f"rows {keep} aren't within a page of {rows} rows")
     native = acquisition.dtype.newbyteorder("=")
-    frames = np.empty((len(file_index), rows, columns), dtype=native)
+    row_bytes = columns * acquisition.dtype.itemsize
+    frames = np.empty((len(file_index), sum(stop - start for start, stop in keep), columns), dtype=native)
     opened = {}
     try:
         for position, (file, offset) in enumerate(zip(file_index.tolist(), data_offset.tolist())):
             if file not in opened:
                 opened[file] = open(acquisition.files[file].path, "rb")
             handle = opened[file]
-            handle.seek(offset)
-            raw = np.frombuffer(handle.read(rows * columns * acquisition.dtype.itemsize), dtype=acquisition.dtype)
-            frames[position] = raw.reshape(rows, columns)
+            at = 0
+            for start, stop in keep:
+                handle.seek(offset + start * row_bytes)
+                block = handle.read((stop - start) * row_bytes)
+                if len(block) != (stop - start) * row_bytes:
+                    raise ScanImageError(f"{acquisition.files[file].name}: a page at byte {offset} ends early")
+                frames[position, at : at + stop - start] = np.frombuffer(block, dtype=acquisition.dtype).reshape(stop - start, columns)
+                at += stop - start
     finally:
         for handle in opened.values():
             handle.close()
@@ -756,12 +769,11 @@ def read_frames(acquisition, indices):
 def read_field(acquisition, field, positions):
     """The pixels of a field's frames at `positions`, as (frames, rows, columns)."""
     positions = np.asarray(positions, dtype=int)
-    pages = _read_pages(acquisition, field.file_index[positions], field.data_offset[positions], field.page_shape)
-    return pages[:, field.rows[0] : field.rows[1]]
+    return _read_pages(acquisition, field.file_index[positions], field.data_offset[positions], field.page_shape, keep=[field.rows])
 
 
 def read_flyback(acquisition, plane, positions):
     """The rows between a plane's ROIs at `positions` of that plane, joined top to bottom."""
     indices = acquisition.plane_frames(plane)[np.asarray(positions, dtype=int)]
-    pages = read_frames(acquisition, indices)
-    return np.concatenate([pages[:, start:stop] for start, stop in acquisition.layout.flyback_rows[plane]], axis=1)
+    frames = acquisition.frames
+    return _read_pages(acquisition, frames["file_index"][indices], frames["data_offset"][indices], acquisition.layout.frame_shape, keep=acquisition.layout.flyback_rows[plane])
