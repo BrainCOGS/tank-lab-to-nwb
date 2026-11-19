@@ -112,11 +112,18 @@ class SessionSync:
         return first / self.sync_stream.rate, later / self.sync_stream.rate
 
 
-def build_session_sync(session_folder, log_path, probes=None, sync_bin=None, every_seconds=30.0, session_date=None):
-    """Build the clock of one session from its raw folder and behavior log. `probes` limits the probes synced."""
+def build_session_sync(session_folder, log_path, probes=None, sync_bin=None, every_seconds=30.0, session_date=None, file=None):
+    """Build the clock of one session from its raw folder and behavior log. `probes` limits the probes synced.
+
+    `log_path` is a path or an already decoded log; `file` names the log in the NWB file when it's decoded.
+    """
     session_folder = Path(session_folder)
-    log = load_log(log_path)
-    session = normalize_log(log, file=Path(log_path))
+    if isinstance(log_path, (str, Path)):
+        file = file or Path(log_path)
+        log = load_log(log_path)
+    else:
+        log, log_path = log_path, file or "log"
+    session = normalize_log(log, file=file)
     if session_date is not None and str(session_date) < DIGITAL_WORD_SYNC_BEFORE:
         raise SessionSyncError(f"{session_folder}: recorded {session_date}, before {DIGITAL_WORD_SYNC_BEFORE}, when the sync used a digital-word frame counter. U19 refuses these sessions too ('Old sessions < 2022 not suported anymore'), and so does this converter.")
     offsets = {round(float(offset), 9) for offset in session.coverage.clock["offsets"]}

@@ -90,7 +90,7 @@ def _tsv(path, header, rows):
     path.write_text("\t".join(header) + "\n" + "".join("\t".join(str(v) for v in row) + "\n" for row in rows))
 
 
-def phy_folder(folder, kind="ks4", n_units=5, n_channels=8, rate=30000.0, seed=1, curated=False, with_cluster_info=None, with_pc_features=True, spikeinterface=False, ibl=False):
+def phy_folder(folder, kind="ks4", n_units=5, n_channels=8, rate=30000.0, seed=1, n_samples=300_000, curated=False, with_cluster_info=None, with_pc_features=True, spikeinterface=False, ibl=False):
     """A fake Kilosort/phy folder of the given kind. Returns (folder, expected per-unit spike samples, cluster ids).
 
     kind: "ks2" (SpikeInterface Kilosort 2.0.2 layout), "ks3" (MATLAB Kilosort 3, `kilosort_output`), "ks4" (python Kilosort 4).
@@ -99,7 +99,7 @@ def phy_folder(folder, kind="ks4", n_units=5, n_channels=8, rate=30000.0, seed=1
     folder.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
     cluster_ids = np.arange(n_units) * 2  # gaps, as after merges in phy
-    trains = {int(c): np.sort(rng.choice(np.arange(10, 300_000), size=int(rng.integers(20, 200)), replace=False)).astype(np.uint64) for c in cluster_ids}
+    trains = {int(c): np.sort(rng.choice(np.arange(10, n_samples), size=int(rng.integers(20, 200)), replace=False)).astype(np.uint64) for c in cluster_ids}
     times = np.concatenate(list(trains.values()))
     clusters = np.concatenate([np.full(len(v), c, dtype=np.int32) for c, v in trains.items()])
     order = np.argsort(times, kind="stable")
@@ -151,7 +151,7 @@ def phy_folder(folder, kind="ks4", n_units=5, n_channels=8, rate=30000.0, seed=1
 DATA = Path(__file__).parent / "data" / "ephys"
 
 
-def imec_files(session_folder, probe, meta_name="np1.ap.meta", n_samples=3000, sync=None, run="run_g0", with_tcat_lf=False, first_sample=1000):
+def imec_files(session_folder, probe, meta_name="np1.ap.meta", n_samples=3000, sync=None, run="run_g0", with_tcat_lf=False, first_sample=1000, rate=None):
     """A probe folder as SpikeGLX writes it: `<run>_imec<N>/<run>_t0.imec<N>.ap.bin` with a real meta file's keys.
 
     `sync` is the SY column (int16, n_samples long), zero if None. `with_tcat_lf` adds a CatGT `tcat` LF file beside it,
@@ -161,6 +161,8 @@ def imec_files(session_folder, probe, meta_name="np1.ap.meta", n_samples=3000, s
     meta = dict(line.split("=", 1) for line in (DATA / meta_name).read_text().splitlines() if "=" in line)
     meta.pop("fileSHA1", None)
     meta["firstSample"] = str(first_sample)
+    if rate is not None:
+        meta["imSampRate"] = repr(rate)
     # neo names the stream from the meta's fileName, the name SpikeGLX gave the file.
     meta["fileName"] = f"D:/{run}/{run}_imec{probe}/{run}_t0.imec{probe}.ap.bin"
     columns = [np.zeros(n_samples, dtype=np.int16)] * 384 + [np.zeros(n_samples, dtype=np.int16) if sync is None else sync.astype(np.int16)]
