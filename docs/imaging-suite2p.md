@@ -1,0 +1,284 @@
+# Suite2p results on the behavior clock
+
+The converter takes a trusted Suite2p output folder, the TIFFs of one acquisition, and its ViRMEn log. It reads Suite2p
+with NumPy; Suite2p and torch are not converter dependencies. Object NPY files contain pickle and must come from a
+trusted run. Nothing uploads.
+
+```
+python -m tank_lab_to_nwb.imaging.convert_suite2p LOG.mat SUITE2P_DIR OUTPUT_DIR TIFF [TIFF ...] [--extra-suite2p DIR ...] [--raw-nwb RAW.nwb] [--allow-incomplete]
+```
+
+`SUITE2P_DIR` is the folder holding `plane0`, `plane1`... A multi-ROI session processed the lab's way has one such folder per
+split ROI folder; give the others with `--extra-suite2p` (see [Multi-ROI sessions](#multi-roi-sessions)). A TIFF argument can be a
+folder, read as `convert_session` reads it.
+
+The output is `OUTPUT_DIR/staging/suite2p.nwb`, with a report beside it. Organize it using
+`virmen.layout.organize_for_dandi(staging, dandiset, description="suite2p")` before local DANDI validation. It can share a
+dandiset with the raw file, named with `description="rawtiff"`: the two get the same subject and session and differ by `desc-`.
+
+The two files are tied together by what was recorded, not by a derived ID. Both carry the same `subject_id`, `session_id` and
+`session_start_time`, and the same ScanImage record in `processing/ophys`: `scanimage.epoch`, the TIFF names and page counts, and
+every frame's number and time. With `--raw-nwb`, this converter checks all of those against the raw file, plus every frame's
+session time and each field's frame times, refusing the file if any differs, and records its NWB identifier and SHA256 in its `companion.rawtiff.*` rows.
+The raw file can't name this one, because it's written first.
+
+## Alignment and what it means
+
+`prepare_session` supplies the normalized behavior, frame times, session-start shift, in-progress trial, frame labels,
+I2C packets and fit provenance. The raw converter and its tests are unchanged. The processed and raw NWB files describe
+the same acquisition and behavior on the same clock; the processed file does not duplicate raw pixels.
+
+Every response series uses its field's times, `prepared.field_times(field)`: the frame times of its plane, plus, for a ROI
+below the top of a multi-ROI page, the time to scan down to its first row. Neither `fs` nor a volume-average time supplies
+timestamps. A partial last volume therefore produces unequal series lengths. Bad frames are retained,
+with their original flags and samples. All ROIs are retained, including ones classified as noncells.
+
+The clock fit is described in [imaging-timing.md](imaging-timing.md). Residuals measure packet scatter around a line,
+not frame-time error. The constant I2C send latency is unmeasured, and the ViRMEn source sets no upper bound on it.
+Timestamps mark frame starts; scanning within a frame and display latency remain separate limitations.
+
+## Establishing the frame order
+
+Matching trace lengths is necessary but does not establish frame identity. Before writing, the converter reconstructs
+registered frames from raw TIFF pages using the saved rigid and nonrigid offsets. It samples the first, middle and last
+frame of **every file for every plane**, including the first and last session frames and both sides of file boundaries.
+The evidence records the raw global frame, file, page, Suite2p frame and reconstruction RMSE.
+
+The reconstruction follows the Suite2p 1.1 registration implementation: signed `int16` pixels are unchanged before
+registration; unsigned `uint16` pixels are integer-divided by two. A rigid shift rolls by `(-yoff, -xoff)`. Nonrigid
+block shifts are bilinearly expanded with aligned corners, border-padded, and used for bilinear image sampling with
+border replication. The final integer conversion truncates toward zero. Normalization for estimating offsets is not
+an intensity scaling of saved frames. NumPy/SciPy reconstruction can differ from CUDA interpolation at integer rounding
+boundaries; its RMSE is measured separately from the byte-exact NWB round trip.
+
+The same samples tie the traces to those frames. `F.npy` at frame `i` must equal what Suite2p's extraction gives on registered frame
+`i`: each ROI's normalized `lam` over its pixels, leaving out `overlap` pixels unless `allow_overlap` is set. The RMSE must be at
+most 0.01, and registered frames `i-1` and `i+1` must be more than ten times worse. A sampled frame where no ROI has a value isn't
+measured.
+
+`Fneu` and `spks` aren't recomputed during conversion, because that would need Suite2p's own neuropil masks and deconvolution. They were
+checked once on the measured run using Suite2p's code, on planes 0 and 4: `Fneu` at 12 random frames per plane matches what its
+`create_masks` gives on the registered frame, at RMSE below 0.000001, against 47.6 to 66.2 for neighboring frames. `spks` for about 40 ROIs per
+plane matches its `preprocess` and `oasis` on `F - 0.7 x Fneu`, at RMSE 0.000005 or less, against 22.1 and 43.6 when shifted a frame.
+
+For each sampled registered frame, neighboring raw pages **within that plane** (`i-1` and `i+1`) are transformed with
+the same target-frame offsets. Each available control must have more than ten times the reconstruction RMSE (with a
+0.01-unit floor), and the reconstruction RMSE must be at most two intensity units. Failure stops conversion. This is
+sampled evidence throughout the session, not a claim that every registered frame was pixel-checked. Neither a
+behavior/activity correlation nor a successful NWB validator proves frame identity.
+
+Current reconstruction deliberately refuses bidiphase correction, two-pass registration, unsupported pixel types, and
+nonrigid grids with only one block on an axis. Empty planes, missing files, frame-count mismatches and invalid masks
+also stop conversion. Zero-ROI planes retain an empty segmentation and their source arrays without inventing traces.
+
+## NWB representation and inventory
+
+`processing/ophys` contains one `PlaneSegmentation` linked to one `ImagingPlane` per plane, all ROIs in source order,
+`iscell` and `cell_probability` columns, and `Fluorescence`, `Neuropil` and `Deconvolved` interfaces. Deconvolution values
+are activity estimates, not measured spike counts. Masks use `(x=column, y=row, weight)`. Summary images transpose
+`(row,column)` to `(x,y)`, matching the raw `TwoPhotonSeries` convention. `summary_image_coordinates` records each
+image's full-frame origin and dimensions. Subtract its origin before indexing a cropped image with full-frame mask
+coordinates; images are not silently padded or masks shifted.
+
+Registration series preserve `xoff`, `yoff`, `corrXY`, `xoff1`, `yoff1`, `corrXY1`, `badframes` and `badframes0`, each with
+its plane's timestamps. `meanImg`, `meanImgE`, `refImg`, `meanImg_crop`, `max_proj` and `Vcorr` are also standard images.
+The source inventory records the original relative path, SHA256 and scratch dataset of every nonmovie artifact.
+`suite2p_settings` also exposes every original setting and version as text, including the unchanged bidiphase decision.
+
+Every source artifact except per-plane `data.bin` is stored **byte-for-byte** as compressed `uint8` scratch data. This
+includes all NPY files, every `Fall.mat`, root metadata and logs, and the whole `combined/` folder. Combined is retained
+only as a source artifact; its padded traces never supply response-series samples. This costs space but preserves
+fields without an NWB semantic equivalent, native dtypes and even duplicate fields that disagree between files.
+To recover an artifact, write the named scratch dataset's bytes to the inventory's relative path. Object NPY files
+still need a trusted pickle reader. The adjacent report inventories every NPY dictionary key and every `stat` key.
+
+The measured run's `stat` keys are listed below. Each also has a `stat_*` text column containing its original
+scalar or array value as JSON with NaN literals; the artifact retains the exact native dtype and NaN representation.
+All `F`, `Fneu`, `spks`, `iscell`, registration/detection dictionaries, `ops`, `db`, settings/version, `zcorr`,
+`regPC`, `tPC`, `regDX`, and processing times remain in their native source artifacts even when also represented
+semantically. `data.bin` is the only excluded data: its registered pixels remain external, and its sampled frame
+identity evidence is stored as `scratch/suite2p_frame_mapping`.
+
+Before PyNWB sees masks, flags or traces, the converter checks their numeric conversion with the existing exact
+coercion rules. No new missing sentinel is introduced. Float32 conversion has tolerance zero. Tests run with
+`error::UserWarning`. A separate verification path rereads NPY files, TIFF descriptions and HDF5 datasets; it checks
+behavior, provenance, times, traces, masks, stat values, images, registration values and every archived artifact byte.
+A mismatch raises rather than being rounded away.
+
+## Multi-ROI sessions
+
+A multi-ROI (mesoscope) acquisition has several fields, one per ROI and plane, and each Suite2p plane folder holds one of
+them. Which one is decided from what Suite2p recorded in that folder's `db.npy`, never from folder order alone.
+
+### How the lab runs Suite2p on them
+
+In U19-pipeline-python, the MATLAB `TiffSplit` step writes one `ROI<r>_z<d>` folder per ROI and depth, each folder becomes its
+own recording process, and the Suite2p job (`automatic_job/suite2p_slurm_job.py`, settings from element-calcium-imaging's
+`suite2p_settings.build_suite2p_inputs`) runs Suite2p 1.1 on that folder's files, with `nplanes`, `nchannels` and `fs` from
+its ScanInfo. So each split folder has its own Suite2p output, `.../suite2p/plane0`. The settings builder also accepts
+Suite2p's own multi-ROI keys, `lines`, `dy` and `dx`, which crop each ROI's rows from the original pages (the 0.x `mesoscan`
+key no longer exists). Both are converted:
+
+| Suite2p read | Converter given | Each plane folder's field comes from | Registered frames rebuilt from |
+|---|---|---|---|
+| Split folders, one run each (the lab's way) | The original stack (preferred) | The split file names: the stack's stem, the ROI number, and the depth, with one file per stack file | The field's rows of the stack, negatives set to 0 in uint16 as the splitter copies them, then halved as Suite2p reads uint16 |
+| Split folders, one run each | The split folders (`--allow-incomplete` when they kept no ScanImage settings) | The exact list of the field's split files | The split pages, halved |
+| The original stack, with `lines` | The original stack | `iplane`, and `lines` equal to one ROI's rows on that plane | The stack rows, unchanged `int16` |
+| The original stack, whole pages | The original stack, one ROI per plane | `iplane` | The pages |
+
+Giving the stack is better wherever it exists: its fields' times include the scan time down to each ROI's first row, while the
+split copies carry the splitter's rounded times and its lag, which understates that time (see
+[imaging-timing.md](imaging-timing.md#multi-roi-imaging)). The splitter's copy is checked rather than assumed, by the frame
+mapping below: a run whose pixels weren't the clipped rows fails it.
+
+Refused, each with an error naming the folder: a plane folder whose `file_list` differs from the given TIFFs or their split
+copies, or mixes original and split names, or several ROIs or depths; a run over one split folder with more than one plane or
+with `lines`; `lines` that aren't one block of rows equal to a ROI's; whole pages of a plane holding several ROIs; a folder
+number other than `iplane x nrois + iroi`; a plane folder missing from, or extra to, what its `db.npy` describes, or named
+`plane*` without a number; any field held by no folder or by two; the same or nested Suite2p folders given twice; split runs
+of a stack whose planes aren't in ascending z, since the splitter numbers depths that way; and a stack run against split TIFFs,
+which have lost the stack's page layout. Frame counts, frames per file, frame shape and trace lengths are then checked per field.
+
+### Suite2p before 1.0
+
+Suite2p 1.x writes `db.npy`, `settings.npy`, `reg_outputs.npy` and `detect_outputs.npy` in each plane folder. Before 1.0 it kept
+all of that in one flat `ops.npy`, with the file list as `filelist`. Both are read (`suite2p.read_plane`), and placed and
+checked the same way. A pre-1.0 `ops.npy` must hold `filelist`, `nframes`, `Ly`, `Lx`, `nplanes`, `iplane`, `frames_per_file`,
+`xoff` and `yoff`, or the folder is refused, naming what's missing. Its registration series and images go where 1.x's do; its
+other values go in `suite2p_settings`, except arrays of more than 1,000 elements (such as `regPC` or `tPC`), which are kept only in the
+byte-exact `ops.npy` archive. `combined/` of a pre-1.0 run is archived but not checked against the planes. A folder with neither
+`db.npy` nor `ops.npy`, or a 1.x folder without `settings.npy` or `reg_outputs.npy`, is refused.
+
+Every plane folder needs its registered movie, `data.bin`, to prove its frame order; without it the conversion stops. Suite2p keeps
+it unless `delete_bin` is set, sometimes on a separate fast disk, so it may have to be put back in the plane folder. The rebuild of
+registered frames follows Suite2p 1.1. No real pre-1.0 output has been checked: if its nonrigid interpolation differs, the mapping
+gate refuses the run rather than converting it.
+
+### What the file holds
+
+Each field gets its own `ImagingPlane`, `PlaneSegmentation`, response series, registration series and summary images, named for
+the field: `ImagingPlane0Roi2`, `PlaneSegmentation0Roi2`, `Fluorescence/Plane0Roi2`, `Plane0Roi2_xoff`, `SummaryImages0Roi2`,
+as the raw file's `TwoPhotonSeriesPlane0Roi2`. A session with one ROI per plane keeps the plane names (`PlaneSegmentation0`,
+`Fluorescence/Plane0`). An imaging plane of a multi-ROI field carries its ROI's grid spacing and `origin_coords`, as in the raw file.
+`processing/ophys/suite2p_fields` lists each field's plane, ROI number and name, rows, time offset, Suite2p folder and the
+pixels Suite2p read. Settings keys and source paths start with the plane folder, relative to the given Suite2p folder, or to
+the folder several have in common (`ROI01_z1/suite2p/plane0/...`).
+
+The frame mapping runs for every field: the first, middle and last frame of each file holding it, with the same thresholds and
+controls as for planes, and each sample records its field, plane, ROI, folder and input.
+
+### Measured on the 3-ROI test session, two fields
+
+Suite2p 1.1.0 (Python 3.12.15, torch 2.15.0+cu132, the 6 GB GTX 1660 Ti) ran the lab's way, once per split folder, with the
+single-ROI run's settings, `fs` 14.3017 (the session's `scanVolumeRate`) and `registration.batch_size` 200, because 500 ran out of
+GPU memory on 512 x 512 frames. Shifts are estimated frame by frame (`smooth_sigma_time` 0), so the batch size changes only how many
+frames go to the GPU at a time and the summation order of the mean image. `ROI01_z1` and `ROI02_z1` finished (311 and 335 ROIs, 63,483
+frames each); `ROI03_z1` didn't, so no whole-session file was written here. Against the original stack, each finished folder was
+placed in its field by its split file names, passed the per-field load checks, and passed the mapping gate at all 96 samples (the
+first, middle and last frame of each of 32 files), with the stack rows clipped as the splitter copies them:
+
+| Field | Matching RMSE | Smallest ±1 control | Smallest control / max(match, 0.01) | F match | Smallest F control | Time offset |
+|---|---:|---:|---:|---:|---:|---:|
+| Plane0Roi1 | 0.00195–0.00756 | 46.38 | 4,638 | 0.0000015–0.0000028 | 6.77 | 0 ms |
+| Plane0Roi2 | 0.00276–0.00781 | 38.49 | 3,849 | 0.0000013–0.0000025 | 6.07 | 22.312 ms |
+
+These are intensity RMSEs, not time errors. Plane0Roi2's frames start 22.311936 ms after Plane0Roi1's, its first row times the
+line period; the split copies' own times put it 1 ms later.
+
+## Session measurements
+
+The clean run used Suite2p **1.1.0**, Python **3.12.15**, torch **2.15.0+cu132**, the GTX 1660 Ti, and the supplied
+configuration. Every per-plane settings dictionary matches that configuration without a changed field. Only output
+paths were redirected. The run started from all **45 TIFFs**, not existing binaries, and completed successfully in
+**1,382.52 s**, including TIFF conversion. GPU compute was idle before launch; over 800 GB of disk was free.
+
+The TIFFs contain **89,508 signed int16 frames**, each 300 rows by 512 columns. No uint16 halving applies: plane-0
+frame-0 reconstruction with unscaled pixels has RMSE **0.024206**, while halving these signed pixels gives
+**292.612127**. Both the interpolation and the final truncation to int16 are included in the reconstruction.
+
+The **675 samples** (135 per plane) include every file's first, middle and last frame. All passed the mapping gate;
+all **1,340 available ±1 controls** were worse. Matching RMSE spans **0.010520–0.026639** intensity units; controls span
+**754.697–939.568**. The smallest same-sample control/match ratio is **31,177.9**. These results support Suite2p frame
+`i` of plane `p` mapping to `acquisition.plane_frames(p)[i]` at the sampled positions throughout this acquisition.
+The intervening unsampled registered pixels were not individually checked.
+
+| Plane | Frames | All ROIs | Maximum matching RMSE | Minimum −1 control | Minimum +1 control |
+|---|---:|---:|---:|---:|---:|
+| 0 | 17,902 | 327 | 0.025643 | 771.649 | 754.697 |
+| 1 | 17,902 | 337 | 0.026639 | 798.140 | 799.994 |
+| 2 | 17,902 | 326 | 0.025259 | 801.822 | 794.642 |
+| 3 | 17,901 | 326 | 0.026393 | 813.851 | 808.412 |
+| 4 | 17,901 | 348 | 0.026270 | 827.527 | 825.642 |
+
+Every plane has 96 nonrigid blocks. `nframes`, all trace and offset lengths, both badframe vectors and TIFF plane
+counts agree; both badframe vectors are all false. For the first 44 files, every plane has 400 samples per file.
+The last file contributes 302 samples to planes 0–2 and 301 to planes 3–4. No sample is invented for the partial volume.
+`combined/` NPY traces, classifications, all stat keys, metadata and tiled images match the per-plane-derived view,
+including the final zero padding. Its MATLAB variables match those NPY values after MATLAB singleton/empty-value
+representation is accounted for. The extra combined `redcell` is a 1,664×2 all-zero placeholder; each per-plane
+`redcell` is empty (0×0). Combined holds no additional measured signal or ROI field.
+
+All 19 per-plane `stat` keys are preserved: `aspect_ratio`, `compact`, `footprint`, `lam`, `med`, `mrs`, `mrs0`, `npix`,
+`npix_norm`, `npix_norm_no_crop`, `npix_soma`, `overlap`, `radius`, `skew`, `snr`, `soma_crop`, `std`, `xpix`, `ypix`.
+Combined adds the derived `iplane`. The report inventories all native dictionary and MATLAB variable names.
+**71 nonmovie artifacts** are byte-exact in NWB scratch. The only omitted artifacts are the five registered `data.bin`
+movies (27,496,857,600 bytes total), which remain external. Every nonmovie Suite2p field is retained in the archive.
+
+All 675 samples also passed the trace link: `F` at frame `i` matches what's recomputed from registered frame `i` with RMSE
+**0.0000256–0.0000674**, and all **1,340** neighboring controls are **108.19–199.18**. These are intensity RMSEs, not time errors.
+
+The clock fit used **73,413 packets**, excluded **180 first-iteration packets**, and rejected **382** additional packets
+(0.5216% of eligible packets). Slope is **0.9999948645516386** (−5.13545 ppm), intercept **11.027272188700522 s**,
+and shifted clock offset **11.02732920000016 s**. Kept residual standard deviation is **1.051158 ms**;
+all-packet residual p1/p99 are **−1.785986 / +3.499372 ms**. These are packet scatter, not frame-time error.
+`session_start_time` moved back **10.244864 s**. Frame times span **0.000000381022–1,782.896587029 s**.
+The first plane times are **0.000000381, 0.019918908, 0.039837436, 0.059755968, 0.079674495 s**; each response series
+round-trips exactly against its own fitted TIFF times. No behavior-level activity sanity check was used as timing proof.
+
+The file has **1,949,976,431 bytes**, SHA256 `0ee1ab3bea6db23c3fbd3621f2a1cb446658beda1d0b354e11033bdf5de7215f`. The raw file it goes
+with has **18,266,980,032 bytes**, SHA256 `d923c30b6a7e99f82226bfa47557bb7f9e052a9892bdbc485bf9550336ecf369`, the value recorded in
+`companion.rawtiff.sha256`. Both are organized into one local stub dandiset, as `desc-rawtiff` and `desc-suite2p`, and these serial checks ran
+there:
+
+- `pynwb.validate`: **[]** on both files.
+- NWB Inspector **0.7.2**, via uvx on Python 3.13 with `--config dandi`: exit **0** on both, with **6** best-practice suggestions on the
+  raw file and **7** on this one, and no errors, critical findings or best-practice violations. The suggestions are missing keywords,
+  the `scanimage` and `in_progress_trial` module names, the all-NaN `easyBlock` and `trialID` columns, and single-row tables: epochs
+  on both, and `companion_files` here.
+- DANDI **0.82.0** `validate` on the dandiset: exit **0**, **No errors found.**
+- Full suite at this conversion's code: **478 passed, 9 skipped**. UserWarnings are errors in tests.
+
+The Inspector uvx environment pinned `h5py==3.13.0`, because the newest h5py has no wheel for this platform. No upstream package was changed.
+
+`registration.do_bidiphase=False` stays as configured on this bidirectionally scanned acquisition, by decision. Indicator, location `root`, and NaN wavelengths retain the raw converter's placeholders. The pending behavior
+field decisions were not changed. Biological validity of the ROI detection and deconvolution was not assessed.
+No data was uploaded.
+
+
+### Why the pre-existing run was not reused
+
+The initial plane-0/frame-0 reconstruction had RMSE **607.127904** intensity units; mapping its next same-plane raw
+page with the same offsets gave **662.818332**. Suite2p's own transform on CPU independently gave **607.127844** for
+the correct raw page, while the independent reconstruction differed from that CPU result by only **0.015729** RMSE.
+
+The saved log starts with `FOUND BINARIES AND DBS` and then runs registration on every plane. Further measurement
+found a mixed history in plane 0. At 98 of 135 samples (first, middle and last frame of each of the 45 files), applying
+the old saved transform to the fresh registered frame reproduces the old movie with RMSE **0.00920–0.01976**. At the
+remaining 37 samples, the old transform applied directly to raw reproduces it with RMSE **0.01693–0.02615**. None of
+these samples is unexplained by those alternatives. The transition is between adjacent zero-based frames **12,999 and 13,000**:
+
+| Plane-0 frame | Old transform applied to raw: RMSE | Fresh registration, then old transform: RMSE |
+|---|---:|---:|
+| 12,999 | 713.97584 | 0.01768 |
+| 13,000 | 0.01993 | 709.42511 |
+
+These are intensity RMSEs, not time errors. The sampled early pixels exhibit two registration transforms; the later
+ones exhibit one. An interrupted in-place first registration through the 13,000-frame boundary (26 batches of 500),
+followed by registration of the partially modified binary, explains the pattern. That execution history is an
+inference: the earlier process log is unavailable, and every old frame was not checked. At frame 0 of old planes 1–4,
+the direct raw reconstruction has RMSE **0.01052–0.02447**; those first frames do not show the plane-0 problem.
+
+The old fluorescence files remain untouched and were not declared corrupt. Sampled frame identity is supported by
+the one- or two-stage reconstructions, but mixed resampling changes plane 0's processing history. Its ROI and trace
+biological validity were not assessed. The saved offsets alone do not describe its early raw-to-registered mapping.
+A clean TIFF-based rerun was selected to establish one consistent registration history for this conversion.

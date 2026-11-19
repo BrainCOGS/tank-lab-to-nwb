@@ -1,0 +1,83 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tank-lab-to-nwb"
+# dynamic = ["version"]
+"version" = "0.4.0"
+description = "NWB conversion scripts and tutorials."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Luiz Tauffer", email = "ben.dichter@gmail.com" },
+    { name = "Cody Baker Szonja Weigl" },
+    { name = "and Ben Dichter" },
+]
+dependencies = [
+    "dandi>=0.82",
+    "h5py",
+    "hdmf>=6.2",
+    "ipywidgets",
+    "isodate",
+    "mat-io>=1.0.2",
+    "ndx-tank-metadata>=0.5.0",
+    "neuroconv[kilosort,openephys,spikeglx]>=0.10.2",
+    "notebook",
+    "numpy",
+    "nwbwidgets",
+    # mat-io needs pandas 3 (or pyarrow) to decode MATLAB tables.
+    "pandas>=3",
+    "pynwb>=4.2",
+    "scipy",
+    "spikeinterface>=0.102.1",
+    "tifffile",
+]
+
+requires-python = ">=3.12,<3.14"
+
+[project.urls]
+Homepage = "https://github.com/catalystneuro/tank-lab-to-nwb"
+
+# [tool.hatch.version]
+# path = "tank_lab_to_nwb/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/tank_lab_to_nwb",
+]
+
+[tool.ruff]
+# Allow lines to be as long as 120.
+line-length = 120
+
+[tool.ruff.lint]
+select = ["NPY201"]
+
+[dependency-groups]
+dev = [
+    "datajoint>=0.14.3",
+    "plotly>=5.13.1",
+    # "pynapple>=0.9.2",
+    "pytest>=8.4.1",
+    "ruff>=0.11.2",
+    "setuptools>=75.8.2",
+]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["corpus: reads the real ViRMEn logs named by the VIRMEN_CORPUS environment variable"]
+# hdmf casts to the declared dtype on write and only warns, so a silent cast fails the tests.
+filterwarnings = ["error::UserWarning"]
+
+[tool.uv]
+# neuroconv 0.10.2 needs the zarr 2 API at import (catalystneuro/neuroconv#2062). We write HDF5, so zarr only has to
+# import. Remove this once a neuroconv release includes the fix.
+constraint-dependencies = ["zarr<3"]
+
+[tool.uv.sources]
+# 0.5.0 (the registry-generated schema) is released on GitHub but not yet on PyPI, so install it from its tag.
+# Drop this source once it's on PyPI. To work on both at once, `uv pip install -e` a local checkout.
+ndx-tank-metadata = { git = "https://github.com/BrainCOGS/ndx-tank-metadata", tag = "v0.5.0" }
+

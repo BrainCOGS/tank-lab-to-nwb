@@ -1,27 +1,28 @@
 """Authors: Ben Dichter, Cody Baker."""
+
 import os
 import sys
+from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
 from shutil import which
 
 import numpy as np
-from datetime import datetime
-from scipy.io import loadmat, matlab
-from collections.abc import Iterable
 from pynwb import NWBFile
-
+from scipy.io import loadmat, matlab
 
 try:
     from typing import ArrayLike
 except ImportError:
+    from typing import Sequence, Union
+
     from numpy import ndarray
-    from typing import Union, Sequence
 
     # adapted from numpy typing
     ArrayLike = Union[bool, int, float, complex, list, ndarray, Sequence]
 
 
-def check_module(nwbfile, name, description=None):
+def check_module(nwbfile: NWBFile, name, description=None):
     """
     Check if processing module exists. If not, create it. Then return module.
 
@@ -33,11 +34,10 @@ def check_module(nwbfile, name, description=None):
 
     Returns
     -------
-    pynwb.module
-
+    pynwb.processing
     """
-    if name in nwbfile.modules:
-        return nwbfile.modules[name]
+    if name in nwbfile.processing:
+        return nwbfile.processing[name]
     else:
         if description is None:
             description = name
@@ -60,12 +60,21 @@ def find_discontinuities(tt, factor=10000):
 
 
 def mat_obj_to_dict(mat_struct):
-    """Recursive function to convert nested matlab struct objects to dictionaries."""
+    """Recursive function to convert nested matlab struct objects to dictionaries.
+    
+    Handles special cases like shapingProtocol and other mat_struct objects that don't 
+    convert cleanly by extracting string representations of function names.
+    """
     dict_from_struct = {}
-    for field_name in mat_struct.__dict__['_fieldnames']:
+    for field_name in mat_struct.__dict__["_fieldnames"]:
         dict_from_struct[field_name] = mat_struct.__dict__[field_name]
         if isinstance(dict_from_struct[field_name], matlab.mio5_params.mat_struct):
-            dict_from_struct[field_name] = mat_obj_to_dict(dict_from_struct[field_name])
+            # Try to convert nested mat_struct objects; if it fails, store as string representation
+            try:
+                dict_from_struct[field_name] = mat_obj_to_dict(dict_from_struct[field_name])
+            except (AttributeError, KeyError):
+                # For protocol functions and other unconvertible objects, extract string representation
+                dict_from_struct[field_name] = str(dict_from_struct[field_name])
         elif isinstance(dict_from_struct[field_name], matlab.MatlabFunction):
             dict_from_struct[field_name] = str(dict_from_struct[field_name])
         elif isinstance(dict_from_struct[field_name], np.ndarray):
@@ -90,8 +99,7 @@ def mat_obj_to_array(mat_struct_array):
 
 def has_struct(mat_struct_array):
     """Determines if a matlab cell array contains any mat objects."""
-    return any(
-        isinstance(mat_struct, matlab.mio5_params.mat_struct) for mat_struct in mat_struct_array)
+    return any(isinstance(mat_struct, matlab.mio5_params.mat_struct) for mat_struct in mat_struct_array)
 
 
 def convert_mat_file_to_dict(mat_file_name):
@@ -131,14 +139,11 @@ def create_indexed_array(ndarray):
 
     return flat_array, array_indices
 
-def create_and_store_indexed_array(ndarray, array_name, description, nwbfile):
 
+def create_and_store_indexed_array(ndarray, array_name, description, nwbfile: NWBFile):
     array_data, array_indices = create_indexed_array(ndarray)
 
-    nwbfile.add_trial_column(name=array_name,
-                            description=description,
-                            index=array_indices,
-                            data=array_data)
+    nwbfile.add_trial_column(name=array_name, description=description, index=array_indices, data=array_data)
 
 
 def flatten_nested_dict(nested_dict):
@@ -148,7 +153,7 @@ def flatten_nested_dict(nested_dict):
         if isinstance(v, dict):
             if v:
                 flatten_sub_dict = flatten_nested_dict(v).items()
-                flatten_dict.update({k2: v2 for k2, v2 in flatten_sub_dict})
+                flatten_dict.update(dict(flatten_sub_dict))
             else:
                 flatten_dict[k] = np.array([])
         else:
@@ -157,135 +162,15 @@ def flatten_nested_dict(nested_dict):
     return flatten_dict
 
 
-def convert_function_handle_to_str(mat_file_path):
-    """Executes a matlab script which converts function handle values to str
-     if matlab is installed on the system."""
-    matlab_class = '''
-    classdef Choice < uint32
 
-        enumeration
-            L(1)
-            R(2)
-            nil(inf)
-        end
 
-        methods (Static)
-            function choices = all()
-                choices = enumeration('Choice')';
-                choices = choices(1:end-1);
-            end
+def fetch_coowners(subject_fullname: str):
+    if subject_fullname is None:
+        return None
+    return (subject.SubjectCoowners() & f"subject_fullname = '{subject_fullname}' and active = 1").fetch("coowner")
 
-            function num = count()
-                num = numel(enumeration('Choice'));
-            end
-        end
 
-        methods
-            function opp = opposite(obj)
-                numValues   = numel(Choice.all());
-                assert(numValues == 2);     % the concept of "opposite" only works for sets of 2
-
-                flipped     = double(obj);
-                flipped     = numValues+1 - flipped;
-                opp         = obj;
-                sel         = opp >= 1 & opp <= numValues;
-                opp(sel)    = flipped(sel);
-            end
-        end
-
-    end
-    '''
-    matlab_code = r'''
-    str_func = char(log.version.code);
-    code_version = 'code_version.txt';
-    fid = fopen(code_version, 'wt');
-    fprintf(fid, str_func);
-    fclose(fid);
-
-    str_func = char(log.animal.protocol);
-    protocol = 'protocol.txt';
-    fid = fopen(protocol, 'wt');
-    fprintf(fid, str_func);
-    fclose(fid);
-
-    choice_data = [];
-    for i = 1 : size(log.block, 2)
-        for j = 1 : size(log.block(i).trial, 2)
-            choice_data = [choice_data; string(log.block(i).trial(j).choice)];
-        end
-    end
-
-    choice = 'trial_choice.txt';
-    fid = fopen(choice, 'wt');
-    fprintf(fid,'%s\n', choice_data);
-    fclose(fid);
-
-    trial_type_data = [];
-    for i = 1 : size(log.block, 2)
-        for j = 1 : size(log.block(i).trial, 2)
-            trial_type_data = [trial_type_data; string(log.block(i).trial(j).trialType)];
-        end
-    end
-
-    trial_type = 'trial_type.txt';
-    fid = fopen(trial_type, 'wt');
-    fprintf(fid,'%s\n', trial_type_data);
-    fclose(fid);
-
-    quit;
-    '''
-
-    with Path('Choice.m').open('w') as f:
-        f.write(matlab_class)
-
-    metadata = {}
-    convert_script_code = f"filePath = '{mat_file_path}';\nload(filePath);{matlab_code}"
-    convert_script_path = Path("convert_function_to_txt.m")
-
-    with convert_script_path.open('w') as f:
-        f.write(convert_script_code)
-
-    if 'win' in sys.platform and sys.platform != 'darwin':
-        matlab_cmd = '''
-                     #!/bin/bash
-                     matlab -nosplash -wait -log -r convert_function_to_txt
-                     '''
-    else:
-        matlab_cmd = '''
-                     #!/bin/bash
-                     matlab -nosplash -nodisplay -log -r convert_function_to_txt
-                     '''
-
-    if which('matlab') is not None:
-        try:
-            os.system(matlab_cmd)
-
-            with open("code_version.txt", "r") as f:
-                version = f.readline()
-            with open("protocol.txt", "r") as f:
-                protocol = f.readline()
-            with open("trial_choice.txt", "r") as f:
-                trial_choice = f.read().splitlines()
-            with open("trial_type.txt", "r") as f:
-                trial_type = f.read().splitlines()
-
-            metadata['experiment_name'] = version
-            metadata['protocol_name'] = protocol
-            metadata['trial_choice'] = trial_choice
-            metadata['trial_type'] = trial_type
-
-            os.remove("code_version.txt")
-            os.remove("protocol.txt")
-            os.remove("trial_choice.txt")
-            os.remove("trial_type.txt")
-
-        except Exception as e:
-            print(f"There was an error while trying to execute {convert_script_path}:\n{e}")
-    else:
-        raise Exception("A working matlab version was not found. "
-              "Code version, animal protocol, type of trial, and choice could not be saved to NWB.")
-
-    os.remove("Choice.m")
-    os.remove("convert_function_to_txt.m")
-
-    return metadata
+def fetch_owner(subject_fullname: str):
+    if subject_fullname is None:
+        return None
+    return (subject.Subject() & f"subject_fullname = '{subject_fullname}'").fetch()
