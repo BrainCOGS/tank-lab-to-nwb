@@ -1,283 +1,151 @@
-"""Authors: Cody Baker and Ben Dichter."""
+"""The neuroconv converter for a Towers-task session: ViRMEn behavior alone, or behavior with spike-sorted units.
 
-import warnings
+    source_data = {"VirmenData": {"file_path": <log.mat>}}                    # behavior, always
+    source_data["KilosortProbe0"] = {"folder_path": <sorter folder>}          # units of imec0; "Kilosort" is imec0 too
+    source_data["SpikeGLX"] = {"folder_path": <raw SpikeGLX run folder>}      # the clock, required with units
+    converter = TowersNWBConverter(source_data, sync_timestamps=None)
+    converter.run_conversion(nwbfile_path=..., metadata=converter.get_metadata(), overwrite=True)
+
+Behavior alone is a neuroconv conversion of `VirmenDataInterface`; `sync_timestamps`, one time per logged frame, moves
+it with `set_aligned_timestamps`. With units, `run_conversion` writes the file through the ephys converter
+(`tank_lab_to_nwb.ephys.convert_session.convert_to_file`, the code behind `python -m tank_lab_to_nwb.ephys.convert_session`):
+behavior and spikes on the recording's clock, rebuilt from the run folder's sync file (nidq or obx) and each probe's AP
+meta and SY channel (docs/ephys-timing.md), checked by reading the file back, with a report beside it. There
+`sync_timestamps` sets nothing: it must agree with the recomputed iteration times to one sync sample, and the report says
+it did. Every refusal of the ephys converter reaches the caller unchanged.
+
+Raw bands (SpikeGLXAP, SpikeGLXLFP) and imaging aren't written through this class.
+"""
+
 from pathlib import Path
-from typing import Optional, Union
 
-import numpy as np
-import spikeinterface.extractors as se
-
-# from neuroconv import NWBConverter, SpikeGLXRecordingInterface, SpikeGLXLFPInterface
 from neuroconv import NWBConverter
-from neuroconv.datainterfaces import (
-    SpikeGLXRecordingInterface,
-    Suite2pSegmentationInterface,
-    TiffImagingInterface,
+
+from ..ephys import convert_session
+from ..ephys.clock import ITERATION_TIME, PROBE_CLOCK
+from ..virmen.interface import VirmenDataInterface
+
+CLOCK_DEFAULTS = dict(probe_clock=PROBE_CLOCK, iteration_time=ITERATION_TIME, allow_virmen_borrowed=False, session_date=None)
+# NWBFile entries the units file takes from the caller's metadata, by the names virmen.convert.build_nwbfile uses.
+NWBFILE_EDITS = ("session_description", "experimenter", "institution", "lab", "experiment_description", "keywords")
+# Made again by neuroconv on every get_metadata(); nothing to carry.
+NWBFILE_FRESH = ("identifier", "source_script", "source_script_file_name")
+SPIKEGLX_NEEDED = (
+    'units need source_data["SpikeGLX"] = {{"folder_path": <raw SpikeGLX run folder>}}, the clock of {keys}: the folder '
+    "that holds the run's *.nidq.bin (or *.obx.bin) with its meta file and each probe's <run>_imec<N> folder with its "
+    ".ap.bin and .ap.meta. Only the sync file and the AP files' SY channel are read (docs/ephys-timing.md)."
 )
 
-from ..utils import convert_mat_file_to_dict
-from .virmenbehaviordatainterface import VirmenDataInterface
-from .kilosortinterface import KiloSortWithProbeInterface
 
-OptionalArrayType = Optional[Union[list, np.ndarray]]
-PathType = Union[Path, str]
+def _probe(key):
+    """The probe a Kilosort key names: "Kilosort" is imec0, "KilosortProbe<N>" is imec<N>."""
+    number = "0" if key == "Kilosort" else key.removeprefix("KilosortProbe")
+    if not number.isdigit():
+        raise ValueError(f"{key}: expected Kilosort or KilosortProbe<N>")
+    return f"imec{int(number)}"
 
 
 class TowersNWBConverter(NWBConverter):
-    """Primary conversion class for the Tank lab Towers task processing pipeline.
+    """A ViRMEn behavior session, with the sorted units of its Neuropixels probes when Kilosort keys are given.
 
-    This converter supports multiple optional data modalities:
-    - VirmenData (required): Behavioral data from Virmen
-    - SpikeGLXAP/SpikeGLXLFP (optional): Electrophysiology recordings
-    - Kilosort (optional): Spike sorting data
-    - Suite2pSegmentation (optional): Calcium imaging segmentation
-    - TiffImaging (optional): Raw imaging data
+    The subject and session come from the log, through the ndx-tank-metadata field registry. `probe_clock`,
+    `iteration_time`, `allow_virmen_borrowed` and `session_date` are the ephys converter's clock options, with its
+    defaults; they apply only with units. `ttl_source`, the old TTL alignment, is refused.
     """
 
-    data_interface_classes = {
-        "SpikeGLXAP": SpikeGLXRecordingInterface,
-        "SpikeGLXLFP": SpikeGLXRecordingInterface,
-        "VirmenData": VirmenDataInterface,
-        "Kilosort": KiloSortWithProbeInterface,  # Use custom interface for electrode group support
-        "Suite2pSegmentation": Suite2pSegmentationInterface,
-        "TiffImagaging": TiffImagingInterface,
-    }
+    data_interface_classes = {"VirmenData": VirmenDataInterface}
 
-    def __init__(
-        self, source_data, ttl_source: Optional[PathType] = None, sync_timestamps: Optional[np.ndarray] = None
-    ):
-        """
-        Initialize the NWBConverter object.
-
-        Parameters
-        ----------
-        source_data : dict
-            Dictionary mapping interface names to their source data dictionaries.
-            VirmenData is required; all other interfaces are optional.
-            For multiple Kilosort probes, use names like "KilosortProbe0", "KilosortProbe1", etc.
-        ttl_source : PathType, optional
-            Path to data file containing the TTL signals to use for basic synchronization.
-            Used for simple TTL-based alignment. If sync_timestamps is provided, this is ignored.
-        sync_timestamps : np.ndarray, optional
-            Pre-computed synchronized timestamps (e.g., from DataJoint BehaviorSync table).
-            If provided, these will be applied to all temporal interfaces via set_aligned_timestamps.
-            This is the preferred method for U19 pipeline integration.
-        """
-        # Dynamically add Kilosort interfaces for multiple probes
-        # Check for any keys starting with "Kilosort" (e.g., "KilosortProbe0", "KilosortProbe1")
-        for key in source_data.keys():
-            if key.startswith("Kilosort") and key not in self.data_interface_classes:
-                self.data_interface_classes[key] = KiloSortWithProbeInterface
-                
-                # Add electrode_group_name to source_data for this interface
-                if key == "Kilosort":
-                    electrode_group_name = "IMEC"
-                else:
-                    probe_id = key.replace("KilosortProbe", "")
-                    electrode_group_name = f"IMEC{probe_id}"
-                
-                source_data[key]["electrode_group_name"] = electrode_group_name
-
-        super().__init__(source_data=source_data)
-
-        # Check that VirmenData interface is present
-        if "VirmenData" not in self.data_interface_objects:
-            raise ValueError("VirmenData interface is required but not found in source_data.")
-
-        # Store sync timestamps for later use in temporally_align_data_interfaces
+    def __init__(self, source_data, ttl_source=None, sync_timestamps=None, verbose=False, *, probe_clock=PROBE_CLOCK, iteration_time=ITERATION_TIME, allow_virmen_borrowed=False, session_date=None):
+        if ttl_source is not None:
+            raise ValueError("ttl_source: the TTL alignment it chose is gone. With units, give the raw run folder as source_data['SpikeGLX']; the clock is built from it (docs/ephys-timing.md).")
+        source_data = dict(source_data)
+        raw_bands = sorted(key for key in source_data if key.startswith("SpikeGLX") and key != "SpikeGLX")  # SpikeGLXAP, SpikeGLXLFP, ...
+        if raw_bands:
+            raise ValueError(f"{', '.join(raw_bands)}: raw bands are not written through TowersNWBConverter yet; SpikeGLX alone gives the run folder for the clock of sorted units")
+        imaging = sorted(key for key in source_data if key.startswith(("Suite2p", "Tiff")))
+        if imaging:
+            raise ValueError(f"{', '.join(imaging)}: imaging is converted by tank_lab_to_nwb.imaging, not by TowersNWBConverter")
+        if "VirmenData" not in source_data:
+            raise ValueError("VirmenData is required: the converter writes a ViRMEn behavior session")
+        self.sorter_folders = {}
+        for key in sorted(key for key in source_data if key.startswith("Kilosort")):
+            probe = _probe(key)
+            if probe in self.sorter_folders:
+                raise ValueError(f"{key}: a second sorting of {probe}")
+            self.sorter_folders[probe] = Path(source_data.pop(key)["folder_path"])
+        spikeglx = source_data.pop("SpikeGLX", None)
+        unknown = sorted(set(source_data) - set(self.data_interface_classes))
+        if unknown:
+            raise ValueError(f"{', '.join(unknown)}: TowersNWBConverter takes VirmenData, Kilosort or KilosortProbe<N>, and SpikeGLX")
+        clock = dict(probe_clock=probe_clock, iteration_time=iteration_time, allow_virmen_borrowed=allow_virmen_borrowed, session_date=session_date)
+        if self.sorter_folders and spikeglx is None:
+            raise ValueError(SPIKEGLX_NEEDED.format(keys=", ".join(sorted(self.sorter_folders))))
+        if not self.sorter_folders:
+            if spikeglx is not None:
+                raise ValueError("SpikeGLX: the run folder is the clock of sorted units, and no Kilosort key is given; raw bands are not written through TowersNWBConverter yet")
+            changed = [name for name, value in clock.items() if value != CLOCK_DEFAULTS[name]]
+            if changed:
+                raise ValueError(f"{', '.join(changed)}: clock options of a conversion with units; no Kilosort key is given")
+        self.raw_folder = None if spikeglx is None else Path(spikeglx["folder_path"])
+        self.clock_options = clock
         self._sync_timestamps = sync_timestamps
+        super().__init__(source_data=source_data, verbose=verbose)
 
-        # Only perform TTL-based alignment if no pre-computed sync timestamps provided
-        if sync_timestamps is None and ttl_source is not None:
-            recording = se.SpikeGLXRecordingExtractor(ttl_source)
-            ttl, states = recording.get_ttl_events()
-            rising_times = ttl[states == 1]
+    def temporally_align_data_interfaces(self, metadata=None, conversion_options=None):
+        if self._sync_timestamps is not None:
+            self.data_interface_objects["VirmenData"].set_aligned_timestamps(self._sync_timestamps)
 
-            assert len(rising_times) > 0, f"No TTL events found in ttl_source file ({ttl_source})."
-            start_time = recording.frame_to_time(rising_times[0])
+    def run_conversion(self, nwbfile_path=None, nwbfile=None, metadata=None, overwrite=False, *, dandiset=None, **options):
+        """Write the session. With units, `nwbfile_path` is written exactly, with `<stem>.report.json` beside it.
 
-            for interface_name in ["SpikeGLXRecording", "SpikeGLXLFP"]:
-                if interface_name in self.data_interface_objects:  # specified in source_data
-                    interface_extractor = self.data_interface_objects[interface_name].recording_extractor
-                    re_start_frame = int(interface_extractor.time_to_frame(start_time))
-                    self.data_interface_objects[interface_name].recording_extractor = se.SubRecordingExtractor(
-                        parent_recording=interface_extractor, start_frame=re_start_frame
-                    )
-        elif sync_timestamps is None and ttl_source is None:
-            warnings.warn(
-                "No sync_timestamps or ttl_source provided. "
-                "Timestamps will not be aligned across interfaces. "
-                "For proper synchronization, provide either sync_timestamps from DataJoint or ttl_source."
-            )
-
-    def temporally_align_data_interfaces(
-        self, metadata: Optional[dict] = None, conversion_options: Optional[dict] = None
-    ):
+        `dandiset` (units only) also names the file for DANDI under that folder and runs `dandi validate` on it.
         """
-        Apply synchronized timestamps to all temporal interfaces.
+        metadata = _with_birth_timezone(metadata or self.get_metadata())
+        if not self.sorter_folders:
+            if dandiset is not None:
+                raise ValueError("dandiset: only a conversion with units is named for DANDI here")
+            return super().run_conversion(nwbfile_path=nwbfile_path, nwbfile=nwbfile, metadata=metadata, overwrite=overwrite, **options)
+        given = ["nwbfile"] * (nwbfile is not None) + sorted(name for name, value in options.items() if value)  # an empty or unset option asks for nothing
+        if given or nwbfile_path is None:
+            raise ValueError(f"{', '.join(given) or 'nwbfile_path'}: with units the file is written to nwbfile_path by the ephys converter, alone")
+        path = Path(nwbfile_path)
+        if path.exists() and not overwrite:
+            raise FileExistsError(f"{path}: exists; pass overwrite=True to replace it")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        log = self.data_interface_objects["VirmenData"].source_data["file_path"]
+        return convert_session.convert_to_file(
+            log, self.raw_folder, path, self.sorter_folders, metadata=self._units_metadata(metadata), dandiset=dandiset, sync_timestamps=self._sync_timestamps, **self.clock_options
+        )
 
-        If sync_timestamps were provided during initialization, apply them to all
-        interfaces that support temporal alignment (those with set_aligned_timestamps method).
-        Skips missing optional interfaces gracefully.
+    def _units_metadata(self, metadata):
+        """The caller's edits of neuroconv's NWBFile and Subject metadata, in the form virmen.convert.build_nwbfile takes.
 
-        Parameters
-        ----------
-        metadata : dict, optional
-            Metadata dictionary (required by base class but not used here)
-        conversion_options : dict, optional
-            Conversion options (required by base class but not used here)
+        Only edits are passed, so the ephys converter's own descriptions stay where the caller changed nothing. The
+        session's start, id and subject id come from the recording and the log; an edit of them, or of anything else the
+        file can't carry, is refused rather than dropped.
         """
-        if self._sync_timestamps is None:
-            if self.verbose:
-                print("No synchronized timestamps available. Skipping temporal alignment.")
-            return
-
-        # List of interfaces that support temporal alignment
-        # Note: Kilosort requires a recording to be registered first, so it's excluded from automatic alignment
-        temporal_interfaces = ["VirmenData", "SpikeGLXAP", "SpikeGLXLFP", "Suite2pSegmentation"]
-
-        for interface_name in temporal_interfaces:
-            if interface_name in self.data_interface_objects:
-                interface = self.data_interface_objects[interface_name]
-                if hasattr(interface, "set_aligned_timestamps"):
-                    try:
-                        interface.set_aligned_timestamps(self._sync_timestamps)
-                        if self.verbose:
-                            print(f"Applied synchronized timestamps to {interface_name}")
-                    except Exception as e:
-                        warnings.warn(f"Failed to apply synchronized timestamps to {interface_name}: {e}")
+        default = _with_birth_timezone(self.get_metadata())
+        refused = sorted(set(metadata) - {"NWBFile", "Subject"})
+        nwbfile, edits = metadata.get("NWBFile", {}), {}
+        for key, value in nwbfile.items():
+            if key in NWBFILE_FRESH or value == default["NWBFile"].get(key):
+                continue
+            if key in NWBFILE_EDITS:
+                edits[key] = value
             else:
-                if self.verbose:
-                    print(f"Optional interface {interface_name} not provided, skipping temporal alignment for it.")
+                refused.append(f"NWBFile.{key}")
+        subject = dict(metadata.get("Subject", {}))
+        if subject.pop("subject_id", default["Subject"]["subject_id"]) != default["Subject"]["subject_id"]:
+            refused.append("Subject.subject_id")
+        if refused:
+            raise ValueError(f"{', '.join(refused)}: the units file takes these from the recording and the log, or has no place for them")
+        return {**edits, "subject": subject}
 
-    def get_metadata(self):
-        vermin_file_path = Path(self.data_interface_objects["VirmenData"].source_data["file_path"])
-        session_id = vermin_file_path.stem
 
-        metadata = super().get_metadata()
-        metadata["NWBFile"].update(session_id=session_id, institution="Princeton", lab="Tank")
-
-        if vermin_file_path.is_file():
-            session_data = convert_mat_file_to_dict(mat_file_name=vermin_file_path)
-            subject_data = session_data["log"]["animal"]
-            metadata.update(Subject=dict(subject_id=subject_data["name"]))
-        else:
-            print(f"Warning: no subject file detected for session {session_id}!")
-
-        # Configure electrode groups for multi-probe Kilosort data
-        # This ensures each probe has a distinct electrode group in the NWB file
-        kilosort_interfaces = [name for name in self.data_interface_objects.keys() if name.startswith("Kilosort")]
-        
-        if kilosort_interfaces:
-            if "Ecephys" not in metadata:
-                metadata["Ecephys"] = {}
-            
-            # Add devices and electrode groups for each Kilosort probe
-            for interface_name in kilosort_interfaces:
-                # Extract probe ID from interface name (e.g., "KilosortProbe0" -> "0")
-                if interface_name == "Kilosort":
-                    probe_id = ""  # Single probe case
-                    group_name = "IMEC"
-                    device_name = "Neuropixels"
-                else:
-                    probe_id = interface_name.replace("KilosortProbe", "")
-                    group_name = f"IMEC{probe_id}"
-                    device_name = f"Neuropixels-IMEC{probe_id}"
-                
-                # Add device metadata for this probe
-                if "Device" not in metadata["Ecephys"]:
-                    metadata["Ecephys"]["Device"] = []
-                
-                if not any(d.get("name") == device_name for d in metadata["Ecephys"]["Device"]):
-                    metadata["Ecephys"]["Device"].append({
-                        "name": device_name,
-                        "description": f"Neuropixels probe{' IMEC' + probe_id if probe_id else ''}",
-                        "manufacturer": "IMEC"
-                    })
-                
-                # Add electrode group metadata for this probe
-                if "ElectrodeGroup" not in metadata["Ecephys"]:
-                    metadata["Ecephys"]["ElectrodeGroup"] = []
-                
-                if not any(eg.get("name") == group_name for eg in metadata["Ecephys"]["ElectrodeGroup"]):
-                    metadata["Ecephys"]["ElectrodeGroup"].append({
-                        "name": group_name,
-                        "description": f"Electrodes from Neuropixels probe{' IMEC' + probe_id if probe_id else ''}",
-                        "location": "brain",
-                        "device": device_name
-                    })
-                
-                # Set the electrode group name in the interface metadata
-                if interface_name not in metadata:
-                    metadata[interface_name] = {}
-                metadata[interface_name]["electrode_group_name"] = group_name
-
-        return metadata
-
-    def add_to_nwbfile(self, nwbfile, metadata, conversion_options=None):
-        """
-        Override add_to_nwbfile to properly set up electrode groups for multi-probe Kilosort.
-        
-        This method ensures that:
-        1. Devices are created for each probe
-        2. Electrode groups are created and linked to devices
-        3. Ecephys processing module is created before Kilosort interfaces add units
-        4. Each probe gets its own units table in processing/ecephys
-        """
-        # First, add devices and electrode groups from metadata
-        from pynwb.device import Device
-        from pynwb.ecephys import ElectrodeGroup
-        
-        if "Ecephys" in metadata:
-            # Add devices
-            if "Device" in metadata["Ecephys"]:
-                for device_meta in metadata["Ecephys"]["Device"]:
-                    if device_meta["name"] not in nwbfile.devices:
-                        device = Device(
-                            name=device_meta["name"],
-                            description=device_meta.get("description", ""),
-                            manufacturer=device_meta.get("manufacturer", "")
-                        )
-                        nwbfile.add_device(device)
-            
-            # Add electrode groups
-            if "ElectrodeGroup" in metadata["Ecephys"]:
-                for eg_meta in metadata["Ecephys"]["ElectrodeGroup"]:
-                    if eg_meta["name"] not in nwbfile.electrode_groups:
-                        device = nwbfile.devices[eg_meta["device"]]
-                        electrode_group = ElectrodeGroup(
-                            name=eg_meta["name"],
-                            description=eg_meta.get("description", ""),
-                            location=eg_meta.get("location", "unknown"),
-                            device=device
-                        )
-                        nwbfile.add_electrode_group(electrode_group)
-        
-        # Create ecephys processing module for Kilosort units tables
-        # This must be done before calling super() so interfaces can add to it
-        kilosort_interfaces = [name for name in self.data_interface_objects.keys() if name.startswith("Kilosort")]
-        if kilosort_interfaces and 'ecephys' not in nwbfile.processing:
-            nwbfile.create_processing_module(
-                name='ecephys',
-                description='Electrophysiology processing module containing spike sorting results from multiple probes'
-            )
-        
-        # Call parent add_to_nwbfile to add all interface data
-        super().add_to_nwbfile(nwbfile=nwbfile, metadata=metadata, conversion_options=conversion_options)
-
-        # Persist behavioral_start_offset for traceability when provided via metadata.
-        # The LabMetaData extension has no field for it, so it is stored in scratch.
-        # This value is the delay (seconds) of the first behavioral frame relative to
-        # IMEC recording start (t=0); all timestamps in the file are already IMEC-relative.
-        behavioral_start_offset = (metadata or {}).get("LabMetaData", {}).get("behavioral_start_offset")
-        if behavioral_start_offset is not None and "behavioral_start_offset" not in nwbfile.scratch:
-            nwbfile.add_scratch(
-                np.float64(behavioral_start_offset),
-                name="behavioral_start_offset",
-                description=(
-                    "Delay in seconds of the first behavioral frame relative to IMEC "
-                    "recording start (t=0). All timestamps in this file are IMEC-relative; "
-                    "this is informational only and equals the first behavioral timestamp."
-                ),
-            )
-
+def _with_birth_timezone(metadata):
+    """A naive date of birth (the U19 DB's) gets the session's timezone, not the converting machine's."""
+    subject, start = metadata.get("Subject", {}), metadata.get("NWBFile", {}).get("session_start_time")
+    birth = subject.get("date_of_birth")
+    if birth is not None and getattr(birth, "tzinfo", True) is None and getattr(start, "tzinfo", None) is not None:
+        metadata = {**metadata, "Subject": {**subject, "date_of_birth": birth.replace(tzinfo=start.tzinfo)}}
+    return metadata
