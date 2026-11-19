@@ -146,3 +146,28 @@ def phy_folder(folder, kind="ks4", n_units=5, n_channels=8, rate=30000.0, seed=1
         ibl_dir.mkdir(exist_ok=True)
         (ibl_dir / "cluster_metrics.csv").write_text("cluster_id,label,noise_cutoff,ks2_label\n" + "".join(f"{c},{0.5 + c / 100},{c * 0.1},{ks[c]}\n" for c in ks))
     return folder, trains, cluster_ids
+
+
+DATA = Path(__file__).parent / "data" / "ephys"
+
+
+def imec_files(session_folder, probe, meta_name="np1.ap.meta", n_samples=3000, sync=None, run="run_g0", with_tcat_lf=False, first_sample=1000):
+    """A probe folder as SpikeGLX writes it: `<run>_imec<N>/<run>_t0.imec<N>.ap.bin` with a real meta file's keys.
+
+    `sync` is the SY column (int16, n_samples long), zero if None. `with_tcat_lf` adds a CatGT `tcat` LF file beside it,
+    the layout neo 0.14.6 can't parse (S3's imec0).
+    """
+    folder = Path(session_folder) / f"{run}_imec{probe}"
+    meta = dict(line.split("=", 1) for line in (DATA / meta_name).read_text().splitlines() if "=" in line)
+    meta.pop("fileSHA1", None)
+    meta["firstSample"] = str(first_sample)
+    # neo names the stream from the meta's fileName, the name SpikeGLX gave the file.
+    meta["fileName"] = f"D:/{run}/{run}_imec{probe}/{run}_t0.imec{probe}.ap.bin"
+    columns = [np.zeros(n_samples, dtype=np.int16)] * 384 + [np.zeros(n_samples, dtype=np.int16) if sync is None else sync.astype(np.int16)]
+    path = write_spikeglx(folder, f"{run}_t0.imec{probe}.ap", columns, meta)
+    if with_tcat_lf:
+        lf = dict(line.split("=", 1) for line in (DATA / "np2010_tcat.lf.meta").read_text().splitlines() if "=" in line)
+        lf.pop("fileSHA1", None)
+        lf["fileName"] = f"D:/{run}/{run}_imec{probe}/{run}_tcat.imec{probe}.lf.bin"
+        write_spikeglx(folder, f"{run}_tcat.imec{probe}.lf", [np.zeros(n_samples // 12, dtype=np.int16)] * 385, lf)
+    return path
