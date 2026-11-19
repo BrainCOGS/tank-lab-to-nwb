@@ -242,16 +242,16 @@ def _labels(values, name, path):
     return values
 
 
-def _peak_channels(folder, unit_ids, spike_clusters, spike_templates, channel_map):
-    """Per cluster, the sorter channel (index into channel_map.npy) of the largest peak-to-peak of its most frequent template."""
+def _peak_channels(folder, unit_ids, spike_templates, order, starts):
+    """Per cluster, the sorter channel (index into channel_map.npy) of the largest peak-to-peak of its most frequent template.
+
+    `order` sorts the spikes by cluster and `starts` is where each of `unit_ids` begins in that order (split_trains').
+    """
     templates = np.load(folder / "templates.npy", mmap_mode="r")
     peak_to_peak = np.ptp(np.asarray(templates), axis=1)  # template x sorted channel
-    order = np.argsort(spike_clusters, kind="stable")
-    clusters, starts = np.unique(spike_clusters[order], return_index=True)
-    bounds = dict(zip(clusters.tolist(), zip(starts, np.append(starts[1:], order.size))))
+    stops = np.append(starts[1:], order.size)
     out = np.empty(len(unit_ids), dtype=np.int64)
-    for i, unit in enumerate(unit_ids):
-        start, stop = bounds[int(unit)]
+    for i, (start, stop) in enumerate(zip(starts, stops)):
         main = np.bincount(spike_templates[order[start:stop]]).argmax()
         out[i] = int(np.argmax(peak_to_peak[main]))
     return out
@@ -276,14 +276,31 @@ def _ignored(folder, files):
     return [name for name in found if name not in used and not name.startswith(".phy/")]
 
 
-def split_trains(spike_times, spike_clusters):
-    """(sorted cluster ids, per cluster its spike samples as int64), keeping every spike."""
-    spike_times = np.asarray(spike_times).ravel().astype(np.int64)
-    spike_clusters = np.asarray(spike_clusters).ravel().astype(np.int64)
-    order = np.argsort(spike_clusters, kind="stable")
-    unit_ids, starts = np.unique(spike_clusters[order], return_index=True)
-    stops = np.append(starts[1:], order.size)
-    return unit_ids, [spike_times[order[start:stop]] for start, stop in zip(starts, stops)]
+def _as_int64(samples):
+    """Spike samples as int64, without a copy when they're stored as uint64 (Kilosort's dtype)."""
+    samples = np.asarray(samples).ravel()
+    if samples.dtype == np.uint64 and (not samples.size or samples.max() < 2**63):
+        return samples.view(np.int64)
+    return samples.astype(np.int64)
+
+
+def split_trains(spike_times, spike_clusters, order=None):
+    """(sorted cluster ids, per cluster its spike samples as int64, the cluster sort order, each cluster's start in it).
+
+    The trains are views into one array sorted by cluster, so the whole read holds that array, the order and the
+    clusters: about 20 bytes a spike.
+    """
+    spike_times = _as_int64(spike_times)
+    spike_clusters = np.asarray(spike_clusters).ravel()
+    if order is None:
+        order = np.argsort(spike_clusters, kind="stable")
+    by_cluster_id = spike_clusters[order]
+    # Already sorted, so a cluster starts wherever the id changes; np.unique would sort it again.
+    starts = np.concatenate(([0], np.flatnonzero(by_cluster_id[1:] != by_cluster_id[:-1]) + 1)) if order.size else np.zeros(0, dtype=np.int64)
+    unit_ids = by_cluster_id[starts]
+    del by_cluster_id
+    by_cluster = spike_times[order]
+    return unit_ids.astype(np.int64), np.split(by_cluster, starts[1:]), order, starts
 
 
 def read_sorting(folder):
@@ -292,15 +309,16 @@ def read_sorting(folder):
     check_folder(folder)
     sorter, version, evidence, sorted_input = identify_sorter(folder)
     params = _read_params(folder)
-    spike_times = np.load(folder / "spike_times.npy").ravel()
+    spike_times = _as_int64(np.load(folder / "spike_times.npy"))
     clusters_file = "spike_clusters.npy" if (folder / "spike_clusters.npy").is_file() else "spike_templates.npy"
-    spike_clusters = np.load(folder / clusters_file).ravel().astype(np.int64)
-    spike_templates = np.load(folder / "spike_templates.npy").ravel().astype(np.int64) if (folder / "spike_templates.npy").is_file() else spike_clusters
+    spike_clusters = np.load(folder / clusters_file).ravel()
+    spike_templates = np.load(folder / "spike_templates.npy").ravel() if (folder / "spike_templates.npy").is_file() else spike_clusters
     if not (spike_times.size == spike_clusters.size == spike_templates.size):
         raise SortingError(f"{folder}: spike_times.npy has {spike_times.size} spikes but {clusters_file} has {spike_clusters.size}")
-    if np.any(np.diff(spike_times.astype(np.int64)) < 0):
+    if np.any(spike_times[1:] < spike_times[:-1]):
         raise SortingError(f"{folder}: spike_times.npy isn't sorted")
-    unit_ids, trains = split_trains(spike_times, spike_clusters)
+    unit_ids, trains, order, starts = split_trains(spike_times, spike_clusters)
+    del spike_times, spike_clusters
     channel_map = np.load(folder / "channel_map.npy").ravel().astype(np.int64)
     channel_positions = np.load(folder / "channel_positions.npy").astype("float64")
     if channel_positions.shape != (channel_map.size, 2):
@@ -322,12 +340,13 @@ def read_sorting(folder):
         else:
             columns.append(Column(column, description + " NaN for a cluster Kilosort didn't make.", _per_unit(table.astype("float64"), unit_ids, np.nan).astype("float64")))
         files[name] = f"{len(table)} rows"
-    curated = _curation(folder, unit_ids, spike_clusters, files, notes)
+    curated = _curation(folder, unit_ids, np.array([train.size for train in trains]), files, notes)
     columns.extend(curated)
     quality = _quality(columns)
     columns.insert(0, quality)
     columns.extend(_metrics(folder, unit_ids, files, notes))
-    peak = _peak_channels(folder, unit_ids, spike_clusters, spike_templates, channel_map)
+    peak = _peak_channels(folder, unit_ids, spike_templates, order, starts)
+    del order, spike_templates
     return SortedProbe(
         folder=folder,
         sorter=sorter,
@@ -349,7 +368,7 @@ def read_sorting(folder):
     )
 
 
-def _curation(folder, unit_ids, spike_clusters, files, notes):
+def _curation(folder, unit_ids, spike_counts, files, notes):
     """phy's curated label, from cluster_group.tsv, and cluster_info.tsv's columns, if they belong to this sorting."""
     columns = []
     group_path = folder / "cluster_group.tsv"
@@ -365,7 +384,7 @@ def _curation(folder, unit_ids, spike_clusters, files, notes):
     if info is not None and "cluster_id" not in info and "id" in info:
         info = info.rename(columns={"id": "cluster_id"})  # phy before 2.0b5
     if info is not None:
-        counts = pd.Series(np.bincount(spike_clusters - spike_clusters.min())[np.asarray(unit_ids) - spike_clusters.min()], index=unit_ids)
+        counts = pd.Series(spike_counts, index=unit_ids)
         listed = info.set_index("cluster_id")
         same_units = set(listed.index) == set(int(u) for u in unit_ids)
         same_counts = same_units and "n_spikes" in listed and np.array_equal(listed.loc[list(unit_ids), "n_spikes"].to_numpy(), counts.to_numpy())

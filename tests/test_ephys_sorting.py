@@ -47,7 +47,7 @@ def test_numpy_trains_equal_spikeinterface_where_it_keeps_every_spike(tmp_path):
 
     folder, trains, _ = phy_folder(tmp_path / "kilosort4_output", kind="ks4")
     extractor = se.read_kilosort(folder, keep_good_only=False)
-    unit_ids, ours = split_trains(np.load(folder / "spike_times.npy"), np.load(folder / "spike_clusters.npy"))
+    unit_ids, ours, _, _ = split_trains(np.load(folder / "spike_times.npy"), np.load(folder / "spike_clusters.npy"))
     assert sorted(extractor.get_unit_ids().tolist()) == unit_ids.tolist()
     for unit, train in zip(unit_ids, ours):
         assert np.array_equal(extractor.get_unit_spike_train(unit_id=unit), train)
