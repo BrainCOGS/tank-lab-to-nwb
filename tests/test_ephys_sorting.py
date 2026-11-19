@@ -178,3 +178,13 @@ def test_clusters_listed_without_spikes_are_noted(tmp_path):
     result = read_sorting(folder)
     assert 99 not in result.unit_ids
     assert any("1 cluster" in note and "no spikes" in note for note in result.notes)
+
+
+def test_older_phy_cluster_info_with_an_id_column(tmp_path):
+    """phy before 2.0b5 wrote cluster_info.tsv with an `id` column (rec 628)."""
+    folder, _, _ = phy_folder(tmp_path / "kilosort4_output", curated=True, with_cluster_info=True)
+    info = folder / "cluster_info.tsv"
+    info.write_text(info.read_text().replace("cluster_id\t", "id\t", 1))
+    result = read_sorting(folder)
+    assert _column(result, "curated_group")[0] == "noise"
+    assert "cluster_info.tsv" in result.files

@@ -362,6 +362,8 @@ def _curation(folder, unit_ids, spike_clusters, files, notes):
         group = _cluster_table(folder, "cluster_group.tsv", "group")
     info_path = folder / "cluster_info.tsv"
     info = pd.read_csv(info_path, sep="\t") if info_path.is_file() else None
+    if info is not None and "cluster_id" not in info and "id" in info:
+        info = info.rename(columns={"id": "cluster_id"})  # phy before 2.0b5
     if info is not None:
         counts = pd.Series(np.bincount(spike_clusters - spike_clusters.min())[np.asarray(unit_ids) - spike_clusters.min()], index=unit_ids)
         listed = info.set_index("cluster_id")
