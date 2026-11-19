@@ -1,4 +1,4 @@
-"""Write a ViRMEn session and its spike-sorted units to one NWB file, on the behavior clock. Nothing here uploads."""
+"""Write a ViRMEn session and its spike-sorted units to one NWB file, both on the ephys recording's clock. Nothing here uploads."""
 
 import json
 from dataclasses import dataclass, replace
