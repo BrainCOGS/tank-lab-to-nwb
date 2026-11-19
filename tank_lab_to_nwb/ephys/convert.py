@@ -2,11 +2,13 @@
 
 import json
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 from hdmf.backends.hdf5.h5_utils import H5DataIO
 from hdmf.common import DynamicTable, DynamicTableRegion, VectorData, VectorIndex
+from hdmf.data_utils import AbstractDataChunkIterator, DataChunk
 from pynwb import NWBHDF5IO
 from pynwb.misc import Units
 
@@ -33,12 +35,73 @@ class ProbeUnits:
     name: str
     sorted: object  # SortedProbe
     electrodes: object  # ProbeElectrodes
-    times: np.ndarray  # every unit's spike times in the file, unit after unit
+    times_of: object  # () -> every unit's spike times in the file, unit after unit, made again from the sorter's files
     counts: np.ndarray  # spikes per unit
     position_check: tuple
     electrodes_rate: float  # the AP file's imSampRate: one sample is the units' resolution
     peak_channel: np.ndarray  # per unit, the saved AP channel of its peak
     departure: dict  # what the probe clock changed: spikes in behavior, and how many land in another iteration than sample / imSampRate puts them
+
+
+class ProbeSpikeTimes(AbstractDataChunkIterator):
+    """Every probe's spike times, unit after unit, made one probe at a time while HDF5 writes them.
+
+    `times_of(i)` makes probe i's times; chunks never cross a probe boundary, so only one probe's times are held.
+    """
+
+    def __init__(self, counts, times_of, chunk=1_000_000):
+        self._counts = [int(c) for c in counts]
+        self._times_of = times_of
+        self._chunk = int(chunk)
+        self._total = sum(self._counts)
+        self.peak_held = 0
+        self._chunks = None
+
+    def __iter__(self):
+        self._chunks = self._generate()
+        return self
+
+    def __next__(self):
+        if self._chunks is None:
+            self._chunks = self._generate()
+        return next(self._chunks)
+
+    def _generate(self):
+        start = 0
+        for i, count in enumerate(self._counts):
+            if not count:
+                continue
+            times = np.asarray(self._times_of(i), dtype="float64")
+            if times.size != count:
+                raise ValueError(f"probe {i}: {times.size} spike times for {count} spikes")
+            self.peak_held = max(self.peak_held, times.size)
+            for offset in range(0, count, self._chunk):
+                piece = times[offset : offset + self._chunk]
+                yield DataChunk(data=piece, selection=np.s_[start + offset : start + offset + piece.size])
+            start += count
+            del times
+
+    def __len__(self):
+        # hdmf's tables check a column's length against its index before anything is written.
+        return self._total
+
+    def recommended_chunk_shape(self):
+        return (min(self._chunk, max(self._total, 1)),)
+
+    def recommended_data_shape(self):
+        return (self._total,)
+
+    @property
+    def chunk_shape(self):
+        return self.recommended_chunk_shape()
+
+    @property
+    def dtype(self):
+        return np.dtype("float64")
+
+    @property
+    def maxshape(self):
+        return (self._total,)
 
 
 def _compressed(data):
@@ -75,6 +138,15 @@ def check_sample_origin(sorted_probe, stream):
     return f"{origin}; the sorter read {exact} as many samples as {stream.bin_path.name} has ({stream.n_samples})"
 
 
+def probe_spike_times(folder, to_seconds):
+    """A sorter folder's spike times in the file, unit after unit in cluster-id order, each unit's in file order."""
+    folder = Path(folder)
+    spike_times = np.load(folder / "spike_times.npy").ravel()
+    name = "spike_clusters.npy" if (folder / "spike_clusters.npy").is_file() else "spike_templates.npy"
+    order = np.argsort(np.load(folder / name).ravel(), kind="stable")
+    return to_seconds(spike_times[order].astype(np.int64))
+
+
 def prepare_units(nwbfile, sync, sorter_folders):
     """Read each probe's sorting, add its electrodes, and put its spikes on the file's clock. `sorter_folders` maps probe name to folder."""
     prepared = []
@@ -90,22 +162,20 @@ def prepare_units(nwbfile, sync, sorter_folders):
         position_check = (difference, offset, channel_source)
         peak = channels[sorted_probe.peak_channel]
         counts = np.array([train.size for train in sorted_probe.spike_samples], dtype=np.int64)
-        times = np.empty(int(counts.sum()), dtype="float64")
         # Under "params_rate" a spike is its sample over params.py's sample_rate, as the DB's CuratedClustering stores it.
         rate = sorted_probe.sample_rate_params if sync.clock.probe_clock == "params_rate" else None
         changed = within = 0
-        stop = 0
         for train in sorted_probe.spike_samples:
-            times[stop : stop + train.size] = sync.clock.probe_samples_to_session(name, train, rate=rate)
+            times = sync.clock.probe_samples_to_session(name, train, rate=rate)
             plain = train / stream.rate + sync.clock.shift
             inside = (plain >= iterations[0]) & (plain < iterations[-1])
-            changed += int(np.count_nonzero(np.searchsorted(iterations, times[stop : stop + train.size][inside], side="right") != np.searchsorted(iterations, plain[inside], side="right")))
+            changed += int(np.count_nonzero(np.searchsorted(iterations, times[inside], side="right") != np.searchsorted(iterations, plain[inside], side="right")))
             within += int(inside.sum())
-            stop += train.size
-        # The samples aren't needed once mapped; dropping them halves what a four-probe session holds.
+        # Neither samples nor times are kept: the writer makes each probe's times again when HDF5 asks for them.
         sorted_probe = replace(sorted_probe, spike_samples=[], n_spikes_read=int(counts.sum()))
         departure = dict(spikes_in_behavior=within, spikes_changing_iteration=changed, sample_rate_used=repr(rate or stream.rate))
-        prepared.append((ProbeUnits(name, sorted_probe, electrodes, times, counts, position_check, stream.rate, peak, departure), how))
+        times_of = partial(probe_spike_times, sorted_probe.folder, lambda samples, name=name, rate=rate: sync.clock.probe_samples_to_session(name, samples, rate=rate))
+        prepared.append((ProbeUnits(name, sorted_probe, electrodes, times_of, counts, position_check, stream.rate, peak, departure), how))
     return prepared
 
 
@@ -134,15 +204,17 @@ def add_units(nwbfile, prepared):
     """One units table for every probe, built from whole columns so a long session's spikes stay numpy arrays."""
     resolution = 1 / min(probe.electrodes_rate for probe, _ in prepared) if prepared else -1.0
     counts = np.concatenate([probe.counts for probe, _ in prepared])
-    flat = np.concatenate([probe.times for probe, _ in prepared])
+    flat = ProbeSpikeTimes([int(probe.counts.sum()) for probe, _ in prepared], lambda i: prepared[i][0].times_of())
     peak = np.concatenate([probe.peak_channel for probe, _ in prepared])
     rows = np.concatenate([probe.electrodes.rows[probe.peak_channel] for probe, _ in prepared])
     groups = [nwbfile.electrode_groups[probe.electrodes.group_names[int(channel)]] for probe, _ in prepared for channel in probe.peak_channel]
-    spike_times = VectorData(name="spike_times", description=TIME_MEANING, data=_compressed(flat))
+    spike_times = VectorData(name="spike_times", description=TIME_MEANING, data=H5DataIO(data=flat, **COMPRESSION))
     electrodes = DynamicTableRegion(name="electrodes", description="The electrode of the unit's peak channel.", data=rows, table=nwbfile.electrodes)
+    # The index goes first: hdmf leaves a column written from an iterator out of its length check, and would then
+    # not find the index's target.
     columns = [
-        spike_times,
         VectorIndex(name="spike_times_index", data=np.cumsum(counts), target=spike_times),
+        spike_times,
         electrodes,
         VectorIndex(name="electrodes_index", data=np.arange(1, counts.size + 1), target=electrodes),
         VectorData(name="electrode_group", description="Electrode group (probe shank) of the peak channel.", data=groups),

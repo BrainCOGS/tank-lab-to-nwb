@@ -43,7 +43,7 @@ def verify_ephys(sync, prepared, nwbfile_path):
         checked["iterations"] = int(sum(np.size(t) for t in sync.iteration_seconds))
         units = f["units"]
         index = units["spike_times_index"][:]
-        times = units["spike_times"][:]
+        times = units["spike_times"]  # read a probe's slice at a time
         probes = _strings(units["probe"][:])
         clusters = units["cluster_id"][:]
         electrodes = units["electrodes"][:]
@@ -55,12 +55,14 @@ def verify_ephys(sync, prepared, nwbfile_path):
             name = "spike_clusters.npy" if (folder / "spike_clusters.npy").is_file() else "spike_templates.npy"
             spike_clusters = np.load(folder / name).ravel().astype(np.int64)
             ids = np.unique(spike_clusters)
+            first, last = (starts[row], index[row + ids.size - 1]) if ids.size else (0, 0)
+            stored_probe = times[first:last]
             if not np.array_equal(clusters[row : row + ids.size], ids) or set(probes[row : row + ids.size]) != {probe.name}:
                 raise RoundTripError(f"units of {probe.name}: rows {row}..{row + ids.size} don't hold its clusters {ids[:5]}...")
             rate = probe.sorted.sample_rate_params if sync.clock.probe_clock == "params_rate" else None
             for i, cluster in enumerate(ids):
                 expected = sync.clock.probe_samples_to_session(probe.name, spike_times[spike_clusters == cluster], rate=rate)
-                stored = times[starts[row + i] : index[row + i]]
+                stored = stored_probe[starts[row + i] - first : index[row + i] - first]
                 if stored.shape != expected.shape or not np.array_equal(stored, expected):
                     raise RoundTripError(f"{probe.name} cluster {cluster}: stored spike times differ from the sorter's samples on the clock")
                 channel = int(probe.peak_channel[i])
