@@ -64,10 +64,11 @@ def read_sync_word(stream, word=0):
         recording = se.read_spikeglx(sg.isolated_stream_folder(stream.bin_path), stream_id=_neo_stream_id(stream))
     except Exception as error:  # noqa: BLE001
         raise sg.SpikeGLXError(f"{stream.bin_path}: SpikeInterface can't read the {stream.kind} stream: {error}") from error
-    ids = list(recording.get_channel_ids())
-    if len(ids) != stream.n_channels or recording.get_num_samples() != stream.n_samples:
-        raise sg.SpikeGLXError(f"{stream.bin_path}: SpikeInterface sees {len(ids)} channels and {recording.get_num_samples()} samples; the meta says {stream.n_channels} and {stream.n_samples}")
-    traces = recording.get_traces(channel_ids=[ids[channel]], return_in_uV=False).ravel()
+    # By name: neo puts a OneBox's SY word in a stream of its own, so positions shift.
+    name = f"{_neo_stream_id(stream)}#XD{word}"
+    if name not in set(recording.get_channel_ids()) or recording.get_num_samples() != stream.n_samples:
+        raise sg.SpikeGLXError(f"{stream.bin_path}: SpikeInterface has no channel {name} or sees {recording.get_num_samples()} samples; the meta says {stream.n_samples}")
+    traces = _read_column(recording, name, stream.n_samples)
     if traces.dtype != np.int16:
         raise sg.SpikeGLXError(f"{stream.bin_path}: SpikeInterface returned the digital word as {traces.dtype}, not int16")
     for start in (0, max(0, stream.n_samples - CROSS_CHECK_SAMPLES)):
@@ -133,6 +134,9 @@ def build_session_sync(session_folder, log_path, probes=None, sync_bin=None, eve
     sync_stream = sg.open_stream(sync_bin or sg.find_sync_stream(session_folder))
     word = read_sync_word(sync_stream)
     trial_line, iteration_line = ps.pipeline_lines(word, sync_stream.kind, sync_stream.rate, sync_stream.meta["fileTimeSecs"])
+    # A OneBox's sync wave is in its SY word, read later; the digital word isn't needed after this.
+    sync_edges = _nidq_sync_edges(sync_stream, word) if sync_stream.kind == "nidq" else None
+    del word
     trials = saved_trials(log)
     if not trials:
         raise SessionSyncError(f"{log_path}: no saved trials")
@@ -143,12 +147,13 @@ def build_session_sync(session_folder, log_path, probes=None, sync_bin=None, eve
     if not (result.regular_sync_status == 1 or result.fixed_sync_status == 1):
         raise SessionSyncError(f"{sync_stream.bin_path}: the pipeline's sync fails on this session (regular {result.regular_sync_status}, fixed {result.fixed_sync_status}): the iteration pulses don't match the log's iterations. Only the ViRMEn-borrowed vectors exist, which assume no drift and aren't a measurement, so this converter stops.")
     edges = iteration_edges(result.iteration_idx_vector, trial_line, iteration_line, result.mode, sync_stream.rate)
+    if sync_edges is None:
+        sync_edges = _obx_sync_edges(sync_stream)
     samples, elapsed, numbers = iteration_samples_for_fit(edges, trials)
     try:
         behavior = fit_behavior(samples, elapsed, numbers, sync_stream.rate)
     except AlignmentError as error:
         raise SessionSyncError(f"{sync_stream.bin_path}: {error}") from error
-    sync_edges = sg.sync_edges(sync_stream) if sync_stream.kind == "nidq" else _obx_sync_edges(sync_stream)
     probe_files = sg.find_ap_files(session_folder)
     if probes is not None:
         missing = sorted(set(probes) - {f"imec{n}" for n in probe_files})
@@ -173,18 +178,37 @@ def build_session_sync(session_folder, log_path, probes=None, sync_bin=None, eve
     return SessionSync(clock, session, sync_stream, streams, result, edges, trials, paired, shift, (trial_line, iteration_line))
 
 
+def _nidq_sync_edges(stream, word):
+    """The NIDQ's sync edges, from the digital word already read, on the line its meta names."""
+    channel, line = sg.sync_line_of_nidq(stream)
+    if channel != sg.digital_channel(stream, 0):
+        word = read_sync_word(stream, word=channel - sg.digital_channel(stream, 0))
+    return sg.rising_edges(sg.bit(word, line)).astype(np.int64)
+
+
 def _obx_sync_edges(stream):
-    """A OneBox's own sync edges: bit 6 of its SY word, through SpikeInterface, checked against a direct read."""
+    """A OneBox's own sync edges: bit 6 of its SY word, through SpikeInterface's SYNC stream, checked against a direct read."""
     import spikeinterface.extractors as se
 
     channel = sg.sync_channel(stream)
-    recording = se.read_spikeglx(sg.isolated_stream_folder(stream.bin_path), stream_id=_neo_stream_id(stream))
-    ids = list(recording.get_channel_ids())
-    word = recording.get_traces(channel_ids=[ids[channel]], return_in_uV=False).ravel()
-    direct = sg.read_channel(stream, channel, 0, CROSS_CHECK_SAMPLES)
-    if not np.array_equal(direct, word[: direct.size]):
-        raise sg.SpikeGLXError(f"{stream.bin_path}: SpikeInterface's SY word differs from the file's bytes")
+    recording = se.read_spikeglx(sg.isolated_stream_folder(stream.bin_path), stream_id=f"{_neo_stream_id(stream)}-SYNC")
+    word = _read_column(recording, recording.get_channel_ids()[0], stream.n_samples)
+    for start in (0, max(0, stream.n_samples - CROSS_CHECK_SAMPLES)):
+        direct = sg.read_channel(stream, channel, start, start + CROSS_CHECK_SAMPLES)
+        if not np.array_equal(direct, word[start : start + direct.size]):
+            raise sg.SpikeGLXError(f"{stream.bin_path}: SpikeInterface's SY word differs from the file's bytes near sample {start}")
     return sg.rising_edges(sg.bit(word, sg.SY_SYNC_BIT)).astype(np.int64)
+
+
+def _read_column(recording, channel_id, n_samples, chunk=2_000_000):
+    """One channel of a recording, a chunk at a time: neo reads every channel of a block before picking one."""
+    out = None
+    for start in range(0, n_samples, chunk):
+        piece = recording.get_traces(start_frame=start, end_frame=min(start + chunk, n_samples), channel_ids=[channel_id], return_in_uV=False).ravel()
+        if out is None:
+            out = np.empty(n_samples, dtype=piece.dtype)
+        out[start : start + piece.size] = piece
+    return out
 
 
 def compare_with_db(pipeline, row):

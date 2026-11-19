@@ -124,13 +124,15 @@ def read_channel(stream, channel, start=0, stop=None):
 
 
 def bit(word, line):
-    """One digital line of a 16-bit word, as uint8 0 or 1."""
-    return ((np.asarray(word).view("<u2") >> line) & 1).astype(np.uint8)
+    """One digital line of a 16-bit word, as uint8 0 or 1. Works on the word's bytes, so no 16-bit copy is made."""
+    byte, shift = divmod(line, 8)
+    return (np.asarray(word).view(np.uint8)[byte::2] >> shift) & 1
 
 
 def rising_edges(line):
     """Indices of the first high sample of each rising edge."""
-    return np.flatnonzero(np.diff(line.astype(np.int8)) == 1) + 1
+    line = np.asarray(line)
+    return np.flatnonzero(line[1:] > line[:-1]) + 1
 
 
 def sync_line_of_nidq(stream):

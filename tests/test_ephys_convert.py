@@ -106,7 +106,8 @@ def test_a_trimmed_sorting_is_refused(session):
     from tank_lab_to_nwb.ephys.sorting import read_sorting
     from tank_lab_to_nwb.ephys.spikeglx import open_stream
 
-    (session["sorter"] / "temp_wh.dat").write_bytes(b"\0" * (2 * 385 * (session["n_ap"] - 100)))
+    # temp_wh.dat holds whole padded batches, so it can't be shorter than the file the sorter read.
+    (session["sorter"] / "temp_wh.dat").write_bytes(b"\0" * (2 * 385 * (session["n_ap"] - 1)))
     with pytest.raises(SampleOriginError, match="moves sample 0"):
         check_sample_origin(read_sorting(session["sorter"]), open_stream(next(session["raw"].glob("*_imec0/*.ap.bin"))))
 

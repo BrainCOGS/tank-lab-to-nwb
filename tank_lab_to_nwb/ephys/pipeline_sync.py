@@ -33,12 +33,12 @@ def pipeline_lines(digital_word, kind, rate, file_time_seconds):
     OneBox file has them on lines 0 and 1, and the one with more rising edges is the iteration line.
     """
     n = int(rate * np.float64(file_time_seconds))
-    word = np.asarray(digital_word)[:n].view("<u2")
-    line = lambda k: ((word >> k) & 1).astype(np.uint8)  # noqa: E731
+    data = np.ascontiguousarray(np.asarray(digital_word)[:n]).view(np.uint8)
+    line = lambda k: (data[k // 8 :: 2] >> (k % 8)) & 1  # noqa: E731 - bit k of each little-endian 16-bit word
     if kind == "nidq":
         return line(1), line(2)
     zero, one = line(0), line(1)
-    if np.flatnonzero(np.diff(zero) == 1).size > np.flatnonzero(np.diff(one) == 1).size:
+    if np.count_nonzero(zero[1:] > zero[:-1]) > np.count_nonzero(one[1:] > one[:-1]):
         return one, zero
     return zero, one
 

@@ -183,3 +183,21 @@ def test_clock_chains_probe_to_session_time():
     assert np.allclose(clock.shifted(2.0).sync_samples_to_session([0]), clock.sync_samples_to_session([0]) + 2.0)
     with pytest.raises(KeyError, match="imec3"):
         clock.probe_samples_to_session("imec3", [0])
+
+
+def test_a_minority_of_frame_late_pulses_is_rejected_not_fatal():
+    """In pulse_signal mode about 6 % of pulses go out late, by a display frame on S8a; here 10 ms, under the iteration spacing."""
+    rng = np.random.default_rng(3)
+    elapsed = np.cumsum(rng.uniform(0.016, 0.020, 50_000))  # iterations 16-20 ms apart
+    iterations = np.tile(np.arange(1, 501), 100)
+
+    def edges(late_fraction):
+        late = rng.random(elapsed.size) < late_fraction
+        times = elapsed * (1 + 20e-6) + 1.0 + rng.normal(0, 3e-4, elapsed.size) + late * 0.010
+        return times * NIDQ_RATE + 0.5
+
+    fit = fit_behavior(edges(0.07), elapsed, iterations, NIDQ_RATE)
+    assert abs((fit.slope - 1) * 1e6 - 20) < 0.5 and abs(fit.intercept - 1.0) < 1e-4
+    assert fit.n_rejected > 0.05 * elapsed.size
+    with pytest.raises(AlignmentError, match="off the line"):
+        fit_behavior(edges(0.12), elapsed, iterations, NIDQ_RATE)

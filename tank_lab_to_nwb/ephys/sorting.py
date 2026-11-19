@@ -197,11 +197,11 @@ def n_sorted_samples(folder, params, sorter):
         for count in filter(None, (channels, np.load(folder / "channel_map.npy").size)):
             if wh.stat().st_size % (2 * count) == 0:
                 n = wh.stat().st_size // (2 * count)
-                if sorter != "Kilosort 4":
-                    # MATLAB Kilosort 2/3 pads its last batch with zeros, so temp_wh.dat holds whole batches of
-                    # ops.NT samples, which no file in the folder records: Kilosort's default, 64 x 1024 + 64.
-                    return (n - MATLAB_BATCH_SAMPLES + 1, n)
-                return (n, n)
+                # Kilosort pads its last batch, so temp_wh.dat holds whole batches: Kilosort 4's batch_size from
+                # ops.npy (S8a: 1,890 x 60,000), MATLAB Kilosort 2/3's ops.NT, which no file in the folder
+                # records: Kilosort's default, 64 x 1024 + 64.
+                batch = _ks4_batch_size(folder) if sorter == "Kilosort 4" else MATLAB_BATCH_SAMPLES
+                return (n - batch + 1, n)
     ops = folder / "ops.npy"
     if sorter == "Kilosort 4" and ops.is_file():
         record = np.load(ops, allow_pickle=True).item()
@@ -209,6 +209,13 @@ def n_sorted_samples(folder, params, sorter):
             batches, size = int(record["Nbatches"]), int(record["batch_size"])
             return ((batches - 1) * size + 1, batches * size)
     return None
+
+
+def _ks4_batch_size(folder):
+    ops = Path(folder) / "ops.npy"
+    if ops.is_file():
+        return int(np.load(ops, allow_pickle=True).item().get("batch_size", 60000))
+    return 60000
 
 
 def _cluster_table(folder, name, column):

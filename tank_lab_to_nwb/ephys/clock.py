@@ -28,6 +28,11 @@ KNOT_SPACING_SECONDS = 300.0
 MAX_SYNC_RATE_DIFFERENCE_PPM = 200.0
 # Beyond this an edge is off the map: a glitch or a wrong pairing, so the session needs a person to look at it.
 MAX_SYNC_RESIDUAL_SECONDS = 0.0005
+# Imaging stops at 5 % of packets off the line. In pulse_signal mode about 6 % of iteration pulses leave a display frame
+# (16.7 ms) after their logged time, in every trial (S8a, rec 905); they're rejected like any late event, and the line
+# is fit to the rest. Over 10 % would mean the matching itself is off. Those late pulses also put the 99th percentile of
+# all residuals near 17 ms, so imaging's 10 ms limit on the percentiles applies to the kept edges here.
+MAX_REJECTED_EDGE_FRACTION = 0.10
 
 
 def edge_seconds(samples, rate):
@@ -151,7 +156,8 @@ def probe_sync(probe_edges, probe_rate, probe_first_sample, sync_edges, sync_rat
 
 def transitions(line):
     """First sample of every change of a 0/1 line, either direction."""
-    return np.flatnonzero(np.diff(np.asarray(line).astype(np.int8)) != 0) + 1
+    line = np.asarray(line)
+    return np.flatnonzero(line[1:] != line[:-1]) + 1
 
 
 def iteration_edges(iteration_idx_vector, trial_line, iteration_line, mode, rate):
@@ -162,7 +168,8 @@ def iteration_edges(iteration_idx_vector, trial_line, iteration_line, mode, rate
     a measurement.
     """
     first_lag, later_lag = pipeline_index_lag(mode, rate)
-    trial_edges, iteration_changes = np.flatnonzero(np.diff(np.asarray(trial_line).astype(np.int8)) == 1) + 1, transitions(iteration_line)
+    trial_line = np.asarray(trial_line)
+    trial_edges, iteration_changes = np.flatnonzero(trial_line[1:] > trial_line[:-1]) + 1, transitions(iteration_line)
     out = []
     for indices in iteration_idx_vector:
         indices = np.asarray(indices, dtype=np.int64).ravel()
@@ -201,7 +208,7 @@ def fit_behavior(edge_samples, elapsed, iterations, rate):
     order = np.argsort(edge_samples, kind="stable")
     if np.any(np.diff(np.asarray(elapsed)[order]) < 0):
         raise AlignmentError("iteration edges and logged iteration times run in different orders; is this the wrong log?")
-    return fit_clock(edge_seconds(edge_samples, rate), elapsed, iterations, what="iteration edges")
+    return fit_clock(edge_seconds(edge_samples, rate), elapsed, iterations, what="iteration edges", max_rejected_fraction=MAX_REJECTED_EDGE_FRACTION, residual_limit_over_kept=True)
 
 
 @dataclass(frozen=True)
