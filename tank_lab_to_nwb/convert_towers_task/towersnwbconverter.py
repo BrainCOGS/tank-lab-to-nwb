@@ -105,8 +105,8 @@ class TowersNWBConverter(NWBConverter):
             if dandiset is not None:
                 raise ValueError("dandiset: only a conversion with units is named for DANDI here")
             return super().run_conversion(nwbfile_path=nwbfile_path, nwbfile=nwbfile, metadata=metadata, overwrite=overwrite, **options)
-        if nwbfile is not None or nwbfile_path is None or any(value not in (None, False) for value in options.values()):
-            given = ["nwbfile"] * (nwbfile is not None) + sorted(name for name, value in options.items() if value not in (None, False))
+        given = ["nwbfile"] * (nwbfile is not None) + sorted(name for name, value in options.items() if value)  # an empty or unset option asks for nothing
+        if given or nwbfile_path is None:
             raise ValueError(f"{', '.join(given) or 'nwbfile_path'}: with units the file is written to nwbfile_path by the ephys converter, alone")
         path = Path(nwbfile_path)
         if path.exists() and not overwrite:

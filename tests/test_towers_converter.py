@@ -195,6 +195,14 @@ def test_an_existing_file_is_kept_without_overwrite(session, towers):  # noqa: F
     assert path.read_bytes() == b"keep"
 
 
+def test_neuroconv_options_left_empty_are_accepted_with_units(session, towers):  # noqa: F811
+    path = session["tmp"] / "out.nwb"
+    towers().run_conversion(nwbfile_path=path, conversion_options={})
+    assert path.is_file()
+    with pytest.raises(ValueError, match="conversion_options"):
+        towers().run_conversion(nwbfile_path=path, overwrite=True, conversion_options={"VirmenData": {"stub": True}})
+
+
 def test_an_edit_the_units_file_cannot_carry_is_refused(session, towers):  # noqa: F811
     converter = towers()
     metadata = converter.get_metadata()
