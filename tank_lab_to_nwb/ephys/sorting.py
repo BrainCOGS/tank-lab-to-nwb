@@ -366,6 +366,25 @@ def _quality(columns):
     return Column("quality", "good, mua or noise: phy's curated group where one is set, else Kilosort's KSLabel. Empty where neither says.", np.asarray(quality, dtype=str))
 
 
+def _ibl_belongs(folder, notes):
+    """Whether ibl_data beside the folder was made from this sorting: its spikes.samples.npy must be this spike_times.npy.
+
+    A job folder can hold several sorter folders and one ibl_data (S2's job 603 has kilosort3_output and
+    kilosort4_output, and its ibl_data is the Kilosort 4 sorting's).
+    """
+    samples = folder.parent / "ibl_data" / "spikes.samples.npy"
+    if not samples.is_file():
+        notes.append("ibl_data has no spikes.samples.npy to show which sorting it belongs to, so its metrics weren't read")
+        return False
+    ours = np.load(folder / "spike_times.npy", mmap_mode="r").ravel()
+    theirs = np.load(samples, mmap_mode="r").ravel()
+    step = max(1, ours.size // 10_000)
+    if ours.shape != theirs.shape or not np.array_equal(np.asarray(ours[::step]).astype(np.int64), np.asarray(theirs[::step]).astype(np.int64)):
+        notes.append(f"ibl_data belongs to another sorting ({theirs.size} spikes, this one has {ours.size}), so its metrics weren't read")
+        return False
+    return True
+
+
 def _metrics(folder, unit_ids, files, notes):
     """Per-unit metrics beside the phy files: SpikeInterface's quality and template metrics, and the IBL step's cluster_metrics.csv."""
     columns = []
@@ -377,6 +396,8 @@ def _metrics(folder, unit_ids, files, notes):
     ]
     for path, key, prefix, description in sources:
         if not path.is_file():
+            continue
+        if prefix == "ibl_" and not _ibl_belongs(folder, notes):
             continue
         table = pd.read_csv(path)
         if key not in table and "cluster_id" in table:

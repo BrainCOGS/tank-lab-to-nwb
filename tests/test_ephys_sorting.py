@@ -149,3 +149,14 @@ def test_find_sorter_folders_includes_non_kilosort(tmp_path):
     assert [p.name for p in find_sorter_folders(tmp_path)] == ["kilosort3_output", "kilosort4_output", "mountainsort5_output"]
     with pytest.raises(SortingError, match="no \\*_output"):
         find_sorter_folders(tmp_path / "ibl_data")
+
+
+def test_ibl_data_of_another_sorting_is_left_out(tmp_path):
+    job = tmp_path / "job_id_603"
+    phy_folder(job / "kilosort4_output", ibl=True)
+    other, _, _ = phy_folder(job / "kilosort3_output", kind="ks3", seed=7, with_pc_features=False)
+    (other / "kilosort_overview.fig").write_bytes(b"")
+    result = read_sorting(other)
+    assert not any(column.name.startswith("ibl_") for column in result.columns)
+    assert any("ibl_data belongs to another sorting" in note for note in result.notes)
+    assert any(column.name.startswith("ibl_") for column in read_sorting(job / "kilosort4_output").columns)

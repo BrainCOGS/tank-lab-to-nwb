@@ -144,6 +144,7 @@ def phy_folder(folder, kind="ks4", n_units=5, n_channels=8, rate=30000.0, seed=1
     if ibl:
         ibl_dir = folder.parent / "ibl_data"
         ibl_dir.mkdir(exist_ok=True)
+        np.save(ibl_dir / "spikes.samples.npy", times[order].astype(np.int64))
         (ibl_dir / "cluster_metrics.csv").write_text("cluster_id,label,noise_cutoff,ks2_label\n" + "".join(f"{c},{0.5 + c / 100},{c * 0.1},{ks[c]}\n" for c in ks))
     return folder, trains, cluster_ids
 
