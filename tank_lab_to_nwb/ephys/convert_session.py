@@ -9,14 +9,17 @@ and says so in the file (units_only.py). It's only done when asked for; the sess
 A sorter folder is the one holding spike_times.npy (`kilosort_output`, `kilosort4_output`, ...); a job folder holding
 exactly one such folder is accepted too. Only the raw folder's sync file and short windows of each AP file's SY channel
 are read, never the AP samples. Behavior and spikes go on the recording's clock by the lab's rule; --probe-clock and
---iteration-time choose the two departures from it (docs/ephys-timing.md). The NWB file goes in <output> with a report beside it. Run organize_for_dandi with
-description="units", then `dandi validate`, afterwards.
+--iteration-time choose the two departures from it (docs/ephys-timing.md). The NWB file goes in <output> with a report beside it.
+
+--dandiset <folder> also names the file for DANDI under that folder (dandi organize, description "units") and runs
+`dandi validate` on it. A file dandi rejects is an error: it stays out of the folder, and the report says why.
 """
 
 import argparse
 import json
 from pathlib import Path
 
+from ..virmen.layout import DandiValidationError, organize_for_dandi
 from .clock import ITERATION_TIME, ITERATION_TIMES, PROBE_CLOCK, PROBE_CLOCKS
 from .convert import conversion_report, write_ephys_nwbfile
 from .session import build_session_sync
@@ -24,7 +27,27 @@ from .sorting import SortingError, find_sorter_folders
 from .units_only import CLOCK, TIED_TO, UnitsOnlyError, write_units_only
 from .verify import verify_ephys
 
-__all__ = ["UnitsOnlyError", "convert", "convert_units_only"]
+__all__ = ["DandiValidationError", "UnitsOnlyError", "convert", "convert_units_only"]
+
+
+def _write_report(path, report):
+    path.with_suffix(".report.json").write_text(json.dumps(report, indent=1, default=str))
+
+
+def organize_and_validate(path, dandiset, description, report):
+    """Name the file under `dandiset` and run `dandi validate` on it, and record the outcome in the file's report.
+
+    DandiValidationError is raised, after the report is written, when dandi rejects the file; it then stays out of `dandiset`.
+    """
+    try:
+        (organized,) = organize_for_dandi(path, dandiset, description=description, validate=True)
+        report["dandi"] = dict(organized=str(organized), validated=True)
+    except DandiValidationError as error:
+        report["dandi"] = dict(organized=None, validated=False, error=str(error))
+        raise
+    finally:
+        _write_report(path, report)
+    return organized
 
 
 def resolve_sorter_folder(path):
@@ -37,8 +60,13 @@ def resolve_sorter_folder(path):
     return found[0]
 
 
-def convert(log, raw_folder, output, sorter_folders, session_date=None, metadata=None, name=None, probe_clock=PROBE_CLOCK, iteration_time=ITERATION_TIME, allow_virmen_borrowed=False):
-    """Convert, verify and report, and return the path of the file. See docs/ephys-timing.md for the two clock choices."""
+def convert(log, raw_folder, output, sorter_folders, session_date=None, metadata=None, name=None, probe_clock=PROBE_CLOCK, iteration_time=ITERATION_TIME, allow_virmen_borrowed=False,
+            dandiset=None):
+    """Convert, verify and report, and return the path of the file. See docs/ephys-timing.md for the two clock choices.
+
+    With `dandiset`, the file is also named under that folder and checked by `dandi validate`; the report's "dandi" entry
+    holds the organized path, and DandiValidationError is raised if dandi rejects the file.
+    """
     log, output = Path(log), Path(output)
     output.mkdir(parents=True, exist_ok=True)
     sorter_folders = {probe: resolve_sorter_folder(folder) for probe, folder in sorter_folders.items()}
@@ -48,7 +76,9 @@ def convert(log, raw_folder, output, sorter_folders, session_date=None, metadata
     checked = verify_ephys(sync, prepared, path)
     report = conversion_report(sync, prepared)
     report["verified"] = checked
-    path.with_suffix(".report.json").write_text(json.dumps(report, indent=1, default=str))
+    _write_report(path, report)
+    if dandiset is not None:
+        organize_and_validate(path, dandiset, "units", report)
     return path
 
 
@@ -99,8 +129,9 @@ def main():
     parser.add_argument("--probe-clock", choices=PROBE_CLOCKS, default=PROBE_CLOCK, help=f"Spike times: sync_edges (drift corrected by the 1 Hz sync edges), meta_rates (sample / imSampRate, the lab's rule) or params_rate (sample / params.py rate, as the DB stores). Default {PROBE_CLOCK}.")
     parser.add_argument("--iteration-time", choices=ITERATION_TIMES, default=ITERATION_TIME, help=f"Iteration times: pipeline_index (the lab's rule) or edge (the line's edge). Default {ITERATION_TIME}.")
     parser.add_argument("--allow-virmen-borrowed", action="store_true", help="Convert a session whose pulse matching failed, with the pipeline's ViRMEn-borrowed vectors (lower accuracy; the file says so).")
+    parser.add_argument("--dandiset", type=Path, help="Also name the file for DANDI under this folder and run dandi validate on it; a file dandi rejects is an error.")
     arguments = parser.parse_args()
-    print(convert(arguments.log, arguments.raw_folder, arguments.output, dict(arguments.sorted), session_date=arguments.date, name=arguments.name, probe_clock=arguments.probe_clock, iteration_time=arguments.iteration_time, allow_virmen_borrowed=arguments.allow_virmen_borrowed))
+    print(convert(arguments.log, arguments.raw_folder, arguments.output, dict(arguments.sorted), session_date=arguments.date, name=arguments.name, probe_clock=arguments.probe_clock, iteration_time=arguments.iteration_time, allow_virmen_borrowed=arguments.allow_virmen_borrowed, dandiset=arguments.dandiset))
 
 
 if __name__ == "__main__":

@@ -23,6 +23,9 @@ python -m tank_lab_to_nwb.ephys.convert_session <behavior log.mat> <raw run fold
 A sorting that nothing ties to a recording (for example one made from a clip) can be converted alone with
 `--units-only`; its file says that its times are the sorted binary's own.
 
+Add `--dandiset <folder>` to also name the file for DANDI under that folder (`dandi organize`) and run `dandi validate`
+on it. A file dandi rejects is an error: it stays out of the folder, and the report beside the NWB file says why.
+
 ## Usage
 
 `TowersNWBConverter` (`tank_lab_to_nwb/convert_towers_task`) converts the behavior alone; it refuses SpikeGLX and

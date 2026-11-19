@@ -1,6 +1,8 @@
 """A whole synthetic ephys session, from raw sync files, a log and a sorter folder to a verified NWB file."""
 
 import json
+import re
+from pathlib import Path
 
 import numpy as np
 import probeinterface
@@ -20,6 +22,7 @@ from tests.synthetic_ephys import (
     sync_word,
     write_spikeglx,
 )
+from tank_lab_to_nwb.virmen.layout import DandiValidationError
 from tests.synthetic_log import make_block, make_log, make_trial
 
 # A low imec rate keeps the AP files small; the clock only uses the meta file's rate.
@@ -126,6 +129,38 @@ def test_whole_conversion_reads_back(session, monkeypatch):
         assert json.loads(sorting["channel_position_offset_um"]) == [11.0, 0.0]
         assert min(min(t) for t in units["spike_times"]) >= 0
         assert len(nwbfile.trials) == 5
+
+
+@pytest.fixture
+def named_log(session, monkeypatch):
+    """convert() reads the log from a path; give it the synthetic one, and keep dandi's log files in the test's folder."""
+    import tank_lab_to_nwb.ephys.convert_session as cs
+
+    real = cs.build_session_sync
+    monkeypatch.setattr(cs, "build_session_sync", lambda raw, log, **kw: real(raw, session["log"], file="log.mat", **kw))
+    monkeypatch.setenv("XDG_STATE_HOME", str(session["tmp"] / "state"))
+    return session["tmp"] / "log.mat"
+
+
+def test_conversion_is_named_and_validated_for_dandi(session, named_log):
+    dandiset = session["tmp"] / "dandiset"
+    path = convert(named_log, session["raw"], session["tmp"] / "out", {"imec0": session["sorter"].parent}, dandiset=dandiset)
+    report = json.loads(path.with_suffix(".report.json").read_text())
+    organized = Path(report["dandi"]["organized"])
+    assert report["dandi"]["validated"] is True
+    assert list(dandiset.rglob("*.nwb")) == [organized]
+    assert re.fullmatch(r"sub-[^_]+_ses-[^_]+_desc-units_behavior\+ecephys\.nwb", organized.name), organized.name
+    assert path.is_file() and organized.stat().st_size == path.stat().st_size
+
+
+def test_a_file_dandi_rejects_stops_the_conversion(session, named_log):
+    dandiset = session["tmp"] / "dandiset"
+    with pytest.raises(DandiValidationError, match="(?i)species"):
+        convert(named_log, session["raw"], session["tmp"] / "out", {"imec0": session["sorter"].parent}, metadata={"subject": {"sex": "U"}}, dandiset=dandiset)
+    report = json.loads((session["tmp"] / "out" / "log_units.report.json").read_text())
+    assert report["dandi"]["validated"] is False and "species" in report["dandi"]["error"].lower()
+    assert report["verified"]["units"] == session["cluster_ids"].size
+    assert not list(dandiset.rglob("*.nwb"))
 
 
 def test_a_trimmed_sorting_is_refused(session):
