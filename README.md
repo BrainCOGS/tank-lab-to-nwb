@@ -10,38 +10,50 @@ pip install tank-lab-to-nwb
 
 ## Ephys-Behavior Synchronization
 
-This converter integrates with the U19 DataJoint pipeline to access pre-computed synchronized timestamps between Virmen behavioral data and NIDQ/IMEC electrophysiology recordings.
+Spike-sorted units and ViRMEn behavior go into one NWB file on the ephys recording's clock, by the lab's rule: each
+logged iteration at its own pulse on the NIDQ or OneBox file (`BehaviorSync`'s `iteration_idx_vector`, recomputed from
+the raw file, so no DB is needed), and each spike at its sample. See [docs/ephys-timing.md](docs/ephys-timing.md) for
+the rule, the two switchable departures from it (`--probe-clock`, `--iteration-time`) and the evidence, and
+[SYNC_DATA_PLAN.md](SYNC_DATA_PLAN.md) for the pipeline's sync data.
 
-### Synchronization Data Structure
+```bash
+python -m tank_lab_to_nwb.ephys.convert_session <behavior log.mat> <raw run folder> <output folder> imec0=<sorter folder> [imec1=<sorter folder> ...]
+```
 
-The `BehaviorSync` table stores compact synchronization data in the `sync_data` field:
-- **trial_idx_vector**: NIDQ sample indices where each trial starts
-- **iteration_idx_vector**: Frame-by-frame NIDQ sample indices for each trial (array of arrays)
-- Fallback versions using Virmen timestamps when pulse-based sync fails
+A sorting that nothing ties to a recording (for example one made from a clip) can be converted alone with
+`--units-only`; its file says that its times are the sorted binary's own.
 
-See [SYNC_DATA_PLAN.md](SYNC_DATA_PLAN.md) for detailed documentation on the synchronization architecture.
+Add `--dandiset <folder>` to also name the file for DANDI under that folder (`dandi organize`) and run `dandi validate`
+on it. A file dandi rejects is an error: it stays out of the folder, and the report beside the NWB file says why.
 
 ## Usage
 
-There are two ways to go about converting Neuropixel and Virmen behavior data.
+`TowersNWBConverter` (`tank_lab_to_nwb/convert_towers_task`) is the neuroconv front door to the same conversion.
+`VirmenData` alone converts the behavior (`sync_timestamps`, one time per logged frame, moves it). With sorted units,
+one `Kilosort` (imec0) or `KilosortProbe<N>` key per probe and the raw run folder as `SpikeGLX`, `run_conversion` writes
+`nwbfile_path` through the code above, on the recording's clock rebuilt from the raw sync file, with its report beside it;
+a `sync_timestamps` given then must agree with that clock to one sync sample. The options of `convert()` are keyword arguments of the
+class with the same defaults: the clock's (`probe_clock`, `iteration_time`, `allow_virmen_borrowed`, `session_date`) and
+the raw data's (`raw_bands`, `raw_from`, `sync_edges`, `raw_max_seconds`; see [docs/ephys-raw.md](docs/ephys-raw.md)).
+`run_conversion(..., dandiset=<folder>)` names and validates the file for DANDI.
 
-(1) The **primary processing pipeline** synchronizes the task data with the electrophysiology data
-   through TTL pulse and writes the spiking output to the same NWB file.
-
-The required arguments for the use of the relevant functions are denoted in the comments of their
-respective sections of the conversion script. These include the file or
-folder locations of the data to be converted to NWB format, as well as several optional fields
-such as Subject information (species/age/weight).
-
-After editing the conversion script `convert_towers.py` with the proper path for Neuropixel and behavior data,
-the conversion can be executed from the terminal:
-
-```bash
-cd tank-lab-to-nwb
-python tank_lab_to_nwb/convert_towers_task/convert_towers.py
+```python
+source_data = {
+    "VirmenData": {"file_path": "<behavior log.mat>"},
+    "KilosortProbe0": {"folder_path": "<sorter folder>"},
+    "SpikeGLX": {"folder_path": "<raw run folder>"},
+}
+converter = TowersNWBConverter(source_data=source_data)
+metadata = converter.get_metadata()
+metadata["NWBFile"]["experimenter"] = ["Last, First"]
+converter.run_conversion(nwbfile_path="session.nwb", metadata=metadata, overwrite=True)
 ```
 
-Alternatively, the conversion can be done using a custom tailored jupyter notebook `spikeinterface_pipeline.ipynb`
+Raw bands are read from the run folder, so the old `SpikeGLXAP` and `SpikeGLXLFP` keys are refused in favor of
+`raw_bands`. Imaging goes through `tank_lab_to_nwb.imaging`. The old example script
+`tank_lab_to_nwb/convert_towers_task/convert_towers.py` builds the converter with raw-band interfaces and no longer runs.
+
+The older exploratory notebook `spikeinterface_pipeline.ipynb` (prototype, not maintained)
 that can be launched from the terminal:
 
 ```bash

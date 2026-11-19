@@ -54,22 +54,32 @@ class VirmenDataInterface(BaseTemporalAlignmentInterface):
 
     def _aligned_session(self):
         """The session with every time moved onto the aligned clock."""
-        original = self.get_original_timestamps()
-
-        def move(times):
-            # np.interp clamps outside the frames, and a block or trial can end after the last frame.
-            times = np.asarray(times, dtype="float64")
-            moved = np.interp(times, original, self._aligned)
-            before, after = times < original[0], times > original[-1]
-            moved[before] = times[before] + self._aligned[0] - original[0]
-            moved[after] = times[after] + self._aligned[-1] - original[-1]
-            return moved
-
-        def move_table(columns):
-            return [replace(c, data=move(c.data)) if c.name in ("start_time", "stop_time") else c for c in columns]
-
-        series = [replace(s, timestamps=move(s.timestamps)) for s in self.session.series]
-        return replace(self.session, trials=move_table(self.session.trials), epochs=move_table(self.session.epochs), series=series)
+        return aligned_session(self.session, self.get_original_timestamps(), self._aligned)
 
     def add_to_nwbfile(self, nwbfile, metadata=None, **conversion_options):
         add_session_to_nwbfile(nwbfile, self.session if self._aligned is None else self._aligned_session())
+
+
+def aligned_session(session, original, aligned):
+    """A copy of the session with every time moved from `original` frame times onto `aligned` ones.
+
+    Frame times are replaced one for one. Any other time (a trial's or block's start and stop) is interpolated between
+    the frames around it, and keeps its distance from the first or last frame outside them.
+    """
+    original = np.asarray(original, dtype="float64")
+    aligned = np.asarray(aligned, dtype="float64")
+
+    def move(times):
+        # np.interp clamps outside the frames, and a block or trial can end after the last frame.
+        times = np.asarray(times, dtype="float64")
+        moved = np.interp(times, original, aligned)
+        before, after = times < original[0], times > original[-1]
+        moved[before] = times[before] + aligned[0] - original[0]
+        moved[after] = times[after] + aligned[-1] - original[-1]
+        return moved
+
+    def move_table(columns):
+        return [replace(c, data=move(c.data)) if c.name in ("start_time", "stop_time") else c for c in columns]
+
+    series = [replace(s, timestamps=move(s.timestamps)) for s in session.series]
+    return replace(session, trials=move_table(session.trials), epochs=move_table(session.epochs), series=series)

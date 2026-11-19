@@ -10,17 +10,17 @@ from pynwb import NWBHDF5IO, NWBFile
 from pynwb.behavior import Position, SpatialSeries
 from pynwb.file import Subject
 
-from tank_lab_to_nwb.virmen.layout import insert_description, insert_session_id, organize_for_dandi, write_stub_dandiset_yaml
+from tank_lab_to_nwb.virmen.layout import DandiValidationError, insert_description, insert_session_id, organize_for_dandi, write_stub_dandiset_yaml
 
 
-def _write_nwb(path, subject_id="mouse-1", session_id="20260101"):
+def _write_nwb(path, subject_id="mouse-1", session_id="20260101", species="Mus musculus"):
     nwbfile = NWBFile(
         session_description="d",
         identifier=str(uuid4()),
         session_start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
         session_id=session_id,
     )
-    nwbfile.subject = Subject(subject_id=subject_id, species="Mus musculus", sex="U", age="P90D")
+    nwbfile.subject = Subject(subject_id=subject_id, species=species, sex="U", age="P90D")
     behavior = nwbfile.create_processing_module("behavior", "behavior")
     series = SpatialSeries(name="xy", data=np.zeros((2, 2)), reference_frame="r", timestamps=[0.0, 1.0], unit="cm")
     behavior.add(Position(spatial_series=series))
@@ -115,12 +115,56 @@ class TestOrganize:
         with pytest.raises(ValueError, match="no NWB files"):
             organize_for_dandi(staging, tmp_path / "dandiset")
 
+    def test_one_file_is_organized_alone(self, staging, tmp_path):
+        _write_nwb(staging / "a.nwb", session_id="20260101")
+        _write_nwb(staging / "b.nwb", session_id="20260102")
+        paths = organize_for_dandi(staging / "a.nwb", tmp_path / "dandiset")
+        assert [p.name for p in paths] == ["sub-mouse-1_ses-20260101_behavior.nwb"]
+        assert list((tmp_path / "dandiset").rglob("*.nwb")) == paths
+
     def test_file_without_a_subject_fails(self, staging, tmp_path):
         nwbfile = NWBFile("d", str(uuid4()), datetime(2026, 1, 1, tzinfo=timezone.utc))
         with NWBHDF5IO(str(staging / "a.nwb"), "w") as io:
             io.write(nwbfile)
         with pytest.raises(Exception):
             organize_for_dandi(staging, tmp_path / "dandiset")
+
+
+class TestValidate:
+    """organize_for_dandi(validate=True) runs `dandi validate` before anything enters the dandiset."""
+
+    @pytest.fixture(autouse=True)
+    def dandi_logs(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    @pytest.fixture
+    def staging(self, tmp_path):
+        folder = tmp_path / "staging"
+        folder.mkdir()
+        return folder
+
+    def test_a_valid_file_enters_the_dandiset(self, staging, tmp_path):
+        _write_nwb(staging / "a.nwb")
+        paths = organize_for_dandi(staging, tmp_path / "dandiset", validate=True)
+        assert [p.name for p in paths] == ["sub-mouse-1_ses-20260101_behavior.nwb"] and paths[0].is_file()
+
+    def test_a_file_dandi_rejects_is_an_error_and_stays_out(self, staging, tmp_path):
+        _write_nwb(staging / "a.nwb")
+        (earlier,) = organize_for_dandi(staging, tmp_path / "dandiset", validate=True)
+        kept = earlier.read_bytes()
+        _write_nwb(staging / "a.nwb", species=None)
+        with pytest.raises(DandiValidationError, match="(?i)species"):
+            organize_for_dandi(staging, tmp_path / "dandiset", validate=True)
+        # The valid file of the same name from before is still there, and the rejected one is still in staging.
+        assert earlier.read_bytes() == kept
+        assert list((tmp_path / "dandiset").rglob("*.nwb")) == [earlier]
+        assert (staging / "a.nwb").is_file() and not list(tmp_path.glob(".organizing-*"))
+
+    def test_validating_refuses_to_move_the_sources(self, staging, tmp_path):
+        source = _write_nwb(staging / "a.nwb")
+        with pytest.raises(ValueError, match="copy"):
+            organize_for_dandi(staging, tmp_path / "dandiset", files_mode="move", validate=True)
+        assert source.is_file()
 
 
 class TestInsertDescription:

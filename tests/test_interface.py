@@ -1,9 +1,5 @@
 """VirmenDataInterface, and the whole local pipeline: staging, dandi organize, the session fix, dandi validate."""
 
-import os
-import shutil
-import subprocess
-
 import numpy as np
 import pytest
 from pynwb import NWBHDF5IO
@@ -12,6 +8,7 @@ import tank_lab_to_nwb.virmen.convert as convert
 import tank_lab_to_nwb.virmen.interface as interface_module
 from tank_lab_to_nwb.virmen.convert_folder import convert_folder
 from tank_lab_to_nwb.virmen.interface import VirmenDataInterface
+from tank_lab_to_nwb.virmen.layout import validate_for_dandi
 from tank_lab_to_nwb.virmen.verify import verify_round_trip
 from tests.synthetic_log import make_block, make_log, make_trial
 
@@ -145,10 +142,8 @@ class TestPipeline:
         with pytest.raises(ValueError, match="no logs"):
             convert_folder(tmp_path, tmp_path / "nwb")
 
-    def test_organized_folder_passes_dandi_validate(self, source, tmp_path):
+    def test_organized_folder_passes_dandi_validate(self, source, tmp_path, monkeypatch):
         output = tmp_path / "nwb"
         convert_folder(source, output)
-        dandi = shutil.which("dandi", path=os.path.dirname(os.sys.executable))
-        result = subprocess.run([dandi, "validate", str(output / "dandiset")], capture_output=True, text=True,
-                                env={**os.environ, "XDG_STATE_HOME": str(tmp_path / "state")})
-        assert result.returncode == 0, result.stdout + result.stderr
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        validate_for_dandi([output / "dandiset"])  # raises DandiValidationError, with dandi's output, on any error
