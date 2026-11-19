@@ -71,6 +71,7 @@ class SortedProbe:
     files: dict = field(default_factory=dict)  # name -> what was read from it, for the record
     notes: list = field(default_factory=list)
     n_spikes_read: int | None = None  # kept when spike_samples is let go after mapping
+    ignored: list = field(default_factory=list)  # files in the folder (and its spikeinterface/ subfolder) this reader didn't use
 
     @property
     def n_spikes(self):
@@ -256,6 +257,25 @@ def _peak_channels(folder, unit_ids, spike_clusters, spike_templates, channel_ma
     return out
 
 
+# Read for every sorting: the trains, channels, templates (for peak channels), params and the sorter's identity.
+_ALWAYS_READ = {
+    "spike_times.npy", "spike_clusters.npy", "spike_templates.npy", "params.py", "channel_map.npy", "channel_positions.npy",
+    "templates.npy", "sorter_provenance.json", "kilosort4.log", "ops.npy", "cluster_info.tsv", "cluster_group.tsv",
+    "spikeinterface/spikeinterface_recording.json",
+}
+# Looked at with stat only, never read.
+_STAT_ONLY = {"temp_wh.dat", "kilosort_overview.fig"}
+
+
+def _ignored(folder, files):
+    """Every file under the folder this reader didn't use, as paths relative to it, so the file can say what was left out."""
+    folder = Path(folder)
+    # Metrics files are named relative to the job folder, as <sorter folder>/spikeinterface/... or ibl_data/...
+    used = _ALWAYS_READ | _STAT_ONLY | set(files) | {name.split("/", 1)[1] for name in files if name.startswith(folder.name + "/")}
+    found = sorted(str(path.relative_to(folder)) for path in Path(folder).rglob("*") if path.is_file())
+    return [name for name in found if name not in used and not name.startswith(".phy/")]
+
+
 def split_trains(spike_times, spike_clusters):
     """(sorted cluster ids, per cluster its spike samples as int64), keeping every spike."""
     spike_times = np.asarray(spike_times).ravel().astype(np.int64)
@@ -322,6 +342,7 @@ def read_sorting(folder):
         columns=columns,
         files=files,
         notes=notes,
+        ignored=_ignored(folder, files),
     )
 
 

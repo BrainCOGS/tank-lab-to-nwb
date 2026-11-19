@@ -299,6 +299,31 @@ def alignment_rows(sync, prepared=()):
     return rows
 
 
+def sorting_rows(probe, how):
+    """(key, value, meaning) rows saying what sorted one probe, from which input, and which files were read or left out."""
+    s = probe.sorted
+    rows = [
+        ("folder", str(s.folder), "The sorter output folder."),
+        ("sorter", s.sorter, "The sorter, as its files say."),
+        ("sorter_version", s.sorter_version, "Its version, or unknown when no file records it."),
+        ("sorter_evidence", s.sorter_evidence, "Which files said so."),
+        ("sorted_input", s.sorted_input, "The binary the sorter read, as its files name it."),
+        ("sample_origin", s.sample_origin, "What sample 0 of spike_times.npy is."),
+        ("sample_origin_check", how, "Why that sample 0 is taken as the raw AP file's."),
+        ("params_sample_rate", repr(s.sample_rate_params), "params.py sample_rate, the nominal rate the sorter was told; the DB's CuratedClustering divides by it. Used for spike times only under probe_clock params_rate."),
+        ("spike_time_rate", probe.departure["sample_rate_used"], "The rate this file divided spike samples by, before any sync map."),
+        ("n_units", str(s.unit_ids.size), "Clusters written to the units table."),
+        ("n_spikes", str(int(probe.counts.sum())), "Spikes written."),
+        ("channel_position_offset_um", json.dumps([float(v) for v in probe.position_check[1]]), "Constant offset of channel_positions.npy from the meta file's geometry, x and y; the shapes agree within channel_position_max_difference_um."),
+        ("channel_position_max_difference_um", repr(probe.position_check[0]), "Largest difference after that offset."),
+        ("channel_source", probe.position_check[2], "How each sorter channel was matched to a saved AP channel."),
+    ]
+    rows += [(f"file.{name}", text, "A per-cluster table that was read, and its rows.") for name, text in s.files.items()]
+    rows += [(f"note.{i}", note, "Something about the tables a reader should know.") for i, note in enumerate(s.notes, start=1)]
+    rows += [(f"ignored.{i}", name, "A file in the sorter folder this converter didn't read.") for i, name in enumerate(s.ignored, start=1)]
+    return rows
+
+
 def _add_ecephys_tables(nwbfile, sync, prepared):
     module = nwbfile.create_processing_module("ecephys", "How behavior and spikes were put on the recording's clock, and what sorted the spikes.")
     module.add(_rows_table("ephys_sync_alignment", "How the behavior and the ephys streams were put on one clock, and how far to trust it.", alignment_rows(sync, prepared)))
@@ -333,26 +358,7 @@ def _add_ecephys_tables(nwbfile, sync, prepared):
             ("sync_seconds", "Its value on the sync stream's clock.", np.concatenate(knot_values)),
         ]))
     for probe, how in prepared:
-        s = probe.sorted
-        rows = [
-            ("folder", str(s.folder), "The sorter output folder."),
-            ("sorter", s.sorter, "The sorter, as its files say."),
-            ("sorter_version", s.sorter_version, "Its version, or unknown when no file records it."),
-            ("sorter_evidence", s.sorter_evidence, "Which files said so."),
-            ("sorted_input", s.sorted_input, "The binary the sorter read, as its files name it."),
-            ("sample_origin", s.sample_origin, "What sample 0 of spike_times.npy is."),
-            ("sample_origin_check", how, "Why that sample 0 is taken as the raw AP file's."),
-            ("params_sample_rate", repr(s.sample_rate_params), "params.py sample_rate, the nominal rate the sorter was told; the DB's CuratedClustering divides by it. Used for spike times only under probe_clock params_rate."),
-            ("spike_time_rate", probe.departure["sample_rate_used"], "The rate this file divided spike samples by, before any sync map."),
-            ("n_units", str(s.unit_ids.size), "Clusters written to the units table."),
-            ("n_spikes", str(int(probe.counts.sum())), "Spikes written."),
-            ("channel_position_offset_um", json.dumps([float(v) for v in probe.position_check[1]]), "Constant offset of channel_positions.npy from the meta file's geometry, x and y; the shapes agree within channel_position_max_difference_um."),
-            ("channel_position_max_difference_um", repr(probe.position_check[0]), "Largest difference after that offset."),
-            ("channel_source", probe.position_check[2], "How each sorter channel was matched to a saved AP channel."),
-        ]
-        rows += [(f"file.{name}", text, "A per-cluster table that was read, and its rows.") for name, text in s.files.items()]
-        rows += [(f"note.{i}", note, "Something about the tables a reader should know.") for i, note in enumerate(s.notes, start=1)]
-        module.add(_rows_table(f"sorting_{probe.name}", f"What sorted {probe.name}, from which input, and which files were read.", rows))
+        module.add(_rows_table(f"sorting_{probe.name}", f"What sorted {probe.name}, from which input, and which files were read.", sorting_rows(probe, how)))
 
 
 def build_ephys_nwbfile(sync, sorter_folders, metadata=None):
