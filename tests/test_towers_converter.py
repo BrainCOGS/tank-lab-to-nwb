@@ -218,3 +218,44 @@ def test_dandiset_names_and_validates_the_file(session, towers):  # noqa: F811
     report = json.loads(path.with_suffix(".report.json").read_text())
     assert report["dandi"]["validated"] is True
     assert [p.name for p in dandiset.rglob("*.nwb")] == [report["dandi"]["organized"].rsplit("/", 1)[-1]]
+
+
+# --- raw bands, chosen by the same options as convert() ------------------------------------------------------------
+
+
+def test_raw_bands_go_through_the_class_as_through_convert(session, towers, named_log):  # noqa: F811
+    by_function = convert(named_log, session["raw"], session["tmp"] / "function", {"imec0": session["sorter"].parent}, raw_bands=("ap",))
+    by_class = session["tmp"] / "class" / "out.nwb"
+    towers(raw_bands=("ap",)).run_conversion(nwbfile_path=by_class)
+    reports = [json.loads(path.with_suffix(".report.json").read_text()) for path in (by_function, by_class)]
+    assert reports[0]["verified"]["raw"] == reports[1]["verified"]["raw"] and reports[1]["verified"]["raw"]["series"] == 1
+    with h5py.File(by_function, "r") as a, h5py.File(by_class, "r") as b:
+        series = "acquisition/ElectricalSeriesAPImec0"
+        assert np.array_equal(a[f"{series}/data"][:], b[f"{series}/data"][:]) and a[f"{series}/data"].shape[0] > 0
+        edges = "processing/ecephys/spikeglx_sync_edges"
+        assert sorted(a[edges]) == sorted(b[edges]) and all(np.array_equal(a[edges][name][:], b[edges][name][:]) for name in a[edges])
+
+
+def test_the_class_writes_no_raw_data_when_told(session, towers):  # noqa: F811
+    path = session["tmp"] / "out.nwb"
+    towers(raw_bands=(), sync_edges=False).run_conversion(nwbfile_path=path)
+    with h5py.File(path, "r") as f:
+        assert "ElectricalSeriesAPImec0" not in f["acquisition"] and "spikeglx_sync_edges" not in f["processing/ecephys"]
+    assert "raw" not in json.loads(path.with_suffix(".report.json").read_text())["verified"]
+
+
+def test_a_file_with_raw_bands_is_named_ecephys_for_dandi_through_the_class(session, towers):  # noqa: F811
+    path = session["tmp"] / "out.nwb"
+    towers(raw_bands=("ap",)).run_conversion(nwbfile_path=path, dandiset=session["tmp"] / "dandiset")
+    organized = json.loads(path.with_suffix(".report.json").read_text())["dandi"]["organized"]
+    assert "_desc-ecephys_" in organized
+
+
+def test_raw_band_keys_name_the_option(converter, tmp_path):
+    with pytest.raises(ValueError, match="raw_bands="):
+        TowersNWBConverter(dict(VirmenData=dict(file_path=str(tmp_path / "session.mat")), SpikeGLXAP=dict(folder_path=str(tmp_path))))
+
+
+def test_raw_options_need_units(converter, tmp_path):
+    with pytest.raises(ValueError, match="raw_bands"):
+        TowersNWBConverter(dict(VirmenData=dict(file_path=str(tmp_path / "session.mat"))), raw_bands=("ap",))

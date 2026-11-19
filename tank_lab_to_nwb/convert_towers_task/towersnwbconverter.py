@@ -3,7 +3,7 @@
     source_data = {"VirmenData": {"file_path": <log.mat>}}                    # behavior, always
     source_data["KilosortProbe0"] = {"folder_path": <sorter folder>}          # units of imec0; "Kilosort" is imec0 too
     source_data["SpikeGLX"] = {"folder_path": <raw SpikeGLX run folder>}      # the clock, required with units
-    converter = TowersNWBConverter(source_data, sync_timestamps=None)
+    converter = TowersNWBConverter(source_data, sync_timestamps=None, raw_bands=("lf",))
     converter.run_conversion(nwbfile_path=..., metadata=converter.get_metadata(), overwrite=True)
 
 Behavior alone is a neuroconv conversion of `VirmenDataInterface`; `sync_timestamps`, one time per logged frame, moves
@@ -14,7 +14,9 @@ meta and SY channel (docs/ephys-timing.md), checked by reading the file back, wi
 `sync_timestamps` sets nothing: it must agree with the recomputed iteration times to one sync sample, and the report says
 it did. Every refusal of the ephys converter reaches the caller unchanged.
 
-Raw bands (SpikeGLXAP, SpikeGLXLFP) and imaging aren't written through this class.
+Raw SpikeGLX bands go in the same file on the same clock, chosen as in the ephys converter (docs/ephys-raw.md):
+`raw_bands` ("ap", "lf"; LF by default), `raw_from` for a folder of clips, `sync_edges` and `raw_max_seconds`. They are
+read from the run folder, so the old SpikeGLXAP and SpikeGLXLFP keys are refused. Imaging isn't written through this class.
 """
 
 from pathlib import Path
@@ -23,9 +25,11 @@ from neuroconv import NWBConverter
 
 from ..ephys import convert_session
 from ..ephys.clock import ITERATION_TIME, PROBE_CLOCK
+from ..ephys.raw import RAW_BANDS
 from ..virmen.interface import VirmenDataInterface
 
 CLOCK_DEFAULTS = dict(probe_clock=PROBE_CLOCK, iteration_time=ITERATION_TIME, allow_virmen_borrowed=False, session_date=None)
+RAW_DEFAULTS = dict(raw_bands=RAW_BANDS, raw_from=None, sync_edges=True, raw_max_seconds=None)
 # NWBFile entries the units file takes from the caller's metadata, by the names virmen.convert.build_nwbfile uses.
 NWBFILE_EDITS = ("session_description", "experimenter", "institution", "lab", "experiment_description", "keywords")
 # Made again by neuroconv on every get_metadata(); nothing to carry.
@@ -49,19 +53,21 @@ class TowersNWBConverter(NWBConverter):
     """A ViRMEn behavior session, with the sorted units of its Neuropixels probes when Kilosort keys are given.
 
     The subject and session come from the log, through the ndx-tank-metadata field registry. `probe_clock`,
-    `iteration_time`, `allow_virmen_borrowed` and `session_date` are the ephys converter's clock options, with its
-    defaults; they apply only with units. `ttl_source`, the old TTL alignment, is refused.
+    `iteration_time`, `allow_virmen_borrowed` and `session_date` are the ephys converter's clock options, and `raw_bands`,
+    `raw_from`, `sync_edges` and `raw_max_seconds` its raw-data options, all with its defaults; they apply only with
+    units. `ttl_source`, the old TTL alignment, is refused.
     """
 
     data_interface_classes = {"VirmenData": VirmenDataInterface}
 
-    def __init__(self, source_data, ttl_source=None, sync_timestamps=None, verbose=False, *, probe_clock=PROBE_CLOCK, iteration_time=ITERATION_TIME, allow_virmen_borrowed=False, session_date=None):
+    def __init__(self, source_data, ttl_source=None, sync_timestamps=None, verbose=False, *, probe_clock=PROBE_CLOCK, iteration_time=ITERATION_TIME, allow_virmen_borrowed=False, session_date=None,
+                 raw_bands=RAW_BANDS, raw_from=None, sync_edges=True, raw_max_seconds=None):
         if ttl_source is not None:
             raise ValueError("ttl_source: the TTL alignment it chose is gone. With units, give the raw run folder as source_data['SpikeGLX']; the clock is built from it (docs/ephys-timing.md).")
         source_data = dict(source_data)
-        raw_bands = sorted(key for key in source_data if key.startswith("SpikeGLX") and key != "SpikeGLX")  # SpikeGLXAP, SpikeGLXLFP, ...
-        if raw_bands:
-            raise ValueError(f"{', '.join(raw_bands)}: raw bands are not written through TowersNWBConverter yet; SpikeGLX alone gives the run folder for the clock of sorted units")
+        band_keys = sorted(key for key in source_data if key.startswith("SpikeGLX") and key != "SpikeGLX")  # SpikeGLXAP, SpikeGLXLFP, ...
+        if band_keys:
+            raise ValueError(f"{', '.join(band_keys)}: raw bands are read from the run folder given as SpikeGLX; choose them with raw_bands=(\"ap\", \"lf\") instead of a key per band")
         imaging = sorted(key for key in source_data if key.startswith(("Suite2p", "Tiff")))
         if imaging:
             raise ValueError(f"{', '.join(imaging)}: imaging is converted by tank_lab_to_nwb.imaging, not by TowersNWBConverter")
@@ -78,16 +84,18 @@ class TowersNWBConverter(NWBConverter):
         if unknown:
             raise ValueError(f"{', '.join(unknown)}: TowersNWBConverter takes VirmenData, Kilosort or KilosortProbe<N>, and SpikeGLX")
         clock = dict(probe_clock=probe_clock, iteration_time=iteration_time, allow_virmen_borrowed=allow_virmen_borrowed, session_date=session_date)
+        raw = dict(raw_bands=tuple(raw_bands or ()), raw_from=raw_from, sync_edges=sync_edges, raw_max_seconds=raw_max_seconds)
         if self.sorter_folders and spikeglx is None:
             raise ValueError(SPIKEGLX_NEEDED.format(keys=", ".join(sorted(self.sorter_folders))))
         if not self.sorter_folders:
             if spikeglx is not None:
-                raise ValueError("SpikeGLX: the run folder is the clock of sorted units, and no Kilosort key is given; raw bands are not written through TowersNWBConverter yet")
-            changed = [name for name, value in clock.items() if value != CLOCK_DEFAULTS[name]]
+                raise ValueError("SpikeGLX: the run folder is the clock of sorted units, and no Kilosort key is given; raw bands are written only beside units")
+            changed = [name for name, value in {**clock, **raw}.items() if value != {**CLOCK_DEFAULTS, **RAW_DEFAULTS}[name]]
             if changed:
-                raise ValueError(f"{', '.join(changed)}: clock options of a conversion with units; no Kilosort key is given")
+                raise ValueError(f"{', '.join(changed)}: options of a conversion with units; no Kilosort key is given")
         self.raw_folder = None if spikeglx is None else Path(spikeglx["folder_path"])
         self.clock_options = clock
+        self.raw_options = raw
         self._sync_timestamps = sync_timestamps
         super().__init__(source_data=source_data, verbose=verbose)
 
@@ -114,7 +122,7 @@ class TowersNWBConverter(NWBConverter):
         path.parent.mkdir(parents=True, exist_ok=True)
         log = self.data_interface_objects["VirmenData"].source_data["file_path"]
         return convert_session.convert_to_file(
-            log, self.raw_folder, path, self.sorter_folders, metadata=self._units_metadata(metadata), dandiset=dandiset, sync_timestamps=self._sync_timestamps, **self.clock_options
+            log, self.raw_folder, path, self.sorter_folders, metadata=self._units_metadata(metadata), dandiset=dandiset, sync_timestamps=self._sync_timestamps, **self.clock_options, **self.raw_options
         )
 
     def _units_metadata(self, metadata):

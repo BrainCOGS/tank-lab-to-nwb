@@ -32,8 +32,9 @@ on it. A file dandi rejects is an error: it stays out of the folder, and the rep
 `VirmenData` alone converts the behavior (`sync_timestamps`, one time per logged frame, moves it). With sorted units,
 one `Kilosort` (imec0) or `KilosortProbe<N>` key per probe and the raw run folder as `SpikeGLX`, `run_conversion` writes
 `nwbfile_path` through the code above, on the recording's clock rebuilt from the raw sync file, with its report beside it;
-a `sync_timestamps` given then must agree with that clock to one sync sample. The clock options of `convert()`
-(`probe_clock`, `iteration_time`, `allow_virmen_borrowed`, `session_date`) are keyword arguments of the class, and
+a `sync_timestamps` given then must agree with that clock to one sync sample. The options of `convert()` are keyword arguments of the
+class with the same defaults: the clock's (`probe_clock`, `iteration_time`, `allow_virmen_borrowed`, `session_date`) and
+the raw data's (`raw_bands`, `raw_from`, `sync_edges`, `raw_max_seconds`; see [docs/ephys-raw.md](docs/ephys-raw.md)).
 `run_conversion(..., dandiset=<folder>)` names and validates the file for DANDI.
 
 ```python
@@ -48,9 +49,9 @@ metadata["NWBFile"]["experimenter"] = ["Last, First"]
 converter.run_conversion(nwbfile_path="session.nwb", metadata=metadata, overwrite=True)
 ```
 
-Raw bands (`SpikeGLXAP`, `SpikeGLXLFP`) aren't written through the class yet, and imaging goes through
-`tank_lab_to_nwb.imaging`. The old example script `tank_lab_to_nwb/convert_towers_task/convert_towers.py` builds the
-converter with raw-band interfaces and no longer runs.
+Raw bands are read from the run folder, so the old `SpikeGLXAP` and `SpikeGLXLFP` keys are refused in favor of
+`raw_bands`. Imaging goes through `tank_lab_to_nwb.imaging`. The old example script
+`tank_lab_to_nwb/convert_towers_task/convert_towers.py` builds the converter with raw-band interfaces and no longer runs.
 
 The older exploratory notebook `spikeinterface_pipeline.ipynb` (prototype, not maintained)
 that can be launched from the terminal:
