@@ -1,5 +1,9 @@
 # Raw SpikeGLX data in the NWB file
 
+`python -m tank_lab_to_nwb.ephys.convert_session ... [--raw-bands ap lf] [--raw-folder <clips>] [--raw-max-seconds S]`
+writes the units file (`docs/ephys-timing.md`) with raw data beside it: LF and the sync edges by default (the file is
+then `<name>_ecephys.nwb`), AP only when asked, nothing raw with an empty `--raw-bands` and `--no-sync-edges`.
+
 How `tank_lab_to_nwb/ephys/` writes the AP and LF bands and the sync lines. The clock and the electrode table belong to
 the units conversion (`docs/ephys-timing.md`); this code takes both as arguments.
 
@@ -43,6 +47,19 @@ a spike is. The rule above therefore writes timestamps for such a probe, which c
 
 The timestamp cost was measured on a linear 60 s ramp (`B/bench/timestamp_cost.txt`); a ramp bent by the drift
 compresses the same way, because shuffle keeps the slowly changing high bytes together.
+
+### LF on the AP's clock
+
+The clock maps AP samples. An LF sample goes through the AP sample taken at the same instant, so LF, AP and spikes
+share one map. That sample was measured on S3's SY edges (60 per probe), and it differs by where the LF came from:
+
+- SpikeGLX's own LF (NP1) counts on the AP counter divided by 12: LF sample k is AP sample
+  `12 × (LF firstSample + k) − AP firstSample`. On S3, every LF edge then lies 0–11 AP samples after its AP edge, as
+  one LF period of quantization allows.
+- CatGT's `tcat` LF keeps every 12th sample of the AP file: LF sample k is AP sample `12 k`. Its `firstSample` is the
+  AP's divided by 12 and rounded down; using it would put the LF 11 AP samples (0.37 ms) early on S3.
+
+Timing LF by `k / LF imSampRate` from the file start is right for CatGT LF, but 11 AP samples (0.37 ms) late for NP1.
 
 ## Sync edges
 
