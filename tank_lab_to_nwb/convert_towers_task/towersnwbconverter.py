@@ -2,8 +2,8 @@
 
 It used to combine SpikeGLX and per-probe Kilosort interfaces too, with a single `sync_timestamps` array that skipped
 Kilosort and no drift correction. Spike-sorted units now have one supported path, `tank_lab_to_nwb.ephys.convert_session`,
-which puts them on the behavior clock as docs/ephys-timing.md describes. This converter refuses ephys interfaces and
-says where to go, rather than writing spikes on an unknown clock.
+which puts them and the behavior on the recording's clock as docs/ephys-timing.md describes. This converter refuses
+ephys interfaces and says where to go, rather than writing spikes on an unknown clock.
 """
 
 from neuroconv import NWBConverter
@@ -12,7 +12,7 @@ from ..virmen.interface import VirmenDataInterface
 
 EPHYS_MOVED = (
     "{keys}: ephys no longer goes through TowersNWBConverter, whose single sync_timestamps array left Kilosort units off "
-    "the behavior clock. Convert units with `python -m tank_lab_to_nwb.ephys.convert_session <log> <raw run folder> <output> "
+    "the clock of the behavior. Convert units with `python -m tank_lab_to_nwb.ephys.convert_session <log> <raw run folder> <output> "
     "imec0=<sorter folder> ...` (see docs/ephys-timing.md)."
 )
 
