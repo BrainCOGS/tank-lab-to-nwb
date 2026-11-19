@@ -15,6 +15,7 @@ Times are written as `starting_time` + `rate` when the clock is a straight line 
 Data are read from the file in time blocks, so memory stays at about `buffer_bytes` whatever the file size.
 """
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -108,11 +109,25 @@ class SpikeGLXChunks(GenericDataChunkIterator):
     def _get_data(self, selection):
         rows, columns = selection
         channels = self._channels[columns]
-        # A plain positioned read, not a memory map: pages read through a map stay resident (and count against the
-        # process) until the kernel needs them, so on a 92 GB file memory would track the page cache, not the buffer.
+        # A plain positioned read, not a memory map, and the pages dropped from the cache afterwards: pages read through a
+        # map stay resident and count against the process, and cached pages count against the cgroup, so on a 92 GB file
+        # memory would otherwise track the page cache instead of the buffer.
         row_bytes = 2 * self._stream.n_channels
-        block = np.fromfile(self._stream.bin_path, dtype=np.int16, count=(rows.stop - rows.start) * self._stream.n_channels, offset=rows.start * row_bytes)
-        return block.reshape(-1, self._stream.n_channels)[:, channels[0] : channels[-1] + 1]
+        offset, size = rows.start * row_bytes, (rows.stop - rows.start) * row_bytes
+        fd = os.open(self._stream.bin_path, os.O_RDONLY)
+        try:
+            raw = bytearray(size)
+            view, done = memoryview(raw), 0
+            while done < size:
+                got = os.preadv(fd, [view[done:]], offset + done)
+                if got == 0:
+                    raise OSError(f"{self._stream.bin_path}: ended {size - done} bytes early")
+                done += got
+            os.posix_fadvise(fd, offset, size, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+        block = np.frombuffer(raw, dtype=np.int16).reshape(-1, self._stream.n_channels)
+        return block[:, channels[0] : channels[-1] + 1]
 
     def _get_maxshape(self):
         return (self._n, self._channels.size)
