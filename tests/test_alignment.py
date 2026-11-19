@@ -303,3 +303,64 @@ def test_labels_keep_each_block():
     labels = frame_labels(acquisition, [5, 4])
     assert labels["block"].tolist() == [1, 1, 2]
     assert labels["trial"].tolist() == [5, 5, 1]
+
+
+def _imaged(frame_times, trials, start_offset=0.0):
+    """An acquisition with one packet per frame, from trials given as (block, trial, iteration times since trial start, start).
+
+    Packets go to each frame whose time falls in a trial's logged span, carrying the iteration that frame lands on.
+    """
+    frame_times = np.asarray(frame_times, dtype="float64")
+    rows = []
+    for block, trial, times, start in trials:
+        times = np.asarray(times, dtype="float64")
+        for index, t in enumerate(frame_times):
+            elapsed = t - start_offset - start
+            if times[0] <= elapsed <= times[-1]:
+                rows.append((index, t, block, trial, int(np.searchsorted(times, elapsed, side="right"))))
+    frame_index, timestamp, block, trial, iteration = (np.asarray(column) for column in zip(*rows))
+    packets = _packets(block, trial, iteration, timestamp)
+    packets["frame_index"] = frame_index.astype("int64")
+    frames = dict(frame_number=np.arange(1, frame_times.size + 1), timestamp=frame_times)
+    clock = {(b, t): (start, np.asarray(times, dtype="float64")) for b, t, times, start in trials}
+    return SimpleNamespace(frames=frames, packets=packets), clock
+
+
+_TRIAL = np.arange(0, 1.0, 0.05)  # 20 iterations over 0.95 s
+
+
+def test_a_trial_imaging_stopped_during_gets_no_labels():
+    acquisition, clock = _imaged(np.arange(0, 2.5, 0.1), [(1, 1, _TRIAL, 0.2), (1, 2, _TRIAL, 2.0)])
+    labels = frame_labels(acquisition, [2], clock)
+    assert labels["partly_imaged"] == [(1, 2)]
+    assert set(labels["trial"].tolist()) == {0, 1}
+    assert not labels["iteration"][labels["trial"] == 0][-5:].any()
+
+
+def test_a_trial_imaging_started_during_gets_no_labels():
+    acquisition, clock = _imaged(np.arange(0.5, 3.0, 0.1), [(1, 1, _TRIAL, 0.0), (1, 2, _TRIAL, 1.5)])
+    labels = frame_labels(acquisition, [2], clock)
+    assert labels["partly_imaged"] == [(1, 1)]
+    assert set(labels["trial"].tolist()) == {0, 2}
+
+
+def test_fully_imaged_trials_keep_their_labels():
+    acquisition, clock = _imaged(np.arange(0, 3.0, 0.1), [(1, 1, _TRIAL, 0.2), (1, 2, _TRIAL, 1.5)])
+    with_rule = frame_labels(acquisition, [2], clock)
+    without = frame_labels(acquisition, [2])
+    assert with_rule["partly_imaged"] == []
+    for name in ("block", "trial", "iteration"):
+        assert with_rule[name].tolist() == without[name].tolist()
+
+
+def test_a_trial_ending_within_a_frame_of_the_last_frame_counts_as_imaged():
+    acquisition, clock = _imaged(np.arange(0, 1.2, 0.1), [(1, 1, _TRIAL, 0.2)])
+    assert frame_labels(acquisition, [1], clock)["partly_imaged"] == []
+
+
+def test_a_trial_with_no_iteration_times_counts_as_imaged():
+    acquisition, clock = _imaged(np.arange(0, 2.5, 0.1), [(1, 1, _TRIAL, 0.2), (1, 2, _TRIAL, 2.0)])
+    clock[(1, 2)] = (2.0, np.empty(0))
+    labels = frame_labels(acquisition, [2], clock)
+    assert labels["partly_imaged"] == []
+    assert 2 in labels["trial"].tolist()

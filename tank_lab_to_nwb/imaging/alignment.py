@@ -164,13 +164,32 @@ def match_packets(packets, clock):
     return elapsed
 
 
-def frame_labels(acquisition, trials_per_block):
+def trial_fully_imaged(iteration_times, frames, frame_times, packet_times, packet_iterations, frame_period):
+    """Whether the acquisition ran from a trial's first logged iteration to its last, give or take one frame.
+
+    Port of trialFullyImaged.m (U19-pipeline-matlab#72). `frames` are the trial's labelled frames; `packet_times` and
+    `packet_iterations` are per frame, from its first packet (NaN time where none). The median packet-minus-iteration
+    offset places the trial on the ScanImage clock, so the late first and end-of-trial packets don't move it. A trial
+    whose log has no iteration times can't be judged and counts as imaged. One acquisition only: the reader refuses more.
+    """
+    iteration_times = np.asarray(iteration_times, dtype="float64").ravel()
+    times, iterations = packet_times[frames], packet_iterations[frames]
+    has = ~np.isnan(times) & (iterations >= 1) & (iterations <= iteration_times.size)
+    if not has.any():
+        return iteration_times.size == 0
+    offset = np.median(times[has] - iteration_times[iterations[has] - 1])
+    return bool(frame_times[0] - frame_period <= offset + iteration_times[0] and offset + iteration_times[-1] <= frame_times[-1] + frame_period)
+
+
+def frame_labels(acquisition, trials_per_block, clock=None):
     """Per frame, the behavior block, trial and iteration as SyncImagingBehavior stores them in the pipeline (0 = none).
 
     This follows the canonical MATLAB: the first packet of each frame, interior frames with no packet repeating the last
     frame that had one, nothing before the first or after the last packet, and frames of a trial absent from the log (the
-    one running when ViRMEn stopped) cleared. These labels mark which header received a packet, so at a trial's onset the first
-    labelled frame can have started just before the trial or run up to a frame late. Use the frame timestamps to decide which frames fall in a trial.
+    one running when ViRMEn stopped) cleared. With `clock` (from iteration_clock), a logged trial that imaging started or
+    stopped partway through is cleared too, as U19-pipeline-matlab#72 does; those trials are listed under `partly_imaged`.
+    These labels mark which header received a packet, so at a trial's onset the first labelled frame can have started just
+    before the trial or run up to a frame late. Use the frame timestamps to decide which frames fall in a trial.
     """
     n_frames = acquisition.frames["frame_number"].size
     labels = np.zeros((3, n_frames), dtype="int64")
@@ -196,7 +215,21 @@ def frame_labels(acquisition, trials_per_block):
             labels[:, in_block & (labels[1] == last_trial)] = 0
         elif last_trial > n_trials:
             raise AlignmentError(f"frames carry trial {last_trial} of block {block}, which has only {n_trials} trials")
-    return dict(block=labels[0], trial=labels[1], iteration=labels[2])
+    partly_imaged = []
+    if clock is not None and has_packet.any():
+        frame_times = np.asarray(acquisition.frames["timestamp"], dtype="float64")
+        frame_period = float(np.median(np.diff(frame_times))) if frame_times.size > 1 else 0.0
+        packet_times = np.full(n_frames, np.nan)
+        packet_times[frame_index[first]] = packets["timestamp"][first]
+        pairs = np.unique(labels[:2, labels[0] > 0], axis=1).T.tolist()
+        for block, trial in pairs:
+            in_trial = (labels[0] == block) & (labels[1] == trial)
+            frames = np.arange(np.argmax(in_trial), n_frames - np.argmax(in_trial[::-1]))
+            _, iteration_times = clock.get((block, trial), (None, np.empty(0)))
+            if not trial_fully_imaged(iteration_times, frames, frame_times, packet_times, labels[2], frame_period):
+                labels[:, in_trial] = 0
+                partly_imaged.append((block, trial))
+    return dict(block=labels[0], trial=labels[1], iteration=labels[2], partly_imaged=partly_imaged)
 
 
 def session_start_shift(frame_times):
@@ -300,6 +333,7 @@ def alignment_rows(prepared):
         ("acquisition.completeness", acquisition.completeness, "Whether these TIFFs are the whole acquisition, as far as they can show."),
         *rois,
         *([("acquisition.split_packet_changes", str(acquisition.split_packet_changes), "I2C packets whose time the splitter changed, because they shared their frame's time. The lowest ROI's rounded value is the one stored and fit.")] if acquisition.source == SPLIT_SOURCE else []),
+        ("labels.partly_imaged_trials", json.dumps([f"{block}/{trial}" for block, trial in prepared.labels["partly_imaged"]]), "Logged trials (block/trial) that imaging started or stopped partway through. Their frames get no behavior labels, as in the pipeline's SyncImagingBehavior since U19-pipeline-matlab#72. Their behavior is still in the trials table."),
         ("fit.method", METHOD, "How frames were put on the behavior clock. No wall clock is involved."),
         ("fit.slope", repr(fit.slope), "ScanImage seconds per ViRMEn elapsed second."),
         ("fit.intercept", repr(fit.intercept), "ScanImage clock reading when ViRMEn's elapsed clock read zero, in seconds."),

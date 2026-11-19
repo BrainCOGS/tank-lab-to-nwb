@@ -39,7 +39,7 @@ _BUFFER_BYTES = 1_000_000_000
 
 # Values in the imaging tables that stand for "none", beyond the ViRMEn field registry's own.
 SENTINELS = {
-    **{name: dict(value=0, meaning="This frame has no label: it's before the first packet, after the last, or in the trial running at save.") for name in ("behavior_block", "behavior_trial", "behavior_iteration")},
+    **{name: dict(value=0, meaning="This frame has no label: it's before the first packet, after the last, in the trial running at save, or in a trial imaging only partly covered.") for name in ("behavior_block", "behavior_trial", "behavior_iteration")},
     **{name: dict(value="NaN", meaning="PLACEHOLDER: the wavelength isn't recorded in these sources.") for name in ("excitation_lambda", "emission_lambda")},
 }
 
@@ -78,7 +78,8 @@ def prepare_session(log, tiff_paths, file=None, allow_incomplete=False):
         log = load_log(log)
     acquisition = read_acquisition(tiff_paths, allow_incomplete=allow_incomplete)
     packets = acquisition.packets
-    elapsed = match_packets(packets, iteration_clock(log))
+    clock = iteration_clock(log)
+    elapsed = match_packets(packets, clock)
     if np.any(np.diff(packets["timestamp"]) <= 0):
         raise AlignmentError("I2C packet times don't always increase")
     fit = fit_clock(packets["timestamp"], elapsed, packets["iteration"])
@@ -103,7 +104,7 @@ def prepare_session(log, tiff_paths, file=None, allow_incomplete=False):
         frame_times=fit.to_elapsed(acquisition.frames["timestamp"]) + clock_offset,
         packet_elapsed=elapsed,
         packet_times=fit.to_elapsed(packets["timestamp"]) + clock_offset,
-        labels=frame_labels(acquisition, trials_per_block),
+        labels=frame_labels(acquisition, trials_per_block, clock),
         in_progress=in_progress,
     )
 
@@ -166,7 +167,7 @@ def _add_scanimage_tables(nwbfile, prepared, extra_alignment_rows=()):
         ("end_of_acquisition_mode", "endOfAcquisitionMode.", _int32(frames["end_of_acquisition_mode"], "end_of_acquisition_mode")),
         ("dc_over_voltage", "dcOverVoltage.", _int32(frames["dc_over_voltage"], "dc_over_voltage")),
         ("behavior_block", "Behavior block as the pipeline's SyncImagingBehavior labels this frame, 0 for none. These labels mark which header got a packet: at a trial's onset, the first labelled frame can have started just before the trial began, or can run up to a frame late. Use the timestamps to find a trial's frames.", _int32(prepared.labels["block"], "behavior_block")),
-        ("behavior_trial", "Behavior trial as the pipeline labels this frame. 0 for none, which includes the frames of the trial running when the log was saved, because the pipeline clears that trial. Its packets are in the scanimage_i2c_packets table.", _int32(prepared.labels["trial"], "behavior_trial")),
+        ("behavior_trial", "Behavior trial as the pipeline labels this frame. 0 for none, which includes the frames of the trial running when the log was saved and of any trial that imaging started or stopped partway through, because the pipeline clears those trials (alignment row labels.partly_imaged_trials lists the latter). Its packets are in the scanimage_i2c_packets table.", _int32(prepared.labels["trial"], "behavior_trial")),
         ("behavior_iteration", "Per-trial iteration as the pipeline labels this frame, 0 for none.", _int32(prepared.labels["iteration"], "behavior_iteration")),
     ]))
     module.add(_table("scanimage_i2c_packets", "Every I2C packet from ViRMEn, as stored in the frame headers.", [
