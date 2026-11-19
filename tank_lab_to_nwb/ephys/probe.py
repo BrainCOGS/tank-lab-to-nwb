@@ -64,6 +64,8 @@ def add_probe_electrodes(nwbfile, ap_bin, location="unknown", interface=None):
     metadata = interface.get_metadata()
     for group in metadata["Ecephys"]["ElectrodeGroups"].values():
         group["location"] = location
+    # neuroconv fills the electrodes' own location column from this property.
+    recording.set_property("brain_area", np.full(recording.get_num_channels(), location))
     add_recording_metadata_to_nwbfile(recording, nwbfile, metadata)
     mapping = _build_channel_id_to_electrodes_table_map(recording, nwbfile)
     channel_ids = recording.get_channel_ids()

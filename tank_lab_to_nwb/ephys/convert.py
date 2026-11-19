@@ -15,6 +15,8 @@ from . import pipeline_sync as ps
 from .probe import add_probe_electrodes, check_channel_positions
 from .sorting import read_sorting
 
+# Allen's term for the whole brain, the most these files can honestly claim; the pipeline's probe locations aren't used yet.
+LOCATION = "root"
 COMPRESSION = dict(compression="gzip", compression_opts=4)
 TIME_MEANING = (
     "Seconds since session_start_time on the behavior clock: probe sample -> probe seconds (sample / imSampRate) -> sync-stream seconds "
@@ -34,6 +36,7 @@ class ProbeUnits:
     electrodes: object  # ProbeElectrodes
     times: list  # per unit, seconds in the file
     position_check: tuple
+    electrodes_rate: float  # the AP file's imSampRate: one sample is the units' resolution
 
 
 def _compressed(data):
@@ -55,16 +58,19 @@ def _rows_table(name, description, rows):
 
 def check_sample_origin(sorted_probe, stream):
     """Refuse a sorting whose sample 0 can't be shown to be sample 0 of the raw AP file. Returns how it was shown."""
-    origin, n = sorted_probe.sample_origin, sorted_probe.n_sorted_samples
-    if origin.startswith("unknown") and n is None:
+    origin, bounds = sorted_probe.sample_origin, sorted_probe.n_sorted_samples
+    if origin.startswith("unknown") and bounds is None:
         raise SampleOriginError(f"{sorted_probe.folder}: nothing says which binary was sorted or how many samples it had, so its spike samples can't be put on the raw file's clock")
-    if n is not None and n != stream.n_samples:
-        raise SampleOriginError(f"{sorted_probe.folder}: the sorter read {n} samples, but {stream.bin_path.name} has {stream.n_samples}. A trimmed or concatenated input moves sample 0, and nothing here says by how much.")
+    if bounds is not None and not bounds[0] <= stream.n_samples <= bounds[1]:
+        told = f"{bounds[0]} samples" if bounds[0] == bounds[1] else f"{bounds[0]} to {bounds[1]} samples"
+        raise SampleOriginError(f"{sorted_probe.folder}: the sorter read {told}, but {stream.bin_path.name} has {stream.n_samples}. A trimmed or concatenated input moves sample 0, and nothing here says by how much.")
     last = max((int(train[-1]) for train in sorted_probe.spike_samples if train.size), default=0)
     if last >= stream.n_samples:
         raise SampleOriginError(f"{sorted_probe.folder}: a spike at sample {last} is past the end of {stream.bin_path.name} ({stream.n_samples} samples)")
-    how = f"the sorter read {n} samples, as many as the raw AP file has" if n is not None else "the sorted binary is the raw AP file itself"
-    return how
+    if bounds is None:
+        return f"{origin}; nothing records how many samples were sorted"
+    exact = "exactly" if bounds[0] == bounds[1] else f"within one batch ({bounds[0]} to {bounds[1]})"
+    return f"{origin}; the sorter read {exact} as many samples as {stream.bin_path.name} has ({stream.n_samples})"
 
 
 def prepare_units(nwbfile, sync, sorter_folders):
@@ -76,10 +82,10 @@ def prepare_units(nwbfile, sync, sorter_folders):
         stream = sync.probe_streams[name]
         sorted_probe = read_sorting(folder)
         how = check_sample_origin(sorted_probe, stream)
-        electrodes = add_probe_electrodes(nwbfile, stream.bin_path)
+        electrodes = add_probe_electrodes(nwbfile, stream.bin_path, location=LOCATION)
         position_check = check_channel_positions(electrodes, sorted_probe.channel_map, sorted_probe.channel_positions)
         times = [sync.clock.probe_samples_to_session(name, train) for train in sorted_probe.spike_samples]
-        prepared.append((ProbeUnits(name, sorted_probe, electrodes, times, position_check), how))
+        prepared.append((ProbeUnits(name, sorted_probe, electrodes, times, position_check, stream.rate), how))
     return prepared
 
 
@@ -105,7 +111,8 @@ def _units_columns(prepared):
 
 
 def add_units(nwbfile, prepared):
-    nwbfile.units = Units(name="units", description=f"Spike-sorted units of every probe, one row per cluster. spike_times: {TIME_MEANING} electrodes: the electrode of the unit's peak channel.")
+    resolution = 1 / min(probe.electrodes_rate for probe, _ in prepared) if prepared else -1.0
+    nwbfile.units = Units(name="units", resolution=resolution, description=f"Spike-sorted units of every probe, one row per cluster. spike_times: {TIME_MEANING} electrodes: the electrode of the unit's peak channel.")
     nwbfile.add_unit_column("probe", "The probe this unit was sorted from: imec<N>, as in the SpikeGLX file names.")
     nwbfile.add_unit_column("cluster_id", "The cluster's id in the sorter's spike_clusters.npy, unique within its probe.")
     nwbfile.add_unit_column("peak_channel", "Saved AP channel (row of the sorter's channel_map.npy) where the unit's most frequent template has its largest peak-to-peak.")
@@ -222,9 +229,9 @@ def _add_ecephys_tables(nwbfile, sync, prepared):
             ("n_spikes", str(s.n_spikes), "Spikes written."),
             ("channel_position_offset_um", json.dumps([float(v) for v in probe.position_check[1]]), "Constant offset of channel_positions.npy from the meta file's geometry, x and y; the shapes agree within channel_position_max_difference_um."),
             ("channel_position_max_difference_um", repr(probe.position_check[0]), "Largest difference after that offset."),
-            ("files", json.dumps(s.files), "Cluster tables read, and their row counts."),
-            ("notes", json.dumps(s.notes), "Anything about the tables a reader should know."),
         ]
+        rows += [(f"file.{name}", text, "A per-cluster table that was read, and its rows.") for name, text in s.files.items()]
+        rows += [(f"note.{i}", note, "Something about the tables a reader should know.") for i, note in enumerate(s.notes, start=1)]
         module.add(_rows_table(f"sorting_{probe.name}", f"What sorted {probe.name}, from which input, and which files were read.", rows))
 
 

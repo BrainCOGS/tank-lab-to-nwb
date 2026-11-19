@@ -22,6 +22,7 @@ import pandas as pd
 
 REQUIRED = ("spike_times.npy", "params.py", "channel_map.npy", "channel_positions.npy", "templates.npy")
 LABELS = ("good", "mua", "noise")
+MATLAB_BATCH_SAMPLES = 64 * 1024 + 64
 # Kilosort's own per-cluster files: column name in the file, column in the units table, and its description.
 KILOSORT_TABLES = {
     "cluster_KSLabel.tsv": ("KSLabel", "ks_label", "Kilosort's automatic label: good (single unit by its refractory-period test) or mua."),
@@ -59,7 +60,7 @@ class SortedProbe:
     sorter_evidence: str  # which files said so
     sorted_input: str  # the binary the sorter read, as its files name it, or "unknown"
     sample_origin: str  # what sample 0 of spike_times.npy is
-    n_sorted_samples: int | None  # samples the sorter read, from file sizes or ops.npy, or None if nothing says
+    n_sorted_samples: tuple | None  # (fewest, most) samples the sorter read, from temp_wh.dat or ops.npy, or None if nothing says
     sample_rate_params: float  # params.py sample_rate, usually the nominal 30000; times use the meta's calibrated rate
     unit_ids: np.ndarray  # cluster ids, as in spike_clusters.npy
     spike_samples: list  # per unit, int64 sample indices
@@ -185,24 +186,27 @@ def sample_origin(sorted_input):
 
 
 def n_sorted_samples(folder, params, sorter):
-    """Samples the sorter read: ops.npy for Kilosort 4, else the size of temp_wh.dat (stat only), else None."""
+    """Samples the sorter read, as (fewest, most): exact from temp_wh.dat's size (stat only), within one batch from a
+    Kilosort 4 ops.npy (Nbatches x batch_size), or None if nothing says."""
     folder = Path(folder)
-    ops = folder / "ops.npy"
-    if sorter == "Kilosort 4" and ops.is_file():
-        record = np.load(ops, allow_pickle=True).item()
-        for key in ("n_samples", "Nsamples"):
-            if key in record:
-                return int(record[key])
-        if "NTbuff" in record and "Nbatches" in record and "batch_size" in record:
-            return None
     wh = folder / "temp_wh.dat"
     if wh.is_file():
         channels = int(params.get("n_channels_dat", 0)) or None
-        if channels:
-            # KS4 writes temp_wh.dat with every saved channel; MATLAB Kilosort with only the mapped ones.
-            for count in (np.load(folder / "channel_map.npy").size, channels):
-                if wh.stat().st_size % (2 * count) == 0:
-                    return wh.stat().st_size // (2 * count)
+        # KS4 writes temp_wh.dat with every saved channel; MATLAB Kilosort with only the mapped ones.
+        for count in filter(None, (channels, np.load(folder / "channel_map.npy").size)):
+            if wh.stat().st_size % (2 * count) == 0:
+                n = wh.stat().st_size // (2 * count)
+                if sorter != "Kilosort 4":
+                    # MATLAB Kilosort 2/3 pads its last batch with zeros, so temp_wh.dat holds whole batches of
+                    # ops.NT samples, which no file in the folder records: Kilosort's default, 64 x 1024 + 64.
+                    return (n - MATLAB_BATCH_SAMPLES + 1, n)
+                return (n, n)
+    ops = folder / "ops.npy"
+    if sorter == "Kilosort 4" and ops.is_file():
+        record = np.load(ops, allow_pickle=True).item()
+        if "Nbatches" in record and "batch_size" in record:
+            batches, size = int(record["Nbatches"]), int(record["batch_size"])
+            return ((batches - 1) * size + 1, batches * size)
     return None
 
 
