@@ -160,3 +160,12 @@ def test_ibl_data_of_another_sorting_is_left_out(tmp_path):
     assert not any(column.name.startswith("ibl_") for column in result.columns)
     assert any("ibl_data belongs to another sorting" in note for note in result.notes)
     assert any(column.name.startswith("ibl_") for column in read_sorting(job / "kilosort4_output").columns)
+
+
+def test_kilosort4s_own_cluster_group_copy_is_not_curation(tmp_path):
+    folder, _, _ = phy_folder(tmp_path / "kilosort4_output")
+    (folder / "cluster_group.tsv").write_text((folder / "cluster_KSLabel.tsv").read_text())
+    result = read_sorting(folder)
+    assert "curated_group" not in {column.name for column in result.columns}
+    assert any("holds no curation" in note for note in result.notes)
+    assert list(_column(result, "quality")) == list(_column(result, "ks_label"))

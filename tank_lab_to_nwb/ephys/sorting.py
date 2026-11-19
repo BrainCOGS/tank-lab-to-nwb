@@ -321,7 +321,14 @@ def read_sorting(folder):
 def _curation(folder, unit_ids, spike_clusters, files, notes):
     """phy's curated label, from cluster_group.tsv, and cluster_info.tsv's columns, if they belong to this sorting."""
     columns = []
-    group = _cluster_table(folder, "cluster_group.tsv", "group")
+    group_path = folder / "cluster_group.tsv"
+    if group_path.is_file() and "group" not in pd.read_csv(group_path, sep="\t", nrows=0).columns and "KSLabel" in pd.read_csv(group_path, sep="\t", nrows=0).columns:
+        # Kilosort 4 writes cluster_group.tsv as a copy of its KSLabel, under that header; phy renames it to group on save.
+        notes.append("cluster_group.tsv is Kilosort 4's copy of KSLabel (its header is KSLabel), so it holds no curation")
+        files["cluster_group.tsv"] = "Kilosort's KSLabel copy, not curation"
+        group = None
+    else:
+        group = _cluster_table(folder, "cluster_group.tsv", "group")
     info_path = folder / "cluster_info.tsv"
     info = pd.read_csv(info_path, sep="\t") if info_path.is_file() else None
     if info is not None:
