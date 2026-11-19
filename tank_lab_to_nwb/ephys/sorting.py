@@ -311,6 +311,9 @@ def read_sorting(folder):
         if table is None:
             continue
         missing = [int(u) for u in unit_ids if int(u) not in table.index]
+        empty = sorted(set(int(c) for c in table.index) - set(int(u) for u in unit_ids))
+        if empty:
+            notes.append(f"{name} lists {len(empty)} cluster{'s' if len(empty) != 1 else ''} with no spikes in spike_clusters.npy (e.g. {empty[:5]}); only clusters with spikes are written")
         if missing:
             notes.append(f"{name} has no row for {len(missing)} clusters (merged or split in phy, which doesn't rerun Kilosort); they get an empty value")
         if source == "KSLabel":
@@ -351,8 +354,8 @@ def _curation(folder, unit_ids, spike_clusters, files, notes):
     columns = []
     group_path = folder / "cluster_group.tsv"
     if group_path.is_file() and "group" not in pd.read_csv(group_path, sep="\t", nrows=0).columns and "KSLabel" in pd.read_csv(group_path, sep="\t", nrows=0).columns:
-        # Kilosort 4 writes cluster_group.tsv as a copy of its KSLabel, under that header; phy renames it to group on save.
-        notes.append("cluster_group.tsv is Kilosort 4's copy of KSLabel (its header is KSLabel), so it holds no curation")
+        # Kilosort writes cluster_group.tsv as a copy of its KSLabel, under that header; phy renames it to group on save.
+        notes.append("cluster_group.tsv is Kilosort's own copy of KSLabel (its header is KSLabel), so it holds no curation")
         files["cluster_group.tsv"] = "Kilosort's KSLabel copy, not curation"
         group = None
     else:

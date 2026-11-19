@@ -169,3 +169,12 @@ def test_kilosort4s_own_cluster_group_copy_is_not_curation(tmp_path):
     assert "curated_group" not in {column.name for column in result.columns}
     assert any("holds no curation" in note for note in result.notes)
     assert list(_column(result, "quality")) == list(_column(result, "ks_label"))
+
+
+def test_clusters_listed_without_spikes_are_noted(tmp_path):
+    folder, _, cluster_ids = phy_folder(tmp_path / "kilosort4_output")
+    text = (folder / "cluster_KSLabel.tsv").read_text() + "99\tmua\n"
+    (folder / "cluster_KSLabel.tsv").write_text(text)
+    result = read_sorting(folder)
+    assert 99 not in result.unit_ids
+    assert any("1 cluster" in note and "no spikes" in note for note in result.notes)
