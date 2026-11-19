@@ -361,8 +361,12 @@ def _add_ecephys_tables(nwbfile, sync, prepared):
         module.add(_rows_table(f"sorting_{probe.name}", f"What sorted {probe.name}, from which input, and which files were read.", sorting_rows(probe, how)))
 
 
-def build_ephys_nwbfile(sync, sorter_folders, metadata=None):
-    """The NWB file for behavior with sorted units, ready to write."""
+def build_ephys_nwbfile(sync, sorter_folders, metadata=None, raw=None, raw_notes=None):
+    """The NWB file for behavior with sorted units, ready to write.
+
+    `raw` adds raw SpikeGLX data on the same clock and electrode rows: a dict of `raw.add_raw_ephys` options (`bands`,
+    `raw_folder`, `sync_edges`, `max_seconds`); None adds nothing. What it added goes into the `raw_notes` dict, if given.
+    """
     placeholder = {
         **PLACEHOLDER_METADATA,
         "keywords": [*KEYWORDS, "extracellular electrophysiology", "Neuropixels", "spike sorting"],
@@ -373,11 +377,18 @@ def build_ephys_nwbfile(sync, sorter_folders, metadata=None):
     prepared = prepare_units(nwbfile, sync, sorter_folders)
     add_units(nwbfile, prepared)
     _add_ecephys_tables(nwbfile, sync, prepared)
+    if raw is not None:
+        from .raw import add_raw_ephys
+
+        rows = {probe.name: probe.electrodes.rows for probe, _ in prepared}
+        notes = add_raw_ephys(nwbfile, sync, rows, **raw)
+        if raw_notes is not None:
+            raw_notes.update(notes)
     return nwbfile, prepared
 
 
-def write_ephys_nwbfile(sync, sorter_folders, nwbfile_path, metadata=None):
-    nwbfile, prepared = build_ephys_nwbfile(sync, sorter_folders, metadata)
+def write_ephys_nwbfile(sync, sorter_folders, nwbfile_path, metadata=None, raw=None, raw_notes=None):
+    nwbfile, prepared = build_ephys_nwbfile(sync, sorter_folders, metadata, raw=raw, raw_notes=raw_notes)
     with NWBHDF5IO(str(nwbfile_path), "w") as io:
         io.write(nwbfile)
     return prepared

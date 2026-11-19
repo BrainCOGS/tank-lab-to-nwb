@@ -91,6 +91,30 @@ class _ClockTimes(GenericDataChunkIterator):
         return np.dtype(np.float64)
 
 
+def read_rows(stream, start, stop):
+    """Samples start..stop of every channel, (samples, channels) int16, by a positioned read.
+
+    Not a memory map, and the pages are dropped from the cache afterwards: pages read through a map stay resident and
+    count against the process, and cached pages count against the cgroup, so on a 92 GB file memory would otherwise
+    track the page cache instead of the block read.
+    """
+    row_bytes = 2 * stream.n_channels
+    offset, size = start * row_bytes, (stop - start) * row_bytes
+    fd = os.open(stream.bin_path, os.O_RDONLY)
+    try:
+        raw = bytearray(size)
+        view, done = memoryview(raw), 0
+        while done < size:
+            got = os.preadv(fd, [view[done:]], offset + done)
+            if got == 0:
+                raise OSError(f"{stream.bin_path}: ended {size - done} bytes early")
+            done += got
+        os.posix_fadvise(fd, offset, size, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+    return np.frombuffer(raw, dtype=np.int16).reshape(-1, stream.n_channels)
+
+
 class SpikeGLXChunks(GenericDataChunkIterator):
     """The neural channels of one stream, (time, channels) int16, read from the file a buffer at a time."""
 
@@ -109,25 +133,7 @@ class SpikeGLXChunks(GenericDataChunkIterator):
     def _get_data(self, selection):
         rows, columns = selection
         channels = self._channels[columns]
-        # A plain positioned read, not a memory map, and the pages dropped from the cache afterwards: pages read through a
-        # map stay resident and count against the process, and cached pages count against the cgroup, so on a 92 GB file
-        # memory would otherwise track the page cache instead of the buffer.
-        row_bytes = 2 * self._stream.n_channels
-        offset, size = rows.start * row_bytes, (rows.stop - rows.start) * row_bytes
-        fd = os.open(self._stream.bin_path, os.O_RDONLY)
-        try:
-            raw = bytearray(size)
-            view, done = memoryview(raw), 0
-            while done < size:
-                got = os.preadv(fd, [view[done:]], offset + done)
-                if got == 0:
-                    raise OSError(f"{self._stream.bin_path}: ended {size - done} bytes early")
-                done += got
-            os.posix_fadvise(fd, offset, size, os.POSIX_FADV_DONTNEED)
-        finally:
-            os.close(fd)
-        block = np.frombuffer(raw, dtype=np.int16).reshape(-1, self._stream.n_channels)
-        return block[:, channels[0] : channels[-1] + 1]
+        return read_rows(self._stream, rows.start, rows.stop)[:, channels[0] : channels[-1] + 1]
 
     def _get_maxshape(self):
         return (self._n, self._channels.size)
@@ -208,12 +214,11 @@ def digital_edges(stream, channel, n_samples=None, block_samples=2**20):
 
     The first sample's state is reported as an edge at the first sample, so the trace can be rebuilt exactly.
     """
-    data = stream.memmap()
     n = stream.n_samples if n_samples is None else min(n_samples, stream.n_samples)
     samples, bits, levels = [], [], []
     previous = None
     for start in range(0, n, block_samples):
-        word = np.asarray(data[start : min(n, start + block_samples), channel]).view(np.uint16)
+        word = read_rows(stream, start, min(n, start + block_samples))[:, channel].copy().view(np.uint16)
         if previous is None:
             ref = np.r_[~word[0], word]  # a fake previous sample that differs in every bit
         else:
@@ -290,3 +295,91 @@ def add_sync_edges(nwbfile, streams_and_clocks, name="spikeglx_sync_edges", n_sa
     ecephys = nwbfile.processing.get("ecephys") or nwbfile.create_processing_module("ecephys", "Processed extracellular electrophysiology.")
     ecephys.add(table)
     return table
+
+
+# --- On a session's clock (tank_lab_to_nwb.ephys.clock.EphysClock, built by session.build_session_sync) ---------------
+
+RAW_BANDS = ("lf",)  # what a session conversion writes unless asked: LF yes, AP only on request (docs/ephys-raw.md)
+
+
+def ap_samples_of_lf(lf, ap, samples):
+    """The AP sample (original file numbering) taken at the same instant as each LF sample (original file numbering).
+
+    Measured on S3's SY edges (60 per probe, docs/ephys-raw.md): SpikeGLX's own LF (NP1) is counted on the AP counter
+    divided by 12, so LF sample k is AP sample 12 * (LF firstSample + k) - AP firstSample. CatGT's tcat LF takes every
+    12th sample of the AP file, so LF sample k is AP sample 12 k; its firstSample is the AP's divided by 12, rounded down,
+    and would put LF 11 samples early on S3.
+    """
+    factor = ap.sampling_rate / lf.sampling_rate
+    if abs(factor - round(factor)) > 1e-6:
+        raise RawEphysError(f"{lf.bin_path.name}: LF rate {lf.sampling_rate} is not a whole fraction of AP rate {ap.sampling_rate}")
+    factor = int(round(factor))
+    samples = np.asarray(samples, dtype=np.int64)
+    if lf.is_catgt:
+        return factor * samples
+    return factor * (lf.first_sample - lf.clip_start + samples) - (ap.first_sample - ap.clip_start)
+
+
+def _clock_offset(meta):
+    """Where the file a clock was built on starts in its original: 0, or its clipStartSample if it is a clip."""
+    return int(meta.get("clipStartSample", 0))
+
+
+def probe_clock(sync, probe, stream, ap=None):
+    """`clock(samples) -> seconds in the file` for one AP or LF stream of `probe`, from the session's EphysClock.
+
+    `samples` count from the start of the stream's original file. The clock may have been built on the full files and
+    the stream be a clip, or the other way round: both are told apart by `clipStartSample`. LF samples go through the
+    AP sample taken at the same instant (`ap_samples_of_lf`), so LF, AP and spikes share one map.
+    """
+    offset = _clock_offset(sync.probe_streams[probe].meta)
+    if stream.band == "ap":
+        return lambda samples: sync.clock.probe_samples_to_session(probe, np.asarray(samples, dtype=np.int64) - offset)
+    if ap is None:
+        raise RawEphysError(f"{stream.bin_path.name}: an LF clock needs the probe's AP stream")
+    return lambda samples: sync.clock.probe_samples_to_session(probe, ap_samples_of_lf(stream, ap, samples) - offset)
+
+
+def sync_stream_clock(sync, stream):
+    offset = _clock_offset(sync.sync_stream.meta)
+    return lambda samples: sync.clock.sync_samples_to_session(np.asarray(samples, dtype=np.int64) - offset)
+
+
+def add_raw_ephys(nwbfile, sync, electrode_rows, raw_folder=None, bands=RAW_BANDS, sync_edges=True, max_seconds=None, compression=None):
+    """Add the raw bands of every probe in `electrode_rows` ({probe: electrodes-table rows of its saved AP channels},
+    as the units conversion made them) and the sync edges, on the session's clock. Returns {series name: note}.
+
+    `raw_folder` defaults to the folder the clock was built from; pass a folder of clips (clip.py) to write a window of
+    the session. `max_seconds` writes only the first seconds of each stream.
+    """
+    from .spikeglx_layout import find_recording
+
+    unknown = set(bands) - {"ap", "lf"}
+    if unknown:
+        raise RawEphysError(f"bands {sorted(unknown)}: only 'ap' and 'lf' exist")
+    recording = find_recording(raw_folder or sync.sync_stream.bin_path.parent)
+    by_device = {p.device: p for p in recording.probes}
+    notes = {}
+    for probe, rows in electrode_rows.items():
+        if probe not in by_device:
+            raise RawEphysError(f"{recording.folder}: no raw files for {probe}")
+        found = by_device[probe]
+        if found.ap.bin_path.name != sync.probe_streams[probe].bin_path.name:
+            raise RawEphysError(f"{probe}: raw AP {found.ap.bin_path.name} is not the file the clock was built on ({sync.probe_streams[probe].bin_path.name})")
+        for band, stream in (("ap", found.ap), ("lf", found.lf)):
+            if band not in bands:
+                continue
+            if stream is None:
+                notes[f"{probe} {band}"] = found.lf_note
+                continue
+            n = None if max_seconds is None else int(round(max_seconds * stream.sampling_rate))
+            clock = probe_clock(sync, probe, stream, ap=found.ap)
+            series = add_electrical_series(nwbfile, stream, np.asarray(rows), clock, n_samples=n, compression=compression)
+            notes[series.name] = found.lf_note if band == "lf" else "raw AP"
+    if sync_edges and recording.sync is not None:
+        if recording.sync.bin_path.name != sync.sync_stream.bin_path.name:
+            raise RawEphysError(f"sync stream {recording.sync.bin_path.name} is not the one the clock was built on ({sync.sync_stream.bin_path.name})")
+        n = None if max_seconds is None else int(round(max_seconds * recording.sync.sampling_rate))
+        table = add_sync_edges(nwbfile, [(recording.sync, sync_stream_clock(sync, recording.sync))], n_samples=n)
+        notes[table.name] = f"{len(table)} edges"
+    return notes

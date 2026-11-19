@@ -9,7 +9,9 @@ and says so in the file (units_only.py). It's only done when asked for; the sess
 A sorter folder is the one holding spike_times.npy (`kilosort_output`, `kilosort4_output`, ...); a job folder holding
 exactly one such folder is accepted too. Only the raw folder's sync file and short windows of each AP file's SY channel
 are read, never the AP samples. Behavior and spikes go on the recording's clock by the lab's rule; --probe-clock and
---iteration-time choose the two departures from it (docs/ephys-timing.md). The NWB file goes in <output> with a report beside it.
+--iteration-time choose the two departures from it (docs/ephys-timing.md). Raw SpikeGLX bands go in the same file on the
+same clock: LF by default, AP with --raw-bands ap lf, none with --raw-bands (empty), and --raw-folder takes them from a
+folder of clips (docs/ephys-raw.md). The NWB file goes in <output> with a report beside it.
 
 --dandiset <folder> also names the file for DANDI under that folder (dandi organize, description "units") and runs
 `dandi validate` on it. A file dandi rejects is an error: it stays out of the folder, and the report says why.
@@ -22,6 +24,7 @@ from pathlib import Path
 from ..virmen.layout import DandiValidationError, organize_for_dandi
 from .clock import ITERATION_TIME, ITERATION_TIMES, PROBE_CLOCK, PROBE_CLOCKS
 from .convert import conversion_report, write_ephys_nwbfile
+from .raw import RAW_BANDS
 from .session import build_session_sync
 from .sorting import SortingError, find_sorter_folders
 from .units_only import CLOCK, TIED_TO, UnitsOnlyError, write_units_only
@@ -61,8 +64,11 @@ def resolve_sorter_folder(path):
 
 
 def convert(log, raw_folder, output, sorter_folders, session_date=None, metadata=None, name=None, probe_clock=PROBE_CLOCK, iteration_time=ITERATION_TIME, allow_virmen_borrowed=False,
-            dandiset=None):
+            raw_bands=RAW_BANDS, raw_from=None, sync_edges=True, raw_max_seconds=None, dandiset=None):
     """Convert, verify and report, and return the path of the file. See docs/ephys-timing.md for the two clock choices.
+
+    `raw_bands` ("ap", "lf") are written from `raw_from` (default `raw_folder`) with the sync edges; see docs/ephys-raw.md.
+    The file is `<name>_units.nwb` without raw bands, `<name>_ecephys.nwb` with them.
 
     With `dandiset`, the file is also named under that folder and checked by `dandi validate`; the report's "dandi" entry
     holds the organized path, and DandiValidationError is raised if dandi rejects the file.
@@ -71,11 +77,15 @@ def convert(log, raw_folder, output, sorter_folders, session_date=None, metadata
     output.mkdir(parents=True, exist_ok=True)
     sorter_folders = {probe: resolve_sorter_folder(folder) for probe, folder in sorter_folders.items()}
     sync = build_session_sync(raw_folder, log, probes=sorted(sorter_folders), session_date=session_date, probe_clock=probe_clock, iteration_time=iteration_time, allow_virmen_borrowed=allow_virmen_borrowed)
-    path = output / f"{name or log.stem}_units.nwb"
-    prepared = write_ephys_nwbfile(sync, sorter_folders, path, metadata)
+    raw_bands = tuple(raw_bands or ())
+    raw = dict(bands=raw_bands, raw_folder=raw_from, sync_edges=sync_edges, max_seconds=raw_max_seconds) if raw_bands or sync_edges else None
+    path = output / f"{name or log.stem}_{'ecephys' if raw_bands else 'units'}.nwb"
+    raw_notes = {}
+    prepared = write_ephys_nwbfile(sync, sorter_folders, path, metadata, raw=raw, raw_notes=raw_notes)
     checked = verify_ephys(sync, prepared, path)
     report = conversion_report(sync, prepared)
     report["verified"] = checked
+    report["raw"] = raw_notes
     _write_report(path, report)
     if dandiset is not None:
         organize_and_validate(path, dandiset, "units", report)
@@ -129,9 +139,14 @@ def main():
     parser.add_argument("--probe-clock", choices=PROBE_CLOCKS, default=PROBE_CLOCK, help=f"Spike times: sync_edges (drift corrected by the 1 Hz sync edges), meta_rates (sample / imSampRate, the lab's rule) or params_rate (sample / params.py rate, as the DB stores). Default {PROBE_CLOCK}.")
     parser.add_argument("--iteration-time", choices=ITERATION_TIMES, default=ITERATION_TIME, help=f"Iteration times: pipeline_index (the lab's rule) or edge (the line's edge). Default {ITERATION_TIME}.")
     parser.add_argument("--allow-virmen-borrowed", action="store_true", help="Convert a session whose pulse matching failed, with the pipeline's ViRMEn-borrowed vectors (lower accuracy; the file says so).")
+    parser.add_argument("--raw-bands", nargs="*", choices=("ap", "lf"), default=list(RAW_BANDS), help=f"Raw SpikeGLX bands to write. Default {' '.join(RAW_BANDS)}; AP is 40-50 GB per probe-hour compressed.")
+    parser.add_argument("--raw-folder", type=Path, help="Take the raw bands from this folder (for example clips from tank_lab_to_nwb.ephys.clip) instead of the raw run folder.")
+    parser.add_argument("--raw-max-seconds", type=float, help="Write only the first seconds of each raw stream (a stub).")
+    parser.add_argument("--no-sync-edges", action="store_true", help="Leave out the table of every sync-line edge.")
     parser.add_argument("--dandiset", type=Path, help="Also name the file for DANDI under this folder and run dandi validate on it; a file dandi rejects is an error.")
     arguments = parser.parse_args()
-    print(convert(arguments.log, arguments.raw_folder, arguments.output, dict(arguments.sorted), session_date=arguments.date, name=arguments.name, probe_clock=arguments.probe_clock, iteration_time=arguments.iteration_time, allow_virmen_borrowed=arguments.allow_virmen_borrowed, dandiset=arguments.dandiset))
+    print(convert(arguments.log, arguments.raw_folder, arguments.output, dict(arguments.sorted), session_date=arguments.date, name=arguments.name, probe_clock=arguments.probe_clock, iteration_time=arguments.iteration_time, allow_virmen_borrowed=arguments.allow_virmen_borrowed,
+                  raw_bands=arguments.raw_bands, raw_from=arguments.raw_folder, sync_edges=not arguments.no_sync_edges, raw_max_seconds=arguments.raw_max_seconds, dandiset=arguments.dandiset))
 
 
 if __name__ == "__main__":

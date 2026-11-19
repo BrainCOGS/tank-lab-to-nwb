@@ -1,8 +1,8 @@
 """Find and describe every SpikeGLX stream of one recording (for writing raw data), and refuse the layouts not handled.
 
-
 `spikeglx.py` beside this reads what the clock needs (sync edges, digital lines); this module describes whole files for
 the raw writer and the clip tool: band, probe, gains, sync channels, CatGT origin.
+
 Only `.meta` files are parsed here; `.bin` data is opened as a memory map by whoever reads it. Gains and channel names come
 from neo's own SpikeGLX parser, so they match what SpikeInterface reports for the same files.
 """
