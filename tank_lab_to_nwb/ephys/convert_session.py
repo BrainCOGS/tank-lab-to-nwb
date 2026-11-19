@@ -21,6 +21,8 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
+
 from ..virmen.layout import DandiValidationError, organize_for_dandi
 from .clock import ITERATION_TIME, ITERATION_TIMES, PROBE_CLOCK, PROBE_CLOCKS
 from .convert import conversion_report, write_ephys_nwbfile
@@ -30,7 +32,7 @@ from .sorting import SortingError, find_sorter_folders
 from .units_only import CLOCK, TIED_TO, UnitsOnlyError, write_units_only
 from .verify import verify_ephys
 
-__all__ = ["DandiValidationError", "UnitsOnlyError", "convert", "convert_units_only"]
+__all__ = ["DandiValidationError", "SyncTimestampsError", "UnitsOnlyError", "convert", "convert_to_file", "convert_units_only"]
 
 
 def _write_report(path, report):
@@ -63,37 +65,82 @@ def resolve_sorter_folder(path):
     return found[0]
 
 
+def _kind(raw_bands):
+    """What names the file, in its folder and for DANDI: "ecephys" with raw bands, "units" without."""
+    return "ecephys" if tuple(raw_bands or ()) else "units"
+
+
 def convert(log, raw_folder, output, sorter_folders, session_date=None, metadata=None, name=None, probe_clock=PROBE_CLOCK, iteration_time=ITERATION_TIME, allow_virmen_borrowed=False,
             raw_bands=RAW_BANDS, raw_from=None, sync_edges=True, raw_max_seconds=None, dandiset=None):
     """Convert, verify and report, and return the path of the file. See docs/ephys-timing.md for the two clock choices.
 
     `raw_bands` ("ap", "lf") are written from `raw_from` (default `raw_folder`) with the sync edges; see docs/ephys-raw.md.
-    The file is `<name>_units.nwb` without raw bands, `<name>_ecephys.nwb` with them.
+    The file is `<output>/<name or the log's stem>_units.nwb` without raw bands, `..._ecephys.nwb` with them.
 
     With `dandiset`, the file is also named under that folder (`desc-units` or `desc-ecephys`) and checked by
     `dandi validate`; the report's "dandi" entry holds the organized path, and DandiValidationError is raised if dandi
     rejects the file. The file is copied there, so a file with raw bands takes its size twice.
     """
-    log, output = Path(log), Path(output)
+    output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
+    path = output / f"{name or Path(log).stem}_{_kind(raw_bands)}.nwb"
+    return convert_to_file(log, raw_folder, path, sorter_folders, session_date=session_date, metadata=metadata, probe_clock=probe_clock, iteration_time=iteration_time, allow_virmen_borrowed=allow_virmen_borrowed,
+                           raw_bands=raw_bands, raw_from=raw_from, sync_edges=sync_edges, raw_max_seconds=raw_max_seconds, dandiset=dandiset)
+
+
+def convert_to_file(log, raw_folder, path, sorter_folders, session_date=None, metadata=None, probe_clock=PROBE_CLOCK, iteration_time=ITERATION_TIME, allow_virmen_borrowed=False,
+                    raw_bands=RAW_BANDS, raw_from=None, sync_edges=True, raw_max_seconds=None, dandiset=None, sync_timestamps=None):
+    """What `convert` does, writing exactly `path` (its folder must exist), with the report beside it as `<stem>.report.json`.
+
+    `sync_timestamps`, per-iteration times computed elsewhere (such as the DB's), are checked against the iteration
+    times recomputed from the raw sync file: SyncTimestampsError if they disagree, before anything is written; the
+    report's "sync_timestamps" entry if they agree. They never set a time in the file.
+    """
+    path = Path(path)
     sorter_folders = {probe: resolve_sorter_folder(folder) for probe, folder in sorter_folders.items()}
-    sync = build_session_sync(raw_folder, log, probes=sorted(sorter_folders), session_date=session_date, probe_clock=probe_clock, iteration_time=iteration_time, allow_virmen_borrowed=allow_virmen_borrowed)
+    sync = build_session_sync(raw_folder, Path(log), probes=sorted(sorter_folders), session_date=session_date, probe_clock=probe_clock, iteration_time=iteration_time, allow_virmen_borrowed=allow_virmen_borrowed)
+    agreement = None if sync_timestamps is None else check_sync_timestamps(sync, sync_timestamps)
     raw_bands = tuple(raw_bands or ())
     raw = dict(bands=raw_bands, raw_folder=raw_from, sync_edges=sync_edges, max_seconds=raw_max_seconds) if raw_bands or sync_edges else None
-    kind = "ecephys" if raw_bands else "units"
-    path = output / f"{name or log.stem}_{kind}.nwb"
     raw_notes = {}
     prepared = write_ephys_nwbfile(sync, sorter_folders, path, metadata, raw=raw, raw_notes=raw_notes)
     checked = verify_ephys(sync, prepared, path)
     if raw is not None:
         checked["raw"] = verify_raw_ephys(path, sync, {probe.name: probe.electrodes.rows for probe, _ in prepared}, **raw)
     report = conversion_report(sync, prepared)
+    if agreement is not None:
+        report["sync_timestamps"] = agreement
     report["verified"] = checked
     report["raw"] = raw_notes
     _write_report(path, report)
     if dandiset is not None:
-        organize_and_validate(path, dandiset, kind, report)
+        organize_and_validate(path, dandiset, _kind(raw_bands), report)
     return path
+
+
+class SyncTimestampsError(ValueError):
+    """Per-iteration times given with a conversion disagree with the ones recomputed from the raw sync file."""
+
+
+def check_sync_timestamps(sync, given):
+    """Compare `given` per-iteration times with the session's, before the file's shift; one sync-stream sample is allowed.
+
+    Returns what the report records; raises SyncTimestampsError, stating the size of the disagreement, otherwise.
+    """
+    given = np.asarray(given, dtype="float64").ravel()
+    recomputed = np.concatenate(sync.iteration_seconds) - sync.clock.shift
+    where = f"the iteration times recomputed from {sync.sync_stream.bin_path} (iteration_time {sync.iteration_time})"
+    if given.size != recomputed.size:
+        raise SyncTimestampsError(f"sync_timestamps has another length than {where}: {given.size} given, {recomputed.size} recomputed")
+    difference = np.abs(given - recomputed)
+    worst = int(np.argmax(difference)) if difference.size else 0
+    samples = float(difference[worst] * sync.sync_stream.rate) if difference.size else 0.0
+    if not samples <= 1.0:
+        raise SyncTimestampsError(
+            f"sync_timestamps differs from {where} by up to {difference[worst] * 1e3:.4f} ms ({samples:.1f} samples of the {sync.sync_stream.rate} Hz sync stream), "
+            f"at iteration {worst}; {int(np.sum(difference * sync.sync_stream.rate > 1.0))} of {given.size} differ by more than one sample"
+        )
+    return dict(agrees=True, iterations=int(given.size), max_difference_seconds=float(difference.max(initial=0.0)), max_difference_samples=samples, tolerance_samples=1.0, compared_before_shift_seconds=float(sync.clock.shift))
 
 
 def convert_units_only(output, sorter_folders, subject_id, session_id, binaries=None, metadata=None, name=None):
