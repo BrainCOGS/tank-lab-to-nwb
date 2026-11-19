@@ -112,6 +112,20 @@ in-behavior spikes on both probes land in the same iteration as `np.digitize` on
 fall in CCI's one-sample-early window. With `sample / imSampRate` instead, only 16.8 % (imec0) and 14.3 % (imec1)
 agree, because CCI's spike rate is the nominal 30000, up to 49 ms (imec0) and 87 ms (imec1) off by the file's end.
 
+## Units only
+
+A sorting that nothing ties to a recording, such as a sorting of a clip whose place in the recording isn't recorded
+(S7a/b: the clips copy the original's meta, `firstSample` included, but not its first bytes), can be written alone with
+`convert_units_only` (`--units-only`). It's never a fallback: the session converter stops when the sync file or the log
+is missing. Spike times are seconds since the sorted binary's first sample, `sample / imSampRate` of that binary's meta
+file, and electrodes come from the same meta. `processing/ecephys/units_only_clock` says so, and that these times
+can't be compared with any other file's. There is no behavior and no trials table.
+
+What such a file can honestly carry: the subject and session ids the caller gives (a sorter folder names neither), the
+probe's identity and geometry from the meta file, and the sorter's identity and labels. `session_start_time` is the
+meta file's `fileCreateTime`, which for a copied meta is the original recording's, not the clip's first sample; the
+file says that too.
+
 ## The sorting's sample 0
 
 `spike_times.npy` counts samples of whatever binary the sorter read; the converter takes it as the raw `t0` AP file's
