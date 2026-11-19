@@ -28,9 +28,29 @@ on it. A file dandi rejects is an error: it stays out of the folder, and the rep
 
 ## Usage
 
-`TowersNWBConverter` (`tank_lab_to_nwb/convert_towers_task`) converts the behavior alone; it refuses SpikeGLX and
-Kilosort interfaces and names the command above instead. The old example script
-`tank_lab_to_nwb/convert_towers_task/convert_towers.py` built that converter with ephys interfaces and no longer runs.
+`TowersNWBConverter` (`tank_lab_to_nwb/convert_towers_task`) is the neuroconv front door to the same conversion.
+`VirmenData` alone converts the behavior (`sync_timestamps`, one time per logged frame, moves it). With sorted units,
+one `Kilosort` (imec0) or `KilosortProbe<N>` key per probe and the raw run folder as `SpikeGLX`, `run_conversion` writes
+`nwbfile_path` through the code above, on the recording's clock rebuilt from the raw sync file, with its report beside it;
+a `sync_timestamps` given then must agree with that clock to one sync sample. The clock options of `convert()`
+(`probe_clock`, `iteration_time`, `allow_virmen_borrowed`, `session_date`) are keyword arguments of the class, and
+`run_conversion(..., dandiset=<folder>)` names and validates the file for DANDI.
+
+```python
+source_data = {
+    "VirmenData": {"file_path": "<behavior log.mat>"},
+    "KilosortProbe0": {"folder_path": "<sorter folder>"},
+    "SpikeGLX": {"folder_path": "<raw run folder>"},
+}
+converter = TowersNWBConverter(source_data=source_data)
+metadata = converter.get_metadata()
+metadata["NWBFile"]["experimenter"] = ["Last, First"]
+converter.run_conversion(nwbfile_path="session.nwb", metadata=metadata, overwrite=True)
+```
+
+Raw bands (`SpikeGLXAP`, `SpikeGLXLFP`) aren't written through the class yet, and imaging goes through
+`tank_lab_to_nwb.imaging`. The old example script `tank_lab_to_nwb/convert_towers_task/convert_towers.py` builds the
+converter with raw-band interfaces and no longer runs.
 
 The older exploratory notebook `spikeinterface_pipeline.ipynb` (prototype, not maintained)
 that can be launched from the terminal:
