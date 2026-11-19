@@ -23,37 +23,44 @@ the units conversion (`docs/ephys-timing.md`); this code takes both as arguments
 
 ## Time
 
-The caller passes `clock(samples) -> seconds on the behavior clock`, where samples count from the start of the
-**original** `.bin` (a clip adds its `clipStartSample`). `series_timing` checks the clock at points 1 s apart (at least
-1,000 points): if it stays within 0.1 sample of the straight line through its first and last sample, the series gets
-`starting_time` and `rate` (the fitted rate, not SpikeGLX's); otherwise explicit timestamps, computed and compressed a
-block at a time.
+The caller passes `clock(samples) -> seconds on the file's clock`, where samples count from the start of the
+**original** `.bin` (a clip adds its `clipStartSample`). The units conversion defines that clock (`docs/ephys-timing.md`:
+recording time, each probe mapped onto the sync stream by its 1 Hz edges). `series_timing` checks the clock at points
+1 s apart (at least 1,000 points): if it stays within 0.1 sample of the straight line through its first and last
+sample, the series gets `starting_time` and `rate` (the fitted rate, not SpikeGLX's); otherwise explicit timestamps,
+computed and compressed a block at a time.
 
-| Storage | Exact when | Cost per probe-hour at 30 kHz |
+On the recording clock a probe's series is nearly a line: what remains is the drift between the probe and the sync
+stream, which a single line misses by up to about 0.3 ms over S3's hour (measured by subagent A). That is 9 AP samples or
+0.75 LF samples, so a `rate` series would put the raw trace up to 9 samples away from where the units' spike times say
+a spike is. The rule above therefore writes timestamps for such a probe, which costs very little:
+
+| Storage | Error on S3 over an hour | Cost per probe-hour at 30 kHz (2.5 kHz LF) |
 |---|---|---|
-| `starting_time` + SpikeGLX's `imSampRate` | never on the behavior clock | 0, but a 20 ppm rate difference is 72 ms off after an hour (50 ppm: 180 ms) |
-| `starting_time` + fitted rate | the clock is linear (one fitted line per stream) | 0 |
-| explicit float64 `timestamps` | always | 864 MB raw; 34 MB with gzip 4 + shuffle (measured on a linear 60 s ramp, `B/bench/timestamp_cost.txt`) |
+| `starting_time` + SpikeGLX's `imSampRate` | 41.5 ms on imec0, 0.57 ms on imec1 (A's drift numbers) | 0 |
+| `starting_time` + fitted rate | up to about 0.3 ms (9 AP samples) | 0 |
+| explicit float64 `timestamps` | none (the clock itself) | 864 MB raw; 34 MB with gzip 4 + shuffle (2.9 MB for LF), which is 0.07% of the compressed AP (47 GB) |
 
-The imaging conversion fits one line per session and writes per-frame timestamps because frames arrive irregularly;
-ephys samples are regular, so a linear clock gives `rate` with no loss, and a non-linear one (piecewise per sync edge)
-still costs only about 0.04% of the compressed AP.
+The timestamp cost was measured on a linear 60 s ramp (`B/bench/timestamp_cost.txt`); a ramp bent by the drift
+compresses the same way, because shuffle keeps the slowly changing high bytes together.
 
 ## Sync edges
 
 `spikeglx_sync_edges` has one row per change of each bit of the nidq or OneBox digital word (`XD0`) and the OneBox
 `SY0` channel: `stream`, `channel`, `bit`, `level` (after the edge), `sample` (original file numbering, the stream's own
-clock) and `time` (behavior clock). The first row per bit is its level at the first sample written, so each line can
+clock) and `time` (the file's clock). The first row per bit is its level at the first sample written, so each line can
 be rebuilt exactly. On S3 a minute holds about 12,000 edges (mostly the 6-bit iteration counter on lines 2–7), so about
 0.7 M rows per hour, a few MB: the full nidq trace is 36 MB per hour and the OneBox's 0.9 GB, mostly the unused analog
 `XA` channels, which aren't written.
 
 ## Memory and chunking
 
-Data are read from a memory map one buffer at a time (`BUFFER_BYTES`, 256 MB by default, spanning all channels so each
-read is contiguous in the file), compressed chunk by chunk and written; memory does not grow with the file. Chunks are
-1 s × 64 channels (3.8 MB at 30 kHz). Compression is gzip, the one filter built into every HDF5 library, so the files
-open without plugins. The numbers behind these choices are in the phase-1 measurements (`B/MEASUREMENTS.md`).
+Data are read with positioned reads one buffer at a time (`BUFFER_BYTES`, 64 MB by default, spanning all channels so
+each read is contiguous in the file), and the pages read are dropped from the page cache, which counts against a
+cgroup's memory. Then they are compressed chunk by chunk and written. Memory does not grow with the file: writing a
+60 s NP2 AP clip to NWB peaked at 242 MB RSS with 64 MB buffers (643 MB with 256 MB, at the same speed). Chunks are
+1 s × 64 channels (3.8 MB at 30 kHz). Compression is gzip level 1 with the shuffle filter: gzip is the one filter built into every HDF5
+library, so the files open without plugins, and shuffle makes it 1.2–1.3 times smaller and faster on NP2 AP. The numbers behind these choices are in the phase-1 measurements (`B/MEASUREMENTS.md`).
 
 ## Layouts
 

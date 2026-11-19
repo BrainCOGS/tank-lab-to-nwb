@@ -1,10 +1,10 @@
-"""Write raw SpikeGLX AP and LF bands, and the edges of the sync lines, to an NWB file on the behavior clock.
+"""Write raw SpikeGLX AP and LF bands, and the edges of the sync lines, to an NWB file on the clock the caller gives.
 
 The clock and the electrode rows come from the caller (the units conversion owns both), so the raw series reference the
 same electrodes as the units and share their clock:
 
 - `clock(samples) -> seconds`: maps sample indices of one stream, counted from the start of its *original* file, to
-  seconds on the behavior clock. A clip's samples are shifted by its `clipStartSample` before the clock sees them.
+  seconds on the file's clock. A clip's samples are shifted by its `clipStartSample` before the clock sees them.
   `LinearClock` is the stand-in used until the real mapping is wired in.
 - `electrodes`: a `DynamicTableRegion` of the file's electrode table, or the row indices, one per neural channel in the
   stream's channel order (the SY channel is never written as a neural channel).
@@ -31,7 +31,7 @@ COMPRESSION = dict(compression="gzip", compression_opts=1, shuffle=True)
 TIMESTAMP_COMPRESSION = dict(compression="gzip", compression_opts=4, shuffle=True)
 CHUNK_SECONDS = 1.0  # time extent of a chunk
 CHUNK_CHANNELS = 64  # channel extent of a chunk: 1 s x 64 channels x 2 bytes = 3.8 MB at 30 kHz
-BUFFER_BYTES = 256 * 2**20  # read and compress this much per step
+BUFFER_BYTES = 64 * 2**20  # read and compress this much per step: 242 MB peak RSS, as fast as 256 MB (643 MB)
 TIME_TOLERANCE_SAMPLES = 0.1  # how far the clock may bend away from a straight line before timestamps are written
 CLOCK_PROBE_SECONDS = 1.0  # spacing of the points at which the clock is checked for straightness
 CLOCK_PROBE_MIN_POINTS = 1000  # ... but at least this many points
@@ -190,7 +190,7 @@ def add_electrical_series(
         description=(
             f"Raw {stream.band.upper()} band of {stream.device} ({stream.probe_part_number}), int16 as saved by SpikeGLX, from "
             f"{stream.bin_path.name}{' samples ' + str(stream.clip_start) + ' on' if stream.clip_start else ''}. "
-            f"SpikeGLX rate {stream.sampling_rate!r} Hz on the probe's clock; times are on the behavior clock."
+            f"SpikeGLX rate {stream.sampling_rate!r} Hz on the probe's clock; times are on the file's clock."
         ),
         **series_timing(clock, stream, n_written),
     )
@@ -248,7 +248,7 @@ def add_sync_edges(nwbfile, streams_and_clocks, name="spikeglx_sync_edges", n_sa
     """One table of every edge on the digital channels of the given streams: the evidence the clock was fitted to.
 
     Columns: stream (file name), channel (XD0/SY0), bit, level after the edge, sample (from the start of the original
-    file, on the stream's clock) and time (on the behavior clock). Edges keep a digital trace exactly, at a few bytes
+    file, on the stream's clock) and time (on the file's clock). Edges keep a digital trace exactly, at a few bytes
     per edge, where the trace itself costs 2 bytes per sample on every channel.
     """
     descriptions = dict(
@@ -257,7 +257,7 @@ def add_sync_edges(nwbfile, streams_and_clocks, name="spikeglx_sync_edges", n_sa
         bit="Bit (line) of the channel.",
         level="Level of the bit from this sample on.",
         sample="Sample index in the original file, on that stream's clock.",
-        time="Seconds on the behavior clock.",
+        time="Seconds on the file's clock.",
     )
     columns = {key: [] for key in descriptions}
     for stream, clock in streams_and_clocks:
@@ -279,7 +279,7 @@ def add_sync_edges(nwbfile, streams_and_clocks, name="spikeglx_sync_edges", n_sa
         description=(
             "Every change of each bit of the SpikeGLX digital channels (nidq or OneBox digital word XD0, sync channel SY0). "
             "The first row per bit is that bit's level at the first sample written. `sample` counts from the start of the "
-            "original .bin on that stream's own clock; `time` is the same instant on the behavior clock."
+            "original .bin on that stream's own clock; `time` is the same instant on the file's clock."
         ),
         id=ElementIdentifiers(name="id", data=np.arange(n_rows)),
         columns=[
