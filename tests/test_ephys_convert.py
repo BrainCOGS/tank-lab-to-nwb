@@ -142,3 +142,9 @@ def test_a_trimmed_sorting_is_refused(session):
 def test_old_digital_word_sessions_are_refused(session):
     with pytest.raises(SessionSyncError, match="digital-word"):
         build_session_sync(session["raw"], session["log"], file="log.mat", session_date="2021-05-06")
+
+
+def test_a_log_with_more_trials_than_pulses_is_named(session):
+    log = _log(session["schedule"] + iteration_schedule(n_trials=2, seed=9))
+    with pytest.raises(SessionSyncError, match="5 trial pulses and the log 7 saved trials"):
+        build_session_sync(session["raw"], log, file="log.mat")

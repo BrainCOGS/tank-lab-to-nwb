@@ -28,7 +28,8 @@ converter follows the lab's definition of how they line up, from U19's `Behavior
 | Case | The pipeline gives | The converter |
 |---|---|---|
 | A saved trial past the last trial pulse (recording stopped early) | no iteration indices | stops, naming the trial |
-| A trial whose synced iteration count differs from the log's | some iterations without indices | stops, naming the trial |
+| A trial whose synced iteration count differs from the log's | some iterations without indices; the pipeline's regular status can still be 1, because it accepts any number of small mismatches when the only big one is the last trial (S8b: 22 trials) | stops, naming the trial |
+| More saved trials than trial pulses (rec 730: 274 against 264) | the pipeline's code fails | stops, giving the counts |
 | The trial running when ViRMEn saved the log (`currentTrial`) | nothing: it isn't in the DB's trials | not written: it isn't in the behavior series either |
 | Regular and fixed matching both fail (rec 80) | only `iteration_idx_vector_from_virmen`: each trial's start pulse plus ViRMEn's logged times, marked lower accuracy | stops, unless `allow_virmen_borrowed` (`--allow-virmen-borrowed`), which converts with those vectors and records `vectors: virmen_borrowed` |
 | Sessions before 2021-06-01 (digital-word counter) | nothing: U19 refuses them | stops (rec 33) |
@@ -53,8 +54,11 @@ Why `sync_edges` is the default: the calibrated rates in the meta files still di
 
 | Probe | Rate difference left | Correction at the AP file's start, middle and end | Spikes in behavior put in another iteration than `meta_rates` puts them |
 |---|---|---|---|
-| imec0 (NP2010) | −10.38 ppm | see `A/RESULTS.md` | see `A/RESULTS.md` |
-| imec1 (NP1) | −0.13 ppm | | |
+| imec0 (NP2010) | −10.38 ppm | −0.14, −21.09, −41.59 ms | 82.2 % |
+| imec1 (NP1) | −0.13 ppm | −0.09, −0.21, −0.64 ms | 2.3 % |
+
+On the 15 files converted, the rate difference left after the calibrated rates ranges from −27 to +8.4 ppm per probe
+(`ephys_sync_alignment` of each file; `A/RESULTS.md`).
 
 A single straight line misses by up to 316 µs (imec0) and 183 µs (imec1): the rate difference wanders slowly over the
 hour. After the piecewise map the edges' residual std is 57–60 µs, which is the NIDQ's 5 kHz sampling step alone
@@ -89,6 +93,8 @@ From the raw sync file and the log alone, against each session's DB `BehaviorSyn
 | S3, rec 353 | regular | 367,559 of 367,559 | 367,559 of 367,559 | yes |
 | S2, rec 241 | regular | 195,901 of 195,901 | 195,901 of 195,901 | yes |
 | S8a, rec 905 (OneBox) | fixed | 210,569 of 210,569 | 210,569 of 210,569 | yes |
+| S5, rec 888 (OneBox, two NP2013) | fixed | 200,738 of 200,738 | yes | yes |
+| S1, rec 132 (four probes) | regular | 380,306 of 380,306 | yes | yes |
 
 More are in `A/RESULTS.md`. Every behavior frame's timestamp in the written file is checked to equal its index over
 the rate (`verify_ephys`).
@@ -101,8 +107,10 @@ which is what the pipeline divided by when it computed its vectors. The converte
 `np.digitize(spike_times, iteration_times)`, where the iteration times come from the per-sample expansion of the
 vectors (`get_full_vector_samples`) and its transitions by `np.diff`: each is one sample before the index, and the
 session's first iteration is dropped. Its spike times are `sample / params.py sample_rate`, and it divides by the DB's
-rounded rate. `pipeline_sync.curated_clusters_iteration_times` reproduces those times; how many spikes it puts in the
-same iteration as this file is in `A/RESULTS.md`.
+rounded rate. `pipeline_sync.curated_clusters_iteration_times` reproduces those times. On S3, with CCI's own rates, 98.1 % of
+in-behavior spikes on both probes land in the same iteration as `np.digitize` on this file's iteration times; the rest
+fall in CCI's one-sample-early window. With `sample / imSampRate` instead, only 16.8 % (imec0) and 14.3 % (imec1)
+agree, because CCI's spike rate is the nominal 30000, up to 49 ms (imec0) and 87 ms (imec1) off by the file's end.
 
 ## The sorting's sample 0
 

@@ -183,7 +183,9 @@ def build_session_sync(
     try:
         result = ps.pipeline_sync(trial_line, iteration_line, sync_stream.rate, behavior_time_vector(trials))
     except (IndexError, ValueError) as error:
-        raise SessionSyncError(f"{sync_stream.bin_path}: the pipeline's iteration detection failed on these lines ({type(error).__name__}: {error}); are the trial and iteration lines wired as the pipeline expects?") from error
+        pulses = ps.get_idx_trial_start(trial_line)[0].size
+        why = f"the sync file has {pulses} trial pulses and the log {len(trials)} saved trials, so the log isn't the one this recording synced (or holds blocks the recording missed)" if pulses < len(trials) else "are the trial and iteration lines wired as the pipeline expects?"
+        raise SessionSyncError(f"{sync_stream.bin_path}: the pipeline's iteration detection failed on these lines ({type(error).__name__}: {error}); {why}") from error
     if result.regular_sync_status == 1 or result.fixed_sync_status == 1:
         vectors, indices = ("regular" if result.regular_sync_status == 1 else "fixed"), result.iteration_idx_vector
     elif allow_virmen_borrowed:
