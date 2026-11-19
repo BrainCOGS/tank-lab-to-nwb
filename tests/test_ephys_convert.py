@@ -144,7 +144,7 @@ def named_log(session, monkeypatch):
 
 def test_conversion_is_named_and_validated_for_dandi(session, named_log):
     dandiset = session["tmp"] / "dandiset"
-    path = convert(named_log, session["raw"], session["tmp"] / "out", {"imec0": session["sorter"].parent}, dandiset=dandiset)
+    path = convert(named_log, session["raw"], session["tmp"] / "out", {"imec0": session["sorter"].parent}, raw_bands=(), dandiset=dandiset)
     report = json.loads(path.with_suffix(".report.json").read_text())
     organized = Path(report["dandi"]["organized"])
     assert report["dandi"]["validated"] is True
@@ -156,7 +156,7 @@ def test_conversion_is_named_and_validated_for_dandi(session, named_log):
 def test_a_file_dandi_rejects_stops_the_conversion(session, named_log):
     dandiset = session["tmp"] / "dandiset"
     with pytest.raises(DandiValidationError, match="(?i)species"):
-        convert(named_log, session["raw"], session["tmp"] / "out", {"imec0": session["sorter"].parent}, metadata={"subject": {"sex": "U"}}, dandiset=dandiset)
+        convert(named_log, session["raw"], session["tmp"] / "out", {"imec0": session["sorter"].parent}, metadata={"subject": {"sex": "U"}}, raw_bands=(), dandiset=dandiset)
     report = json.loads((session["tmp"] / "out" / "log_units.report.json").read_text())
     assert report["dandi"]["validated"] is False and "species" in report["dandi"]["error"].lower()
     assert report["verified"]["units"] == session["cluster_ids"].size

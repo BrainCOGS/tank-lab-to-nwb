@@ -168,6 +168,24 @@ def _converted_with_raw(session, monkeypatch):
     return path, build_session_sync(session["raw"], session["log"], file="log.mat")
 
 
+def test_a_file_with_raw_bands_is_named_ecephys_for_dandi(session, monkeypatch):  # noqa: F811
+    import re
+    from pathlib import Path
+
+    import tank_lab_to_nwb.ephys.convert_session as cs
+
+    real = cs.build_session_sync
+    monkeypatch.setattr(cs, "build_session_sync", lambda raw, log, **kw: real(raw, session["log"], file="log.mat", **kw))
+    monkeypatch.setenv("XDG_STATE_HOME", str(session["tmp"] / "state"))
+    dandiset = session["tmp"] / "dandiset"
+    path = cs.convert(session["tmp"] / "log.mat", session["raw"], session["tmp"] / "out", {"imec0": session["sorter"].parent}, raw_bands=("ap",), dandiset=dandiset)
+    report = json.loads(path.with_suffix(".report.json").read_text())
+    organized = Path(report["dandi"]["organized"])
+    assert path.name == "log_ecephys.nwb" and report["dandi"]["validated"] is True
+    assert re.fullmatch(r"sub-[^_]+_ses-[^_]+_desc-ecephys_behavior\+ecephys\.nwb", organized.name), organized.name
+    assert list(dandiset.rglob("*.nwb")) == [organized]
+
+
 def test_convert_reads_the_raw_series_back(session, monkeypatch):  # noqa: F811
     path, _ = _converted_with_raw(session, monkeypatch)
     checked = json.loads(path.with_suffix(".report.json").read_text())["verified"]["raw"]

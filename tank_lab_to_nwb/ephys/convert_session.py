@@ -13,8 +13,8 @@ are read, never the AP samples. Behavior and spikes go on the recording's clock 
 same clock: LF by default, AP with --raw-bands ap lf, none with --raw-bands (empty), and --raw-folder takes them from a
 folder of clips (docs/ephys-raw.md). The NWB file goes in <output> with a report beside it.
 
---dandiset <folder> also names the file for DANDI under that folder (dandi organize, description "units") and runs
-`dandi validate` on it. A file dandi rejects is an error: it stays out of the folder, and the report says why.
+--dandiset <folder> also names the file for DANDI under that folder (dandi organize, description "units", or "ecephys"
+with raw bands) and runs `dandi validate` on it. A file dandi rejects is an error: it stays out of the folder, and the report says why.
 """
 
 import argparse
@@ -70,8 +70,9 @@ def convert(log, raw_folder, output, sorter_folders, session_date=None, metadata
     `raw_bands` ("ap", "lf") are written from `raw_from` (default `raw_folder`) with the sync edges; see docs/ephys-raw.md.
     The file is `<name>_units.nwb` without raw bands, `<name>_ecephys.nwb` with them.
 
-    With `dandiset`, the file is also named under that folder and checked by `dandi validate`; the report's "dandi" entry
-    holds the organized path, and DandiValidationError is raised if dandi rejects the file.
+    With `dandiset`, the file is also named under that folder (`desc-units` or `desc-ecephys`) and checked by
+    `dandi validate`; the report's "dandi" entry holds the organized path, and DandiValidationError is raised if dandi
+    rejects the file. The file is copied there, so a file with raw bands takes its size twice.
     """
     log, output = Path(log), Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -79,7 +80,8 @@ def convert(log, raw_folder, output, sorter_folders, session_date=None, metadata
     sync = build_session_sync(raw_folder, log, probes=sorted(sorter_folders), session_date=session_date, probe_clock=probe_clock, iteration_time=iteration_time, allow_virmen_borrowed=allow_virmen_borrowed)
     raw_bands = tuple(raw_bands or ())
     raw = dict(bands=raw_bands, raw_folder=raw_from, sync_edges=sync_edges, max_seconds=raw_max_seconds) if raw_bands or sync_edges else None
-    path = output / f"{name or log.stem}_{'ecephys' if raw_bands else 'units'}.nwb"
+    kind = "ecephys" if raw_bands else "units"
+    path = output / f"{name or log.stem}_{kind}.nwb"
     raw_notes = {}
     prepared = write_ephys_nwbfile(sync, sorter_folders, path, metadata, raw=raw, raw_notes=raw_notes)
     checked = verify_ephys(sync, prepared, path)
@@ -90,7 +92,7 @@ def convert(log, raw_folder, output, sorter_folders, session_date=None, metadata
     report["raw"] = raw_notes
     _write_report(path, report)
     if dandiset is not None:
-        organize_and_validate(path, dandiset, "units", report)
+        organize_and_validate(path, dandiset, kind, report)
     return path
 
 

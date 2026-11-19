@@ -7,6 +7,9 @@ then `<name>_ecephys.nwb`), AP only when asked, nothing raw with an empty `--raw
 How `tank_lab_to_nwb/ephys/` writes the AP and LF bands and the sync lines. The clock and the electrode table belong to
 the units conversion (`docs/ephys-timing.md`); this code takes both as arguments.
 
+With `--dandiset <folder>` the file is also named for DANDI and checked by `dandi validate`: `desc-ecephys` when it holds
+raw bands, `desc-units` when it doesn't. The file is copied into that folder, so allow its size twice.
+
 ## What is written where
 
 | Source | NWB location | Why there |
