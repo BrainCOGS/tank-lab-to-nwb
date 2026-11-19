@@ -1,23 +1,29 @@
-"""Put probe samples on the behavior clock. Pure functions of arrays; reading files is elsewhere. See docs/ephys-timing.md.
+"""Put every ephys stream and the behavior on the recording's clock. Pure functions of arrays. See docs/ephys-timing.md.
 
-Two links, chained:
+The lab's rule (U19 BehaviorSync, SYNC_DATA_PLAN.md): the file's clock is the recording's, t = 0 at the first sample of
+the sync stream (NIDQ or OneBox). Each logged ViRMEn iteration takes the time of its own pulse on that stream,
+`iteration_idx_vector / rate`, one for one: nothing is fitted. Spikes keep their sample's time.
 
-1. Probe to sync stream. Every SpikeGLX stream records the same 1 Hz sync wave. Pairing a probe's edges with the NIDQ's
-   (or OneBox's) and fitting a continuous piecewise-linear map takes probe seconds to sync-stream seconds, including the
-   drift between their crystals, which the calibrated rates in the meta files don't remove.
-2. Sync stream to behavior. ViRMEn toggles a digital line every iteration. Those edges, matched to logged iterations the
-   way the lab's pipeline matches them, fit one straight line from ViRMEn's elapsed clock to sync-stream seconds, with the
-   same rule and limits as imaging (`imaging.alignment.fit_clock`).
+Two departures from that rule can be switched on, each recorded in the file with its size:
 
-A sample's time in the file is then `fit.to_elapsed(sync_seconds) + clock_offset`, the same form as an imaging frame's.
+- `probe_clock`: "sync_edges" maps each probe's seconds to the sync stream's through a piecewise-linear fit to the 1 Hz
+  sync edges, which removes the drift between crystals that the calibrated rates leave. "meta_rates" is the plain
+  `sample / imSampRate`. "params_rate" is `sample / params.py sample_rate`, what the DB's CuratedClustering stores.
+- `iteration_time`: "pipeline_index" is the pipeline's stored index (6 samples before the edge in counter_bit0 mode);
+  "edge" is the edge itself, timed half a sample before its first high sample.
 """
 
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..imaging.alignment import AlignmentError, ClockFit, fit_clock
 from .pipeline_sync import pipeline_index_lag
+
+# The defaults, until the lab decides. Each is one line.
+PROBE_CLOCK = "sync_edges"
+ITERATION_TIME = "pipeline_index"
+PROBE_CLOCKS = ("sync_edges", "meta_rates", "params_rate")
+ITERATION_TIMES = ("pipeline_index", "edge")
 
 # Sync edges are paired by the streams' firstSample counts, which start together within milliseconds. Further apart than
 # this, an edge could pair with its neighbour a second away, which no residual would show.
@@ -28,12 +34,6 @@ KNOT_SPACING_SECONDS = 300.0
 MAX_SYNC_RATE_DIFFERENCE_PPM = 200.0
 # Beyond this an edge is off the map: a glitch or a wrong pairing, so the session needs a person to look at it.
 MAX_SYNC_RESIDUAL_SECONDS = 0.0005
-# Imaging stops at 5 % of packets off the line. In pulse_signal mode about 6 % of iteration pulses leave a display frame
-# (16.7 ms) after their logged time, in every trial (S8a, rec 905); they're rejected like any late event, and the line
-# is fit to the rest. Over 10 % would mean the matching itself is off. Those late pulses also put the 99th percentile of
-# all residuals near 17 ms, so imaging's 10 ms limit on the percentiles applies to the kept edges here.
-MAX_REJECTED_EDGE_FRACTION = 0.10
-
 
 def edge_seconds(samples, rate):
     """When an edge happened, from the first sample at its new level: half a sample earlier, on average.
@@ -184,61 +184,88 @@ def iteration_edges(iteration_idx_vector, trial_line, iteration_line, mode, rate
     return out
 
 
-def iteration_samples_for_fit(edges, trial_times):
-    """(edge samples, logged elapsed times, 1-based iteration numbers) of every measured edge, for `fit_clock`.
+def iteration_times(iteration_idx_vector, edges, rate, iteration_time=ITERATION_TIME):
+    """Per trial, each iteration's time in sync-stream seconds.
 
-    `trial_times` holds each trial's (start, per-iteration times) on the elapsed clock, in the order the pipeline paired them.
+    "pipeline_index": the pipeline's stored index over the rate, as BehaviorSync's users compute it. "edge": the edge the
+    index was found from; an index with no edge there (borrowed from ViRMEn's times by the fix path) keeps the index
+    plus the same lag, so it moves with its neighbours.
     """
-    samples, elapsed, numbers = [], [], []
-    if len(edges) > len(trial_times):
-        raise AlignmentError(f"{len(edges)} trials of iteration edges but only {len(trial_times)} logged trials")
-    for trial_edges, (start, times) in zip(edges, trial_times):
-        trial_edges = np.asarray(trial_edges)
-        if trial_edges.size > len(times):
-            raise AlignmentError(f"a trial has {trial_edges.size} iteration edges but {len(times)} logged iterations")
-        keep = trial_edges >= 0
-        samples.append(trial_edges[keep])
-        elapsed.append(start + np.asarray(times, dtype="float64")[: trial_edges.size][keep])
-        numbers.append(np.arange(1, trial_edges.size + 1)[keep])
-    return np.concatenate(samples), np.concatenate(elapsed), np.concatenate(numbers)
+    if iteration_time not in ITERATION_TIMES:
+        raise ValueError(f"iteration_time must be one of {ITERATION_TIMES}, not {iteration_time!r}")
+    out = []
+    for indices, found in zip(iteration_idx_vector, edges):
+        indices = np.asarray(indices, dtype=np.int64).ravel()
+        if iteration_time == "pipeline_index":
+            out.append(indices / rate)
+        else:
+            found = np.asarray(found, dtype=np.int64)
+            out.append(np.where(found >= 0, edge_seconds(found, rate), edge_seconds(indices + _lag(indices, found), rate)))
+    return out
 
 
-def fit_behavior(edge_samples, elapsed, iterations, rate):
-    """The line from ViRMEn's elapsed clock to sync-stream seconds, by imaging's rule."""
-    order = np.argsort(edge_samples, kind="stable")
-    if np.any(np.diff(np.asarray(elapsed)[order]) < 0):
-        raise AlignmentError("iteration edges and logged iteration times run in different orders; is this the wrong log?")
-    return fit_clock(edge_seconds(edge_samples, rate), elapsed, iterations, what="iteration edges", max_rejected_fraction=MAX_REJECTED_EDGE_FRACTION, residual_limit_over_kept=True)
+def _lag(indices, found):
+    """The pipeline's lag in this trial, from its own measured edges, for the indices that have none."""
+    measured = found >= 0
+    lags = np.zeros(indices.size, dtype=np.int64)
+    if measured[1:].any():
+        lags[1:] = int(np.median(found[1:][measured[1:]] - indices[1:][measured[1:]]))
+    if measured[0]:
+        lags[0] = found[0] - indices[0]
+    return lags
+
+
+def behavior_timestamps(per_trial_times, logged_iterations):
+    """Every logged iteration's time, trial after trial, for VirmenDataInterface.set_aligned_timestamps.
+
+    `logged_iterations` is each saved trial's number of logged iterations (its `trial.time`). The pipeline gives a time
+    to exactly those; where it gives none (a trial past the last trial pulse, or a trial with a different count), this
+    raises rather than guessing.
+    """
+    if len(per_trial_times) < len(logged_iterations):
+        raise ValueError(f"the pipeline synced {len(per_trial_times)} trials, the log has {len(logged_iterations)}: trial {len(per_trial_times) + 1} on has no pulse times")
+    for trial, (times, n) in enumerate(zip(per_trial_times, logged_iterations), start=1):
+        if np.size(times) != n:
+            difference = n - np.size(times)
+            raise ValueError(f"trial {trial}: {abs(difference)} logged iteration{'s' if abs(difference) != 1 else ''} {'without' if difference > 0 else 'more than the'} pulse times ({n} logged, {np.size(times)} synced)")
+    flat = np.concatenate([np.asarray(t, dtype="float64") for t in per_trial_times[: len(logged_iterations)]]) if logged_iterations else np.zeros(0)
+    if np.any(np.diff(flat) < 0):
+        raise ValueError("iteration times run backwards; is this the wrong log?")
+    return flat
 
 
 @dataclass(frozen=True)
 class EphysClock:
-    """Everything needed to put any sample of a session's streams on the file's clock."""
+    """Seconds on the recording's clock for any sample of a session's streams. t = 0 is the sync stream's first sample."""
 
     sync_kind: str  # "nidq" or "obx"
     sync_rate: float
-    behavior: ClockFit  # sync-stream seconds = slope * elapsed + intercept
-    clock_offset: float  # seconds added to elapsed time, including any session start shift
-    probes: dict = field(default_factory=dict)  # probe name -> SyncFit
+    probe_clock: str
+    probes: dict = field(default_factory=dict)  # probe name -> SyncFit (always fitted, so its size can be reported)
     probe_rates: dict = field(default_factory=dict)  # probe name -> imSampRate from its meta
+    shift: float = 0.0  # seconds added to everything, if needed so that nothing is negative
 
-    def sync_seconds_to_session(self, seconds):
-        return self.behavior.to_elapsed(seconds) + self.clock_offset
+    def __post_init__(self):
+        if self.probe_clock not in PROBE_CLOCKS:
+            raise ValueError(f"probe_clock must be one of {PROBE_CLOCKS}, not {self.probe_clock!r}")
 
     def sync_samples_to_session(self, samples):
         """Sync-stream (NIDQ or OneBox) sample indices to seconds in the file."""
-        return self.sync_seconds_to_session(np.asarray(samples, dtype="float64") / self.sync_rate)
+        return np.asarray(samples, dtype="float64") / self.sync_rate + self.shift
 
     def probe_samples_to_session(self, probe, samples, rate=None):
         """Sample indices into a probe's AP file (or, with its own `rate`, its LF file) to seconds in the file.
 
-        An LF file shares its AP file's clock, so pass the LF rate from its meta; the map is in seconds.
+        `rate` defaults to the AP meta's imSampRate; pass the LF rate for LF samples, or params.py's rate under
+        probe_clock "params_rate". Under "sync_edges" the probe's seconds then go through its sync map.
         """
-        if probe not in self.probes:
-            raise KeyError(f"no sync map for {probe}; the clock has {sorted(self.probes)}")
+        if probe not in self.probe_rates:
+            raise KeyError(f"no clock for {probe}; the clock has {sorted(self.probe_rates)}")
         rate = self.probe_rates[probe] if rate is None else rate
-        return self.sync_seconds_to_session(self.probes[probe](np.asarray(samples, dtype="float64") / rate))
+        seconds = np.asarray(samples, dtype="float64") / rate
+        if self.probe_clock == "sync_edges":
+            seconds = self.probes[probe](seconds)
+        return seconds + self.shift
 
     def shifted(self, seconds):
-        """The same clock with every time later by `seconds`."""
-        return EphysClock(self.sync_kind, self.sync_rate, self.behavior, self.clock_offset + seconds, dict(self.probes), dict(self.probe_rates))
+        return EphysClock(self.sync_kind, self.sync_rate, self.probe_clock, dict(self.probes), dict(self.probe_rates), self.shift + seconds)

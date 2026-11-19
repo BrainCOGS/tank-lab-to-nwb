@@ -19,9 +19,8 @@ from .sorting import read_sorting
 LOCATION = "root"
 COMPRESSION = dict(compression="gzip", compression_opts=4)
 TIME_MEANING = (
-    "Seconds since session_start_time on the behavior clock: probe sample -> probe seconds (sample / imSampRate) -> sync-stream seconds "
-    "through the piecewise-linear map fitted to the 1 Hz sync edges -> ViRMEn elapsed seconds through the line fitted to the iteration edges -> "
-    "plus derived.clock_offset. See ephys_sync_alignment."
+    "Seconds on the recording's clock, from the sync stream's first sample (session_start_time): the spike's sample over the probe's rate, "
+    "through the probe's sync map if ephys_sync_alignment's probe_clock is sync_edges. See ephys_sync_alignment."
 )
 
 
@@ -39,6 +38,7 @@ class ProbeUnits:
     position_check: tuple
     electrodes_rate: float  # the AP file's imSampRate: one sample is the units' resolution
     peak_channel: np.ndarray  # per unit, the saved AP channel of its peak
+    departure: dict  # what the probe clock changed: spikes in behavior, and how many land in another iteration than sample / imSampRate puts them
 
 
 def _compressed(data):
@@ -78,6 +78,7 @@ def check_sample_origin(sorted_probe, stream):
 def prepare_units(nwbfile, sync, sorter_folders):
     """Read each probe's sorting, add its electrodes, and put its spikes on the file's clock. `sorter_folders` maps probe name to folder."""
     prepared = []
+    iterations = np.concatenate(sync.iteration_seconds)
     for name, folder in sorter_folders.items():
         if name not in sync.probe_streams:
             raise KeyError(f"{folder}: sorted probe {name} has no raw AP file in the session folder")
@@ -90,13 +91,21 @@ def prepare_units(nwbfile, sync, sorter_folders):
         peak = channels[sorted_probe.peak_channel]
         counts = np.array([train.size for train in sorted_probe.spike_samples], dtype=np.int64)
         times = np.empty(int(counts.sum()), dtype="float64")
+        # Under "params_rate" a spike is its sample over params.py's sample_rate, as the DB's CuratedClustering stores it.
+        rate = sorted_probe.sample_rate_params if sync.clock.probe_clock == "params_rate" else None
+        changed = within = 0
         stop = 0
         for train in sorted_probe.spike_samples:
-            times[stop : stop + train.size] = sync.clock.probe_samples_to_session(name, train)
+            times[stop : stop + train.size] = sync.clock.probe_samples_to_session(name, train, rate=rate)
+            plain = train / stream.rate + sync.clock.shift
+            inside = (plain >= iterations[0]) & (plain < iterations[-1])
+            changed += int(np.count_nonzero(np.searchsorted(iterations, times[stop : stop + train.size][inside], side="right") != np.searchsorted(iterations, plain[inside], side="right")))
+            within += int(inside.sum())
             stop += train.size
         # The samples aren't needed once mapped; dropping them halves what a four-probe session holds.
         sorted_probe = replace(sorted_probe, spike_samples=[], n_spikes_read=int(counts.sum()))
-        prepared.append((ProbeUnits(name, sorted_probe, electrodes, times, counts, position_check, stream.rate, peak), how))
+        departure = dict(spikes_in_behavior=within, spikes_changing_iteration=changed, sample_rate_used=repr(rate or stream.rate))
+        prepared.append((ProbeUnits(name, sorted_probe, electrodes, times, counts, position_check, stream.rate, peak, departure), how))
     return prepared
 
 
@@ -151,69 +160,92 @@ def add_units(nwbfile, prepared):
     )
 
 
-def alignment_rows(sync):
-    clock, fit, stream, pipeline = sync.clock, sync.clock.behavior, sync.sync_stream, sync.pipeline
+RULE = (
+    "The lab's rule (U19 BehaviorSync; SYNC_DATA_PLAN.md): the file's clock is the recording's, t = 0 at the sync stream's first sample. "
+    "Each logged ViRMEn iteration takes the time of its own pulse, iteration_idx_vector / rate, one for one, and the behavior's frames are "
+    "those times. Nothing is fitted to ViRMEn's clock. Spikes are their sample over the probe's rate."
+)
+PROBE_CLOCK_MEANING = {
+    "sync_edges": "Departure from the rule: probe seconds (sample / imSampRate) go through a piecewise-linear map fitted to the 1 Hz sync edges, which removes the drift between the probe's and the sync stream's crystals that the calibrated rates leave. The rule itself is meta_rates.",
+    "meta_rates": "The rule: sample / imSampRate, the calibrated rate in the AP meta file, with no drift correction.",
+    "params_rate": "sample / params.py sample_rate (the nominal 30000), what the DB's CuratedClustering stores; neither calibrated nor drift-corrected.",
+}
+ITERATION_TIME_MEANING = {
+    "pipeline_index": "The rule: the pipeline's stored index over the rate. In counter_bit0 mode that index is pipeline.index_lag_seconds before the line's edge.",
+    "edge": "Departure from the rule: the line's edge itself, half a sample before its first high sample. An index with no edge there keeps the index plus the trial's lag.",
+}
+
+
+def alignment_rows(sync, prepared=()):
+    clock, stream, pipeline = sync.clock, sync.sync_stream, sync.pipeline
     first_lag, later_lag = ps.pipeline_index_lag(pipeline.mode, stream.rate)
     n_edges = sum(int(np.sum(np.asarray(e) >= 0)) for e in sync.edges)
     n_iterations = sum(np.asarray(e).size for e in sync.edges)
+    seconds = np.concatenate(sync.iteration_seconds)
     rows = [
-        ("sync.file", stream.bin_path.name, f"The {stream.kind} file whose digital lines carry ViRMEn's trial and iteration signals and the 1 Hz sync wave."),
-        ("sync.rate", repr(stream.rate), f"Its calibrated sampling rate from the meta file, samples per second ({'niSampRate' if stream.kind == 'nidq' else 'obSampRate'})."),
-        ("sync.first_sample", str(stream.first_sample), "Its firstSample: the run's sample count when the file began, used only to pair sync edges."),
-        ("pipeline.mode", pipeline.mode, "How the pipeline's detection read the iteration line: counter_bit0, bit 0 of ViRMEn's iteration counter, which changes every iteration; or pulse_signal, one pulse per iteration."),
-        ("pipeline.regular_sync_status", str(pipeline.regular_sync_status), "1 if the pipeline's regular detection matched every trial's iterations, as BehaviorSync.regular_sync_status."),
-        ("pipeline.fixed_sync_status", str(pipeline.fixed_sync_status), "1 if the pipeline's fix path was needed and succeeded, as BehaviorSync.fixed_sync_status. Indices it borrowed from ViRMEn's logged times aren't edges and weren't fit."),
-        ("pipeline.index_lag_seconds", repr(later_lag / stream.rate), f"The pipeline stores each later iteration's index {later_lag} samples before the edge it found (the first iteration's {first_lag} sample before), because it adds the trial's start rather than its search window's. This file uses the edges; BehaviorSync's vectors are early by this much."),
-        ("fit.method", "imaging.alignment.fit_clock on iteration edges", "A straight line from each matched iteration's logged elapsed time to its edge on the sync stream, each trial's first iteration excluded, rejecting edges further than max(5 x MAD, 5 ms) from the median residual until the kept set stops changing: the rule imaging uses for I2C packets."),
-        ("fit.slope", repr(fit.slope), "Sync-stream seconds per ViRMEn elapsed second."),
-        ("fit.intercept", repr(fit.intercept), "Sync-stream seconds when ViRMEn's elapsed clock read zero."),
-        ("fit.clock_offset", repr(clock.clock_offset), "Seconds added to elapsed time to get this file's time, including derived.session_start_shift_seconds if any."),
-        ("fit.n_edges", str(n_edges), "Iteration edges found on the line at the pipeline's matched indices."),
-        ("fit.n_not_edges", str(n_iterations - n_edges), "Matched iterations with no edge at their index: borrowed from ViRMEn's times by the pipeline's fix path. Not fit."),
-        ("fit.n_first_iteration", str(fit.n_first_iteration), "Edges of a trial's first iteration, not fit."),
-        ("fit.n_rejected", str(fit.n_rejected), "Edges rejected as off the line."),
-        ("fit.residual_p1_ms", repr(fit.residual_ms["p1"]), "1st percentile of edge residuals."),
-        ("fit.residual_p50_ms", repr(fit.residual_ms["p50"]), "Median edge residual."),
-        ("fit.residual_p99_ms", repr(fit.residual_ms["p99"]), "99th percentile of edge residuals."),
-        ("fit.kept_std_ms", repr(fit.kept_std_ms), "Standard deviation of the fit edges' residuals: how far ViRMEn's output sits from its logged times, not spike-time error."),
-        ("fit.send_latency", "not measured", "A constant, not corrected: the delay from ViRMEn logging an iteration's time to its digital output changing. Behavior events run early relative to spikes by it."),
+        ("rule", "pulse per iteration, recording clock", RULE),
+        ("probe_clock", clock.probe_clock, PROBE_CLOCK_MEANING[clock.probe_clock]),
+        ("iteration_time", sync.iteration_time, ITERATION_TIME_MEANING[sync.iteration_time]),
+        ("vectors", sync.vectors, {"regular": "The pipeline's regular pulse matching (BehaviorSync.regular_sync_status 1).", "fixed": "The pipeline's fix path (fixed_sync_status 1): a few missed pulses were filled in from ViRMEn's logged times; see n_not_edges.", "virmen_borrowed": "LOWER ACCURACY, converted only because it was asked for: the pipeline's pulse matching failed, so each iteration is its trial's start pulse plus ViRMEn's logged time (iteration_idx_vector_from_virmen), with no drift correction within a trial."}[sync.vectors]),
+        ("sync.file", stream.bin_path.name, f"The {stream.kind} file whose digital lines carry ViRMEn's trial and iteration signals and the 1 Hz sync wave. Its first sample is t = 0."),
+        ("sync.rate", repr(stream.rate), f"Its calibrated rate from the meta file ({'niSampRate' if stream.kind == 'nidq' else 'obSampRate'}), which divides the indices. The DB stores it rounded to a float, which the pipeline didn't compute with."),
+        ("sync.file_create_time", stream.meta.get("fileCreateTime", ""), "The sync file's fileCreateTime on the rig's clock: session_start_time, to the second."),
+        ("pipeline.mode", pipeline.mode, "How the pipeline read the iteration line: counter_bit0, bit 0 of ViRMEn's iteration counter, which changes every iteration; or pulse_signal, one pulse per iteration."),
+        ("pipeline.regular_sync_status", str(pipeline.regular_sync_status), "As BehaviorSync.regular_sync_status, recomputed from the raw file."),
+        ("pipeline.fixed_sync_status", str(pipeline.fixed_sync_status), "As BehaviorSync.fixed_sync_status, recomputed from the raw file."),
+        ("pipeline.index_lag_seconds", repr(later_lag / stream.rate), f"The pipeline stores each later iteration's index {later_lag} samples before the line's edge (the first iteration's {first_lag} before), because it adds the trial's start rather than its search window's."),
+        ("iterations", str(n_iterations), "Logged iterations given a time, every one of the saved trials."),
+        ("iterations.with_edge", str(n_edges), "Of those, iterations whose index sits at an edge of the line."),
+        ("iterations.first_time", repr(float(seconds[0])), "The first iteration's time in this file: when behavior began in the recording."),
+        ("iterations.last_time", repr(float(seconds[-1])), "The last iteration's time."),
+        ("between_iterations", "interpolated", "A time that isn't an iteration's, such as a trial's stop or a block's start, is placed linearly between the iterations around it, or keeps its distance from the first or last one outside them (VirmenDataInterface's rule). Trials the pipeline didn't sync, or with a different iteration count, stop the conversion."),
     ]
     for name, sync_fit in clock.probes.items():
         if name == clock.sync_kind:
             continue
+        x = np.array([0.0, sync.probe_streams[name].n_samples / 2, sync.probe_streams[name].n_samples]) / clock.probe_rates[name]
+        correction = (sync_fit(x) - x) * 1e3
         rows += [
             (f"{name}.rate", repr(clock.probe_rates[name]), "Calibrated imSampRate from the AP meta file."),
             (f"{name}.sync_edges", str(sync_fit.n_edges), "Paired 1 Hz sync edges, read from short windows of the AP file's SY channel."),
+            (f"{name}.sync_correction_ms", f"start {correction[0]:.3f}, middle {correction[1]:.3f}, end {correction[2]:.3f}", "How far the sync map moves this probe's samples from sample / imSampRate, at the AP file's start, middle and end, in ms. Applied only if probe_clock is sync_edges."),
             (f"{name}.rate_difference_ppm", repr((sync_fit.linear_slope - 1) * 1e6), "Drift of this probe's clock against the sync stream left after the calibrated rates, in parts per million: 1 ppm is 3.6 ms per hour."),
             (f"{name}.line_residual_max_us", repr(sync_fit.linear_residual_us["max"]), "Largest edge residual of the best single line, in microseconds: the wander the piecewise map follows."),
             (f"{name}.map_residual_max_us", repr(sync_fit.residual_us["max"]), "Largest edge residual of the piecewise-linear map, in microseconds. Mostly the sync stream's sampling step."),
             (f"{name}.map_residual_std_us", repr(sync_fit.residual_us["std"]), "Standard deviation of those residuals, in microseconds; a 5 kHz NIDQ step alone gives 58."),
             (f"{name}.map_knots", str(sync_fit.knots.size), "Knots of the piecewise-linear map; see ephys_sync_maps."),
-            (f"{name}.coarse_offset_ms", f"{sync_fit.coarse_offset_ms['min']:.3f}..{sync_fit.coarse_offset_ms['max']:.3f}", "Offset between paired edges on the firstSample timeline, before fitting, in ms. Its spread is the drift."),
+        ]
+    for probe, _ in prepared:
+        d = probe.departure
+        fraction = d["spikes_changing_iteration"] / d["spikes_in_behavior"] if d["spikes_in_behavior"] else 0.0
+        rows += [
+            (f"{probe.name}.spikes_in_behavior", str(d["spikes_in_behavior"]), "Spikes between the first and last iteration, by sample / imSampRate."),
+            (f"{probe.name}.spikes_changing_iteration", f"{d['spikes_changing_iteration']} ({fraction:.2%})", "Of those, spikes this file's probe_clock puts in another iteration than sample / imSampRate does: the size of the departure, 0 under meta_rates."),
         ]
     if sync.shift_microseconds:
-        rows.append(("derived.session_start_shift_seconds", repr(sync.shift_microseconds / 1e6), "Seconds session_start_time was moved back from ViRMEn's session.start, so that no ephys sample has a negative time."))
+        rows.append(("shift_seconds", repr(sync.shift_microseconds / 1e6), "Seconds added to every time so that nothing is negative: a probe mapped onto the sync stream started before it. session_start_time is earlier by the same amount."))
     return rows
 
 
 def _add_ecephys_tables(nwbfile, sync, prepared):
-    module = nwbfile.create_processing_module("ecephys", "How spikes were put on the behavior clock, and what sorted them.")
-    module.add(_rows_table("ephys_sync_alignment", "How the ephys streams were aligned to behavior, and how far to trust it.", alignment_rows(sync)))
+    module = nwbfile.create_processing_module("ecephys", "How behavior and spikes were put on the recording's clock, and what sorted the spikes.")
+    module.add(_rows_table("ephys_sync_alignment", "How the behavior and the ephys streams were put on one clock, and how far to trust it.", alignment_rows(sync, prepared)))
     trial, iteration, edge, index = [], [], [], []
-    for t, (edges, indices) in enumerate(zip(sync.edges, sync.pipeline.iteration_idx_vector), start=1):
+    for t, (edges, indices) in enumerate(zip(sync.edges, sync.iteration_idx_vector), start=1):
         edges, indices = np.asarray(edges), np.asarray(indices).ravel()
         trial.append(np.full(edges.size, t))
         iteration.append(np.arange(1, edges.size + 1))
         edge.append(edges)
         index.append(indices)
     trial, iteration, edge, index = (np.concatenate(v).astype(np.int64) for v in (trial, iteration, edge, index))
-    edge_time = np.where(edge >= 0, sync.clock.sync_samples_to_session(np.maximum(edge, 0)), np.nan)
-    module.add(_table("ephys_iteration_edges", "Each logged iteration the pipeline matched to the sync stream's iteration line.", [
+    edge_time = np.where(edge >= 0, (edge - 0.5) / sync.clock.sync_rate + sync.clock.shift, np.nan)
+    module.add(_table("ephys_iteration_edges", "Each logged iteration, the pipeline's sample for it, the line's edge, and the time this file gives it.", [
         ("trial", "1-based trial in session order (the trials table's row + 1).", trial),
         ("iteration", "1-based iteration within the trial.", iteration),
         ("pipeline_index", "The sample index the pipeline stores for this iteration (BehaviorSync.sync_data iteration_idx_vector).", index),
         ("edge_sample", "Sample of the sync stream where the line changed for this iteration, or -1 if the pipeline borrowed this index from ViRMEn's times.", edge),
-        ("edge_time", "The edge's time in this file, NaN if there's no edge.", edge_time),
+        ("edge_time", "The edge's time in this file (half a sample before its first high sample), NaN if there's no edge.", edge_time),
+        ("time", "The iteration's time in this file, by ephys_sync_alignment's iteration_time: the behavior frames' timestamps.", np.concatenate(sync.iteration_seconds)),
     ]))
     knot_probe, knot_seconds, knot_values = [], [], []
     for name, fit in sync.clock.probes.items():
@@ -238,7 +270,8 @@ def _add_ecephys_tables(nwbfile, sync, prepared):
             ("sorted_input", s.sorted_input, "The binary the sorter read, as its files name it."),
             ("sample_origin", s.sample_origin, "What sample 0 of spike_times.npy is."),
             ("sample_origin_check", how, "Why that sample 0 is taken as the raw AP file's."),
-            ("params_sample_rate", repr(s.sample_rate_params), "params.py sample_rate. Not used: spike times use the meta file's calibrated imSampRate and the sync map."),
+            ("params_sample_rate", repr(s.sample_rate_params), "params.py sample_rate, the nominal rate the sorter was told; the DB's CuratedClustering divides by it. Used for spike times only under probe_clock params_rate."),
+            ("spike_time_rate", probe.departure["sample_rate_used"], "The rate this file divided spike samples by, before any sync map."),
             ("n_units", str(s.unit_ids.size), "Clusters written to the units table."),
             ("n_spikes", str(int(probe.counts.sum())), "Spikes written."),
             ("channel_position_offset_um", json.dumps([float(v) for v in probe.position_check[1]]), "Constant offset of channel_positions.npy from the meta file's geometry, x and y; the shapes agree within channel_position_max_difference_um."),
@@ -255,8 +288,8 @@ def build_ephys_nwbfile(sync, sorter_folders, metadata=None):
     placeholder = {
         **PLACEHOLDER_METADATA,
         "keywords": [*KEYWORDS, "extracellular electrophysiology", "Neuropixels", "spike sorting"],
-        "experiment_description": "PLACEHOLDER: ViRMEn behavior with Neuropixels recordings sorted by Kilosort. Experimenter, institution, lab and brain locations are not real yet.",
-        "session_description": f"ViRMEn behavior of {sync.session.lab_meta.get('experiment_name', 'an unnamed experiment')} with spike-sorted Neuropixels units on the behavior clock.",
+        "experiment_description": "PLACEHOLDER: ViRMEn behavior with Neuropixels recordings sorted by Kilosort, on the recording clock. Experimenter, institution, lab and brain locations are not real yet.",
+        "session_description": f"ViRMEn behavior of {sync.session.lab_meta.get('experiment_name', 'an unnamed experiment')} with spike-sorted Neuropixels units, both on the ephys recording's clock.",
     }
     nwbfile = build_nwbfile(sync.session, {**placeholder, **(metadata or {})})
     prepared = prepare_units(nwbfile, sync, sorter_folders)
@@ -274,7 +307,7 @@ def write_ephys_nwbfile(sync, sorter_folders, nwbfile_path, metadata=None):
 
 def conversion_report(sync, prepared):
     return dict(
-        alignment={key: value for key, value, _ in alignment_rows(sync)},
+        alignment={key: value for key, value, _ in alignment_rows(sync, prepared)},
         probes={probe.name: dict(sorter=probe.sorted.sorter, version=probe.sorted.sorter_version, units=int(probe.sorted.unit_ids.size), spikes=int(probe.counts.sum()), folder=str(probe.sorted.folder), sample_origin_check=how, notes=probe.sorted.notes) for probe, how in prepared},
         coverage=sync.session.coverage.as_dict(),
     )

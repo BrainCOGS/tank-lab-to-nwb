@@ -22,12 +22,13 @@ def iteration_schedule(n_trials=12, iterations=(180, 260), period=0.012, gap=1.5
     return trials
 
 
-def sync_word(trials, n_samples, rate=NIDQ_RATE, slope=1.0 + 4e-6, intercept=12.345, skip=(), sync_line=0, sync_phase=0.3, latency=0.0, trial_line=1, counter_lines=(2, 3, 4, 5, 6, 7)):
+def sync_word(trials, n_samples, rate=NIDQ_RATE, slope=1.0 + 4e-6, intercept=12.345, skip=(), sync_line=0, sync_phase=0.3, latency=0.0, trial_line=1, counter_lines=(2, 3, 4, 5, 6, 7), late=None):
     """A NIDQ digital word: the 1 Hz sync wave, a 5 ms trial pulse, and ViRMEn's iteration counter on its lines.
 
     Sync-stream seconds = slope * elapsed + intercept (+ latency). The counter restarts at 1 with each trial, as on the
     real rigs, and holds its value between trials. An iteration in `skip`, given as (trial index, iteration index), sends
-    nothing, so the counter jumps over it. Returns (word, true edge sample per trial and iteration, -1 if skipped).
+    nothing, so the counter jumps over it. `late` maps (trial index, iteration index) to extra seconds before that
+    iteration's output changes, as when a pulse misses a display frame. Returns (word, true edge sample per trial and iteration, -1 if skipped).
     """
     word = np.zeros(n_samples, dtype=np.uint16)
     seconds = np.arange(n_samples) / rate
@@ -36,7 +37,8 @@ def sync_word(trials, n_samples, rate=NIDQ_RATE, slope=1.0 + 4e-6, intercept=12.
     edges = []
     skip = set(skip)
     for t, (start, times) in enumerate(trials):
-        at = np.ceil((slope * (start + times.astype("float64")) + intercept + latency) * rate).astype(np.int64)  # the first sample at or after the change
+        delay = np.array([(late or {}).get((t, i), 0.0) for i in range(times.size)])
+        at = np.ceil((slope * (start + times.astype("float64")) + intercept + latency + delay) * rate).astype(np.int64)  # the first sample at or after the change
         trial_edges = np.where([(t, i) not in skip for i in range(times.size)], at, -1)
         edges.append(trial_edges)
         word[at[0] : at[0] + int(0.005 * rate)] |= np.uint16(1 << trial_line)

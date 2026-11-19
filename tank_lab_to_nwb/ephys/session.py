@@ -12,17 +12,27 @@ come from the reader unnoticed.
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
 
-from ..imaging.alignment import AlignmentError, session_start_shift, shifted_session
+from ..virmen.interface import aligned_session
 from ..virmen.loader import load_log, records
 from ..virmen.session import normalize_log
 from . import pipeline_sync as ps
 from . import spikeglx as sg
-from .clock import EphysClock, fit_behavior, identity_sync, iteration_edges, iteration_samples_for_fit, probe_sync
+from .clock import (
+    ITERATION_TIME,
+    PROBE_CLOCK,
+    EphysClock,
+    behavior_timestamps,
+    identity_sync,
+    iteration_edges,
+    iteration_times,
+    probe_sync,
+)
 
 # Pipeline rule (BehaviorSync.make): before this date the iteration count is a digital word, which U19 no longer supports.
 DIGITAL_WORD_SYNC_BEFORE = "2021-06-01"
@@ -94,18 +104,22 @@ def read_probe_sync_edges(ap_bin, windows):
 
 @dataclass(frozen=True)
 class SessionSync:
-    """A session's clock and everything that shows how it was found."""
+    """A session's clock, its behavior on that clock, and everything that shows how they were found."""
 
     clock: EphysClock
-    session: object  # the normalized behavior session, on the same clock (shifted if needed)
+    session: object  # the normalized behavior session, its times moved onto the recording's clock
     sync_stream: sg.Stream
     probe_streams: dict  # name -> Stream of the raw AP file
     pipeline: ps.PipelineSync
-    edges: list  # per trial, the edge sample of each iteration, -1 if not measured
+    vectors: str  # which pipeline vectors timed the iterations: "regular", "fixed" or "virmen_borrowed"
+    iteration_time: str
+    iteration_idx_vector: np.ndarray  # the vectors used, per trial
+    edges: list  # per trial, the edge sample of each iteration, -1 if there's none at the index
+    iteration_seconds: list  # per trial, each iteration's time in the file
     trials: list
-    probe_edges: dict = field(default_factory=dict)  # name -> (probe edge samples, sync edge samples) paired
+    probe_edges: dict = field(default_factory=dict)
     shift_microseconds: int = 0
-    lines: tuple = ()  # (trial line, iteration line) as the pipeline reads them
+    recording_start: object = None  # the sync file's fileCreateTime: when its first sample was taken, to the second
 
     @property
     def lag_seconds(self):
@@ -113,10 +127,40 @@ class SessionSync:
         return first / self.sync_stream.rate, later / self.sync_stream.rate
 
 
-def build_session_sync(session_folder, log_path, probes=None, sync_bin=None, every_seconds=30.0, session_date=None, file=None):
-    """Build the clock of one session from its raw folder and behavior log. `probes` limits the probes synced.
+def recording_start_time(stream):
+    """The wall-clock time of the sync file's first sample, from its fileCreateTime, on the rig's clock in Eastern time."""
+    from datetime import datetime
 
-    `log_path` is a path or an already decoded log; `file` names the log in the NWB file when it's decoded.
+    from ..virmen.timebase import EASTERN
+
+    return datetime.fromisoformat(stream.meta["fileCreateTime"]).replace(tzinfo=EASTERN)
+
+
+def _frame_times(session):
+    """The behavior's time of every logged frame (iteration): its longest series, the one on the "all" clock."""
+    found = next((s.timestamps for s in session.series if s.clock == "all"), None)
+    if found is None:
+        raise SessionSyncError(f"{session.file}: the log has no per-iteration series to align")
+    return np.asarray(found, dtype="float64")
+
+
+def build_session_sync(
+    session_folder,
+    log_path,
+    probes=None,
+    sync_bin=None,
+    every_seconds=30.0,
+    session_date=None,
+    file=None,
+    probe_clock=PROBE_CLOCK,
+    iteration_time=ITERATION_TIME,
+    allow_virmen_borrowed=False,
+):
+    """Build the clock of one session from its raw folder and behavior log, by the lab's rule. See docs/ephys-timing.md.
+
+    `log_path` is a path or an already decoded log; `file` names the log in the NWB file when it's decoded. `probes`
+    limits the probes synced. When the pipeline's pulse matching fails (regular and fixed status 0), the session is
+    refused unless `allow_virmen_borrowed`, which times iterations by the ViRMEn-borrowed vectors and says so in the file.
     """
     session_folder = Path(session_folder)
     if isinstance(log_path, (str, Path)):
@@ -127,10 +171,6 @@ def build_session_sync(session_folder, log_path, probes=None, sync_bin=None, eve
     session = normalize_log(log, file=file)
     if session_date is not None and str(session_date) < DIGITAL_WORD_SYNC_BEFORE:
         raise SessionSyncError(f"{session_folder}: recorded {session_date}, before {DIGITAL_WORD_SYNC_BEFORE}, when the sync used a digital-word frame counter. U19 refuses these sessions too ('Old sessions < 2022 not suported anymore'), and so does this converter.")
-    offsets = {round(float(offset), 9) for offset in session.coverage.clock["offsets"]}
-    if len(offsets) != 1:
-        raise SessionSyncError(f"{log_path}: ViRMEn's clock restarted ({len(offsets)} clock runs), and one line can't span that")
-    clock_offset = float(session.coverage.clock["offsets"][0])
     sync_stream = sg.open_stream(sync_bin or sg.find_sync_stream(session_folder))
     word = read_sync_word(sync_stream)
     trial_line, iteration_line = ps.pipeline_lines(word, sync_stream.kind, sync_stream.rate, sync_stream.meta["fileTimeSecs"])
@@ -144,16 +184,24 @@ def build_session_sync(session_folder, log_path, probes=None, sync_bin=None, eve
         result = ps.pipeline_sync(trial_line, iteration_line, sync_stream.rate, behavior_time_vector(trials))
     except (IndexError, ValueError) as error:
         raise SessionSyncError(f"{sync_stream.bin_path}: the pipeline's iteration detection failed on these lines ({type(error).__name__}: {error}); are the trial and iteration lines wired as the pipeline expects?") from error
-    if not (result.regular_sync_status == 1 or result.fixed_sync_status == 1):
-        raise SessionSyncError(f"{sync_stream.bin_path}: the pipeline's sync fails on this session (regular {result.regular_sync_status}, fixed {result.fixed_sync_status}): the iteration pulses don't match the log's iterations. Only the ViRMEn-borrowed vectors exist, which assume no drift and aren't a measurement, so this converter stops.")
-    edges = iteration_edges(result.iteration_idx_vector, trial_line, iteration_line, result.mode, sync_stream.rate)
+    if result.regular_sync_status == 1 or result.fixed_sync_status == 1:
+        vectors, indices = ("regular" if result.regular_sync_status == 1 else "fixed"), result.iteration_idx_vector
+    elif allow_virmen_borrowed:
+        vectors, indices = "virmen_borrowed", result.iteration_idx_vector_from_virmen
+    else:
+        raise SessionSyncError(f"{sync_stream.bin_path}: the pipeline's pulse matching fails on this session (regular {result.regular_sync_status}, fixed {result.fixed_sync_status}). Only the ViRMEn-borrowed vectors exist: each trial's start pulse plus ViRMEn's logged times, which the pipeline marks lower accuracy. Pass allow_virmen_borrowed=True (--allow-virmen-borrowed) to convert with them; the file then says so.")
+    edges = iteration_edges(indices, trial_line, iteration_line, result.mode, sync_stream.rate)
+    del trial_line, iteration_line
+    seconds = iteration_times(indices, edges, sync_stream.rate, iteration_time)
+    try:
+        aligned = behavior_timestamps(seconds, [times.size for _, times in trials])
+    except ValueError as error:
+        raise SessionSyncError(f"{sync_stream.bin_path}: {error}. The lab's rule gives these iterations no time, so this converter stops rather than guess.") from error
+    original = _frame_times(session)
+    if original.size != aligned.size or np.any(np.diff(original) < 0):
+        raise SessionSyncError(f"{log_path}: {original.size} logged frames in the behavior series but {aligned.size} iterations in the saved trials")
     if sync_edges is None:
         sync_edges = _obx_sync_edges(sync_stream)
-    samples, elapsed, numbers = iteration_samples_for_fit(edges, trials)
-    try:
-        behavior = fit_behavior(samples, elapsed, numbers, sync_stream.rate)
-    except AlignmentError as error:
-        raise SessionSyncError(f"{sync_stream.bin_path}: {error}") from error
     probe_files = sg.find_ap_files(session_folder)
     if probes is not None:
         missing = sorted(set(probes) - {f"imec{n}" for n in probe_files})
@@ -165,17 +213,26 @@ def build_session_sync(session_folder, log_path, probes=None, sync_bin=None, eve
         name = f"imec{number}"
         stream = sg.open_stream(ap_bin)
         probe_edges = read_probe_sync_edges(ap_bin, sg.sampling_windows(stream, every_seconds=every_seconds))
-        fit = probe_sync(probe_edges, stream.rate, stream.first_sample, sync_edges, sync_stream.rate, sync_stream.first_sample)
-        fits[name], rates[name], streams[name] = fit, stream.rate, stream
-        paired[name] = probe_edges
-    clock = EphysClock(sync_stream.kind, sync_stream.rate, behavior, clock_offset, fits, rates)
-    # Nothing in the file may have a negative time: move session_start_time back to the earliest file's first sample.
-    starts = [clock.sync_samples_to_session([0])[0]] + [clock.probe_samples_to_session(name, [0])[0] for name in streams]
-    shift = session_start_shift(np.array(starts))
-    if shift:
-        session = shifted_session(session, shift)
-        clock = clock.shifted(shift / 1e6)
-    return SessionSync(clock, session, sync_stream, streams, result, edges, trials, paired, shift, (trial_line, iteration_line))
+        fits[name] = probe_sync(probe_edges, stream.rate, stream.first_sample, sync_edges, sync_stream.rate, sync_stream.first_sample)
+        rates[name], streams[name], paired[name] = stream.rate, stream, probe_edges
+    clock = EphysClock(sync_stream.kind, sync_stream.rate, probe_clock, fits, rates)
+    # t = 0 is the sync file's first sample. A probe mapped onto it can start a little earlier; nothing may be negative.
+    starts = [0.0, float(aligned.min())] + [clock.probe_samples_to_session(name, [0])[0] for name in streams]
+    shift = int(np.ceil(-min(starts) * 1e6)) if min(starts) < 0 else 0
+    clock = clock.shifted(shift / 1e6)
+    session = aligned_session(session, original, aligned + shift / 1e6)
+    start = recording_start_time(sync_stream) - timedelta(microseconds=shift)
+    session = replace(session, session_start_time=start, settings=[*session.settings, *_clock_settings(session, sync_stream, shift)])
+    seconds = [t + shift / 1e6 for t in seconds]
+    return SessionSync(clock, session, sync_stream, streams, result, vectors, iteration_time, indices, edges, seconds, trials, paired, shift, start)
+
+
+def _clock_settings(session, stream, shift):
+    meaning = "How this file's times relate to ViRMEn's: see processing/ecephys/ephys_sync_alignment."
+    return [
+        ("derived.file_clock", f"recording: seconds since the first sample of {stream.bin_path.name}" + (f", plus {shift / 1e6} s" if shift else ""), "Every time in this file is on the ephys recording's clock, as the lab's pipeline defines it; derived.clock_offset and the other derived.clock_* rows describe ViRMEn's own clock, which the iteration times replaced."),
+        ("derived.virmen_session_start", session.session_start_time.isoformat(), "ViRMEn's session.start. session_start_time is the sync file's fileCreateTime instead. " + meaning),
+    ]
 
 
 def _nidq_sync_edges(stream, word):

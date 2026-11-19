@@ -1,4 +1,4 @@
-"""Putting probe samples on the behavior clock: sync edges, the pipeline's iteration matching, and the line to ViRMEn time."""
+"""Probe sync maps and the pipeline's iteration matching. The lab's rule built on them is in test_ephys_rule.py."""
 
 import numpy as np
 import pytest
@@ -7,15 +7,12 @@ from tank_lab_to_nwb.ephys import pipeline_sync as ps
 from tank_lab_to_nwb.ephys.clock import (
     EphysClock,
     SyncError,
-    fit_behavior,
     fit_sync,
     identity_sync,
     iteration_edges,
-    iteration_samples_for_fit,
     pair_sync_edges,
     probe_sync,
 )
-from tank_lab_to_nwb.imaging.alignment import AlignmentError
 from tests.synthetic_ephys import IMEC_RATE, NIDQ_RATE, iteration_schedule, sync_word
 
 
@@ -120,19 +117,6 @@ def test_virmen_vectors_follow_the_pipeline_formula():
         assert np.array_equal(stored, (true[0] - 1) + np.int64(times * NIDQ_RATE))
 
 
-def test_behavior_line_is_recovered():
-    trials = iteration_schedule(n_trials=20)
-    slope, intercept = 1 + 4e-6, 12.345
-    word, _ = sync_word(trials, n_samples=int(NIDQ_RATE * 110), slope=slope, intercept=intercept)
-    trial_line, iteration_line = _lines(word)
-    result = ps.pipeline_sync(trial_line, iteration_line, NIDQ_RATE, _behavior_time(trials))
-    edges = iteration_edges(result.iteration_idx_vector, trial_line, iteration_line, result.mode, NIDQ_RATE)
-    fit = fit_behavior(*iteration_samples_for_fit(edges, trials), NIDQ_RATE)
-    assert abs(fit.slope - slope) < 1e-6
-    assert abs(fit.intercept - intercept) < 5e-6
-    assert fit.n_rejected == 0
-
-
 def test_missed_pulses_take_the_fix_path_and_borrowed_indices_are_not_edges():
     trials = iteration_schedule(n_trials=20)
     skip = {(4, 50), (4, 51), (9, 120)}
@@ -148,56 +132,16 @@ def test_missed_pulses_take_the_fix_path_and_borrowed_indices_are_not_edges():
         # Every index called an edge is the true edge of that iteration.
         assert np.array_equal(found[measured], true[measured]), t
     assert all(edges[t][i] == -1 for t, i in skip)
-    fit = fit_behavior(*iteration_samples_for_fit(edges, trials), NIDQ_RATE)
-    assert abs(fit.slope - (1 + 4e-6)) < 1e-6
 
 
-def test_wrong_log_is_refused():
-    trials = iteration_schedule(n_trials=20)
-    word, _ = sync_word(trials, n_samples=int(NIDQ_RATE * 110))
-    trial_line, iteration_line = _lines(word)
-    result = ps.pipeline_sync(trial_line, iteration_line, NIDQ_RATE, _behavior_time(trials))
-    edges = iteration_edges(result.iteration_idx_vector, trial_line, iteration_line, result.mode, NIDQ_RATE)
-    other = iteration_schedule(n_trials=20, seed=5)
-    shuffled = [(start, other_times[: times.size] if other_times.size >= times.size else np.resize(other_times, times.size)) for (start, times), (_, other_times) in zip(trials, other)]
-    with pytest.raises(AlignmentError):
-        fit_behavior(*iteration_samples_for_fit(edges, shuffled), NIDQ_RATE)
-
-
-def test_clock_chains_probe_to_session_time():
-    trials = iteration_schedule(n_trials=20)
-    word, _ = sync_word(trials, n_samples=int(NIDQ_RATE * 110))
-    trial_line, iteration_line = _lines(word)
-    result = ps.pipeline_sync(trial_line, iteration_line, NIDQ_RATE, _behavior_time(trials))
-    edges = iteration_edges(result.iteration_idx_vector, trial_line, iteration_line, result.mode, NIDQ_RATE)
-    behavior = fit_behavior(*iteration_samples_for_fit(edges, trials), NIDQ_RATE)
+def test_clock_chains_probe_samples_to_the_recording():
     nidq = edges_at(NIDQ_RATE, 0, 110, lambda s: s)
     probe = edges_at(IMEC_RATE, 0, 110, drifting_probe)
-    clock = EphysClock("nidq", NIDQ_RATE, behavior, clock_offset=100.0, probes={"imec0": probe_sync(probe, IMEC_RATE, 0, nidq, NIDQ_RATE, 0), "nidq": identity_sync()}, probe_rates={"imec0": IMEC_RATE, "nidq": NIDQ_RATE})
-    # A spike at a known sync-stream time lands at that time's elapsed reading plus the offset.
+    fits = {"imec0": probe_sync(probe, IMEC_RATE, 0, nidq, NIDQ_RATE, 0), "nidq": identity_sync()}
+    clock = EphysClock("nidq", NIDQ_RATE, "sync_edges", fits, {"imec0": IMEC_RATE, "nidq": NIDQ_RATE})
     sync_seconds = np.array([20.0, 55.5, 90.25])
-    elapsed = (sync_seconds - 12.345) / (1 + 4e-6)
-    spikes = drifting_probe(sync_seconds) * IMEC_RATE
-    assert np.max(np.abs(clock.probe_samples_to_session("imec0", spikes) - (elapsed + 100.0))) < 60e-6
-    assert np.allclose(clock.sync_samples_to_session(sync_seconds * NIDQ_RATE), elapsed + 100.0, atol=5e-6, rtol=0)
-    assert np.allclose(clock.shifted(2.0).sync_samples_to_session([0]), clock.sync_samples_to_session([0]) + 2.0)
+    assert np.max(np.abs(clock.probe_samples_to_session("imec0", drifting_probe(sync_seconds) * IMEC_RATE) - sync_seconds)) < 40e-6
+    assert np.array_equal(clock.sync_samples_to_session(np.array([0, 5000])), np.array([0, 5000]) / NIDQ_RATE)
+    assert np.allclose(clock.shifted(2.0).sync_samples_to_session([0]), [2.0])
     with pytest.raises(KeyError, match="imec3"):
         clock.probe_samples_to_session("imec3", [0])
-
-
-def test_a_minority_of_frame_late_pulses_is_rejected_not_fatal():
-    """In pulse_signal mode about 6 % of pulses go out late, by a display frame on S8a; here 10 ms, under the iteration spacing."""
-    rng = np.random.default_rng(3)
-    elapsed = np.cumsum(rng.uniform(0.016, 0.020, 50_000))  # iterations 16-20 ms apart
-    iterations = np.tile(np.arange(1, 501), 100)
-
-    def edges(late_fraction):
-        late = rng.random(elapsed.size) < late_fraction
-        times = elapsed * (1 + 20e-6) + 1.0 + rng.normal(0, 3e-4, elapsed.size) + late * 0.010
-        return times * NIDQ_RATE + 0.5
-
-    fit = fit_behavior(edges(0.07), elapsed, iterations, NIDQ_RATE)
-    assert abs((fit.slope - 1) * 1e6 - 20) < 0.5 and abs(fit.intercept - 1.0) < 1e-4
-    assert fit.n_rejected > 0.05 * elapsed.size
-    with pytest.raises(AlignmentError, match="off the line"):
-        fit_behavior(edges(0.12), elapsed, iterations, NIDQ_RATE)

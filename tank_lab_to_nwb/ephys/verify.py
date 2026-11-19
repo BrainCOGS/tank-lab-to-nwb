@@ -17,11 +17,30 @@ def _strings(values):
     return np.array([v.decode() if isinstance(v, bytes) else str(v) for v in values])
 
 
+def _check_iterations(f, sync):
+    """Every behavior frame's timestamp must be its iteration's time, recomputed here from the vectors and the rate."""
+    expected = np.concatenate([np.asarray(v, dtype=np.int64).ravel() / sync.sync_stream.rate for v in sync.iteration_idx_vector]) + sync.clock.shift
+    if sync.iteration_time == "edge":
+        expected = np.concatenate(sync.iteration_seconds)
+    stored = f["processing/ecephys/ephys_iteration_edges/time"][:]
+    if not np.array_equal(stored, expected):
+        raise RoundTripError("ephys_iteration_edges time differs from the pipeline vectors over the rate")
+    frames = None
+    for item in f["processing/behavior"].values():
+        if isinstance(item, h5py.Group) and "timestamps" in item and item["timestamps"].shape == expected.shape:
+            frames = item["timestamps"][:]
+            break
+    if frames is None or not np.array_equal(frames, expected):
+        raise RoundTripError("the behavior frames' timestamps aren't the iteration times")
+
+
 def verify_ephys(sync, prepared, nwbfile_path):
     """Raise RoundTripError at the first stored value that differs from the sources. Returns counts checked."""
     verify_round_trip(sync.session, nwbfile_path)
     checked = dict(units=0, spikes=0)
     with h5py.File(nwbfile_path, "r") as f:
+        _check_iterations(f, sync)
+        checked["iterations"] = int(sum(np.size(t) for t in sync.iteration_seconds))
         units = f["units"]
         index = units["spike_times_index"][:]
         times = units["spike_times"][:]
@@ -38,8 +57,9 @@ def verify_ephys(sync, prepared, nwbfile_path):
             ids = np.unique(spike_clusters)
             if not np.array_equal(clusters[row : row + ids.size], ids) or set(probes[row : row + ids.size]) != {probe.name}:
                 raise RoundTripError(f"units of {probe.name}: rows {row}..{row + ids.size} don't hold its clusters {ids[:5]}...")
+            rate = probe.sorted.sample_rate_params if sync.clock.probe_clock == "params_rate" else None
             for i, cluster in enumerate(ids):
-                expected = sync.clock.probe_samples_to_session(probe.name, spike_times[spike_clusters == cluster])
+                expected = sync.clock.probe_samples_to_session(probe.name, spike_times[spike_clusters == cluster], rate=rate)
                 stored = times[starts[row + i] : index[row + i]]
                 if stored.shape != expected.shape or not np.array_equal(stored, expected):
                     raise RoundTripError(f"{probe.name} cluster {cluster}: stored spike times differ from the sorter's samples on the clock")

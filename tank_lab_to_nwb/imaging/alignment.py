@@ -62,19 +62,15 @@ class ClockFit:
         return (np.asarray(scanimage_time, dtype="float64") - self.intercept) / self.slope
 
 
-def fit_clock(times, elapsed, iterations, what="I2C packets", max_rejected_fraction=MAX_REJECTED_FRACTION, residual_limit_over_kept=False):
-    """Fit the line, rejecting late packets. A trial's first iteration isn't fit, because it's always sent late.
-
-    `what` names the events in error messages: ephys fits iteration edges on a NIDQ or OneBox line the same way, and
-    allows more of them off the line, checking the residual percentiles over the kept ones (see docs/ephys-timing.md).
-    """
+def fit_clock(times, elapsed, iterations):
+    """Fit the line, rejecting late packets. A trial's first iteration isn't fit, because it's always sent late."""
     times, elapsed, iterations = (np.asarray(v) for v in (times, elapsed, iterations))
     if times.size < MIN_PACKETS:
-        raise AlignmentError(f"only {times.size} {what} match the log, too few to fit the clocks; {MIN_PACKETS} are needed")
+        raise AlignmentError(f"only {times.size} I2C packets match the log, too few to fit the clocks; {MIN_PACKETS} are needed")
     center = elapsed.mean()
     eligible = iterations > 1
     if eligible.sum() < MIN_PACKETS:
-        raise AlignmentError(f"only {eligible.sum()} usable {what} match the log; {MIN_PACKETS} are needed")
+        raise AlignmentError(f"only {eligible.sum()} usable I2C packets match the log; {MIN_PACKETS} are needed")
     keep = eligible.copy()
     slope, intercept = np.polyfit(elapsed[keep] - center, times[keep], 1)
     for _ in range(50):
@@ -92,11 +88,11 @@ def fit_clock(times, elapsed, iterations, what="I2C packets", max_rejected_fract
     if ppm > MAX_RATE_DIFFERENCE_PPM:
         raise AlignmentError(f"the clocks differ in rate by {ppm:.0f} ppm, more than the {MAX_RATE_DIFFERENCE_PPM:.0f} ppm allowed")
     n_rejected = int(eligible.sum() - keep.sum())
-    if n_rejected > max_rejected_fraction * eligible.sum():
-        raise AlignmentError(f"{n_rejected} of {eligible.sum()} {what} are off the line, so one line doesn't fit this session")
-    low, high = np.percentile(residual[keep] if residual_limit_over_kept else residual, [1, 99])
+    if n_rejected > MAX_REJECTED_FRACTION * eligible.sum():
+        raise AlignmentError(f"{n_rejected} of {eligible.sum()} packets are off the line, so one line doesn't fit this session")
+    low, high = np.percentile(residual, [1, 99])
     if max(abs(low), abs(high)) > MAX_RESIDUAL_SECONDS:
-        raise AlignmentError(f"{what} are {low * 1e3:.1f} to {high * 1e3:.1f} ms from the line, so one line doesn't fit this session")
+        raise AlignmentError(f"packets are {low * 1e3:.1f} to {high * 1e3:.1f} ms from the line, so one line doesn't fit this session")
     p1, p50, p99 = np.percentile(residual, [1, 50, 99]) * 1e3
     return ClockFit(
         slope=float(slope),

@@ -59,21 +59,45 @@ def session(tmp_path, monkeypatch):
     probe = probeinterface.read_spikeglx(DATA / "np1.ap.meta")
     np.save(sorter / "channel_map.npy", np.arange(8, dtype=np.int32))
     np.save(sorter / "channel_positions.npy", probe.contact_positions[:8] + [11.0, 0.0])
-    return dict(log=_log(schedule), raw=raw, sorter=sorter, trains=trains, cluster_ids=cluster_ids, n_ap=n_ap, tmp=tmp_path)
+    return dict(schedule=schedule, n_nidq=n_nidq, log=_log(schedule), raw=raw, sorter=sorter, trains=trains, cluster_ids=cluster_ids, n_ap=n_ap, tmp=tmp_path)
 
 
-def test_spikes_land_on_the_behavior_clock(session):
+def test_iterations_take_their_pulses_and_spikes_their_samples(session):
+    sync = build_session_sync(session["raw"], session["log"], file="log.mat", probe_clock="meta_rates")
+    assert (sync.pipeline.regular_sync_status, sync.pipeline.mode, sync.vectors) == (1, "counter_bit0", "regular")
+    for got, index in zip(sync.iteration_seconds, sync.iteration_idx_vector):
+        assert np.array_equal(got, np.asarray(index) / NIDQ_RATE)
+    frames = next(s.timestamps for s in sync.session.series if s.clock == "all")
+    assert np.array_equal(frames, np.concatenate(sync.iteration_seconds))
+    samples = np.array([0, 12345, session["n_ap"] - 1])
+    assert np.array_equal(sync.clock.probe_samples_to_session("imec0", samples), samples / IMEC_RATE)
+    # The trials table follows the frames: a trial starts at its first iteration's pulse.
+    starts = next(c.data for c in sync.session.trials if c.name == "start_time")
+    assert np.array_equal(starts, [t[0] for t in sync.iteration_seconds])
+
+
+def test_sync_edges_moves_spikes_by_the_measured_drift(session):
     sync = build_session_sync(session["raw"], session["log"], file="log.mat")
-    assert (sync.pipeline.regular_sync_status, sync.pipeline.mode) == (1, "counter_bit0")
-    assert abs(sync.clock.behavior.slope - SLOPE) < 2e-6
+    assert sync.clock.probe_clock == "sync_edges"
     fit = sync.clock.probes["imec0"]
     assert abs((fit.linear_slope - 1) * 1e6 - (-PROBE_DRIFT * 1e6)) < 3
-    # A spike at a known NIDQ time lands at that time's elapsed reading plus the log's offset.
+    # A spike at a known NIDQ time lands at that time, whatever the probe's own rate says.
     nidq_seconds = np.array([3.0, 7.5, 11.0])
     probe_samples = (nidq_seconds - 0.03) * (1 + PROBE_DRIFT) * IMEC_RATE
-    elapsed = (nidq_seconds - INTERCEPT) / SLOPE
-    got = sync.clock.probe_samples_to_session("imec0", probe_samples)
-    assert np.max(np.abs(got - (elapsed + sync.clock.clock_offset))) < 1e-4
+    assert np.max(np.abs(sync.clock.probe_samples_to_session("imec0", probe_samples) - nidq_seconds)) < 1e-4
+
+
+def test_virmen_borrowed_vectors_only_when_asked(session):
+    # Tens of pulses missing in three trials: too many for the pipeline's fix path.
+    skip = {(t, i) for t in (1, 2, 3) for i in range(20, 60)}
+    word, _ = sync_word(session["schedule"], n_samples=session["n_nidq"], slope=SLOPE, intercept=INTERCEPT, skip=skip)
+    word.view(np.int16).tofile(next(session["raw"].glob("*.nidq.bin")))
+    with pytest.raises(SessionSyncError, match="allow_virmen_borrowed"):
+        build_session_sync(session["raw"], session["log"], file="log.mat")
+    sync = build_session_sync(session["raw"], session["log"], file="log.mat", allow_virmen_borrowed=True)
+    assert sync.vectors == "virmen_borrowed"
+    for got, index in zip(sync.iteration_seconds, sync.pipeline.iteration_idx_vector_from_virmen):
+        assert np.array_equal(got, np.asarray(index) / NIDQ_RATE)
 
 
 def test_whole_conversion_reads_back(session, monkeypatch):
@@ -82,6 +106,7 @@ def test_whole_conversion_reads_back(session, monkeypatch):
     real = cs.build_session_sync
     monkeypatch.setattr(cs, "build_session_sync", lambda raw, log, **kw: real(raw, session["log"], file="log.mat", **kw))
     path = convert(session["tmp"] / "log.mat", session["raw"], session["tmp"] / "out", {"imec0": session["sorter"].parent})
+    assert convert(session["tmp"] / "log.mat", session["raw"], session["tmp"] / "meta", {"imec0": session["sorter"].parent}, probe_clock="meta_rates", iteration_time="edge").is_file()
     report = json.loads(path.with_suffix(".report.json").read_text())
     assert report["verified"]["units"] == session["cluster_ids"].size
     assert report["verified"]["spikes"] == sum(v.size for v in session["trains"].values())
@@ -94,6 +119,8 @@ def test_whole_conversion_reads_back(session, monkeypatch):
         assert len(nwbfile.electrodes) == 384
         alignment = nwbfile.processing["ecephys"]["ephys_sync_alignment"].to_dataframe().set_index("key")["value"]
         assert alignment["pipeline.index_lag_seconds"] == repr(6 / NIDQ_RATE)
+        assert (alignment["probe_clock"], alignment["iteration_time"], alignment["vectors"]) == ("sync_edges", "pipeline_index", "regular")
+        assert nwbfile.session_start_time.isoformat().startswith("2024-07-27T13:59:44")
         sorting = nwbfile.processing["ecephys"]["sorting_imec0"].to_dataframe().set_index("key")["value"]
         assert sorting["sorter"] == "Kilosort 4" and sorting["sorter_version"] == "4.0.37"
         assert json.loads(sorting["channel_position_offset_um"]) == [11.0, 0.0]
@@ -115,12 +142,3 @@ def test_a_trimmed_sorting_is_refused(session):
 def test_old_digital_word_sessions_are_refused(session):
     with pytest.raises(SessionSyncError, match="digital-word"):
         build_session_sync(session["raw"], session["log"], file="log.mat", session_date="2021-05-06")
-
-
-def test_unsynced_lines_are_refused(session):
-    nidq = next(session["raw"].glob("*.nidq.bin"))
-    data = np.fromfile(nidq, dtype="<u2")
-    data &= np.uint16(~(1 << 2) & 0xFFFF)  # the iteration line never changes
-    data.tofile(nidq)
-    with pytest.raises(SessionSyncError):
-        build_session_sync(session["raw"], session["log"], file="log.mat")

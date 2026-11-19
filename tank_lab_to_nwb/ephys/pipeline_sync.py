@@ -355,3 +355,38 @@ def pipeline_index_lag(mode, rate):
     """
     after, _ = mode_offsets(mode, rate)
     return 1, (1 + after) if mode == "counter_bit0" else 1
+
+
+# ---- ephys_pipeline.get_full_vectors_from_key and ephys_sync.CuratedClustersIteration ----
+
+
+def get_full_vector_samples(iter_start_idx_vectors, nidq_sampling_rate, total_samples):
+    framenumber_vector_samples = np.zeros(total_samples) * np.nan
+    trialnumber_vector_samples = np.zeros(total_samples) * np.nan
+    for i in range(len(iter_start_idx_vectors)):
+        this_trial_iter_vector = iter_start_idx_vectors[i]
+        if i < len(iter_start_idx_vectors) - 1:
+            next_trial_iter_vector = iter_start_idx_vectors[i + 1]
+        for j in range(this_trial_iter_vector.shape[0] - 1):
+            framenumber_vector_samples[this_trial_iter_vector[j] : this_trial_iter_vector[j + 1]] = j + 1
+        if i < len(iter_start_idx_vectors) - 1:
+            trialnumber_vector_samples[this_trial_iter_vector[0] : next_trial_iter_vector[0]] = i + 1
+            framenumber_vector_samples[this_trial_iter_vector[-1] : next_trial_iter_vector[0]] = this_trial_iter_vector.shape[0]
+        else:
+            trialnumber_vector_samples[this_trial_iter_vector[0] : this_trial_iter_vector[-1] + int(nidq_sampling_rate)] = i + 1
+            framenumber_vector_samples[this_trial_iter_vector[-1] : this_trial_iter_vector[-1] + int(nidq_sampling_rate)] = this_trial_iter_vector.shape[0]
+    return trialnumber_vector_samples, framenumber_vector_samples
+
+
+def curated_clusters_iteration_times(iteration_idx_vector, nidq_sampling_rate, total_samples):
+    """The iteration times CuratedClustersIteration digitizes spikes into, from the per-sample iteration vector.
+
+    It expands the vectors to one value per NIDQ sample, then takes the samples where the value changes, by np.diff,
+    so each time is the sample before the index, and the session's first iteration (after NaN) is dropped. Its spike
+    times come from the element, `spike_times.npy / params.py sample_rate`.
+    """
+    _, iteration_index_nidq = get_full_vector_samples([np.asarray(v, dtype=np.int64).ravel() for v in iteration_idx_vector], nidq_sampling_rate, total_samples)
+    ls = np.diff(iteration_index_nidq)
+    ls[ls < 0] = 1
+    ls[np.isnan(ls)] = 0
+    return np.where(ls)[0] / nidq_sampling_rate
