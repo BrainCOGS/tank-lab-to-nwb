@@ -63,6 +63,10 @@ disagreed by 0.15 to 0.96 s, with the sign changing between days.
 
 The lab's pipeline, `SyncImagingBehavior` in U19-pipeline-matlab, stores labels rather than a clock: the block, trial and iteration
 of each frame's first packet, repeated across interior frames with no packet, and cleared for the trial missing from the log.
+Since U19-pipeline-matlab#72 it also clears a logged trial that imaging only partly covered: the trial's packets, matched to its
+logged iteration times, place it on the ScanImage clock by their median offset, and unless the acquisition ran from its first to its
+last iteration, give or take one frame period, its frames get 0. The alignment table lists those trials as
+`labels.partly_imaged_trials`; the trials table still holds their behavior.
 `processing/ophys/scanimage_frames` holds these as `behavior_block`, `behavior_trial` and `behavior_iteration`, so its results can be
 compared.
 

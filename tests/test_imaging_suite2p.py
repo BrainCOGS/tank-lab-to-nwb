@@ -450,7 +450,7 @@ def test_a_whole_page_run_of_a_multi_roi_session_is_refused(tmp_path, log, run):
     rois = [dict(rows=3), dict(rows=3)]
     packets = {}
     trial = log["block"][0]["trial"][0]
-    for iteration in range(1, 900, 2):
+    for iteration in range(1, trial["time"].size + 1, 2):
         time = (float(trial["start"].item()) + float(trial["time"][iteration - 1, 0])) * (1 - 5e-6) + 13.0
         frame = int(time // 0.02) + 1
         if frame <= 801:

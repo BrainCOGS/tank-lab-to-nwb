@@ -17,25 +17,29 @@ from tank_lab_to_nwb.virmen.coerce import LossyConversionError
 from tests.synthetic_log import make_block, make_log, make_trial, scalar
 from tests.synthetic_tiff import FRAME_PERIOD, frame_pixels, software, write_acquisition
 
-N_ITERATIONS = 900
+N_ITERATIONS = 500  # 2 s, which ends inside the 801 frames' 16 s of imaging
 STEP = 0.004  # seconds between iterations
 INTERCEPT = 13.0  # the elapsed clock read zero 13 s after imaging started, 3 s before the session's first time
 
 
+def _one_trial_log(n_iterations):
+    trial = make_trial(start=1.0, n_frames=n_iterations, n_iti=0, duration=None)
+    trial["time"] = (np.arange(n_iterations, dtype="float32") * STEP).reshape(-1, 1)
+    trial["duration"] = np.array([[n_iterations * STEP]], dtype="float32")
+    return make_log([make_block([trial], start=(2026, 7, 15, 12, 0, 1.0))], currentIt=scalar(0))
+
+
 @pytest.fixture
 def log():
-    """One long trial, starting at elapsed 1 s."""
-    trial = make_trial(start=1.0, n_frames=N_ITERATIONS, n_iti=0, duration=None)
-    trial["time"] = (np.arange(N_ITERATIONS, dtype="float32") * STEP).reshape(-1, 1)
-    trial["duration"] = np.array([[N_ITERATIONS * STEP]], dtype="float32")
-    return make_log([make_block([trial], start=(2026, 7, 15, 12, 0, 1.0))], currentIt=scalar(0))
+    """One long trial, starting at elapsed 1 s and ending while imaging still runs."""
+    return _one_trial_log(N_ITERATIONS)
 
 
 def _frame_packets(log, n_frames):
     """Packets every other iteration on the frame they fall in, after an exact line through the log's time."""
     trial = log["block"][0]["trial"][0]
     packets = {}
-    for iteration in range(1, N_ITERATIONS + 1, 2):
+    for iteration in range(1, trial["time"].size + 1, 2):
         elapsed = float(trial["start"].item()) + float(trial["time"][iteration - 1, 0])
         time = elapsed * (1 - 5e-6) + INTERCEPT
         frame = int(time // FRAME_PERIOD) + 1
@@ -310,6 +314,22 @@ def test_frames_table_holds_the_pipeline_labels(written):
     assert set(block[numbered].tolist()) == {1} and set(trial[numbered].tolist()) == {1}
     assert np.all(np.diff(iteration[numbered]) >= 0)
     assert iteration[numbered[0]] == 1
+
+
+def test_a_trial_imaging_stopped_during_has_no_labels_and_is_listed(tmp_path):
+    log = _one_trial_log(900)  # 3.6 s, but imaging stops 1.6 s before it ends
+    folder = tmp_path / "tiffs"
+    folder.mkdir()
+    tiffs = write_acquisition(folder, 801, frames_per_file=300, packets=_frame_packets(log, 801))
+    path = tmp_path / "partial.nwb"
+    convert_session(log, tiffs, path, file="session.mat")
+    with h5py.File(path, "r") as file:
+        frames = file["processing/ophys/scanimage_frames"]
+        assert not frames["behavior_block"][()].any() and not frames["behavior_trial"][()].any() and not frames["behavior_iteration"][()].any()
+        table = file["processing/ophys/scanimage_alignment"]
+        values = dict(zip(table["key"].asstr()[()], table["value"].asstr()[()]))
+        assert len(file["intervals/trials/id"]) == 1  # the trial's behavior stays
+    assert values["labels.partly_imaged_trials"] == '["1/1"]'
 
 
 def test_the_file_describes_its_method_well_enough_to_reproduce(written):
