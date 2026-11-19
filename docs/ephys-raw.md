@@ -70,6 +70,20 @@ be rebuilt exactly. On S3 a minute holds about 12,000 edges (mostly the 6-bit it
 0.7 M rows per hour, a few MB: the full nidq trace is 36 MB per hour and the OneBox's 0.9 GB, mostly the unused analog
 `XA` channels, which aren't written.
 
+## Read-back check
+
+After writing, `convert` reads the file's HDF5 directly (`raw.verify_raw_ephys`) and stops with `RoundTripError` if it
+differs from the SpikeGLX files:
+
+- each raw series: shape and dtype, its electrode rows against the units' rows, and at its start, middle and end (1 s
+  each) every stored sample against the file's bytes and every time against the clock (exactly for timestamps, within
+  the 0.1-sample tolerance for `starting_time` + `rate`);
+- the sync edges: every row's time against the clock, and the digital word rebuilt from the rows alone against the
+  file's bytes over the first and last million samples.
+
+The whole of an AP file isn't reread: the writer copies blocks unchanged, so a fault would be in where blocks land,
+which three windows across the file show. The counts go in the report under `verified.raw`.
+
 ## Memory and chunking
 
 Data are read with positioned reads one buffer at a time (`BUFFER_BYTES`, 64 MB by default, spanning all channels so

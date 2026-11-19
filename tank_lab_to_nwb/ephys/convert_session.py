@@ -24,7 +24,7 @@ from pathlib import Path
 from ..virmen.layout import DandiValidationError, organize_for_dandi
 from .clock import ITERATION_TIME, ITERATION_TIMES, PROBE_CLOCK, PROBE_CLOCKS
 from .convert import conversion_report, write_ephys_nwbfile
-from .raw import RAW_BANDS
+from .raw import RAW_BANDS, verify_raw_ephys
 from .session import build_session_sync
 from .sorting import SortingError, find_sorter_folders
 from .units_only import CLOCK, TIED_TO, UnitsOnlyError, write_units_only
@@ -83,6 +83,8 @@ def convert(log, raw_folder, output, sorter_folders, session_date=None, metadata
     raw_notes = {}
     prepared = write_ephys_nwbfile(sync, sorter_folders, path, metadata, raw=raw, raw_notes=raw_notes)
     checked = verify_ephys(sync, prepared, path)
+    if raw is not None:
+        checked["raw"] = verify_raw_ephys(path, sync, {probe.name: probe.electrodes.rows for probe, _ in prepared}, **raw)
     report = conversion_report(sync, prepared)
     report["verified"] = checked
     report["raw"] = raw_notes
@@ -124,11 +126,7 @@ def main_units_only(argv):
     print(convert_units_only(arguments.output, dict(arguments.sorted), arguments.subject, arguments.session_id, binaries=dict(arguments.binary), name=arguments.name))
 
 
-def main():
-    import sys
-
-    if "--units-only" in sys.argv[1:]:
-        return main_units_only(sys.argv[1:])
+def session_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("log", type=Path)
     parser.add_argument("raw_folder", type=Path)
@@ -140,13 +138,22 @@ def main():
     parser.add_argument("--iteration-time", choices=ITERATION_TIMES, default=ITERATION_TIME, help=f"Iteration times: pipeline_index (the lab's rule) or edge (the line's edge). Default {ITERATION_TIME}.")
     parser.add_argument("--allow-virmen-borrowed", action="store_true", help="Convert a session whose pulse matching failed, with the pipeline's ViRMEn-borrowed vectors (lower accuracy; the file says so).")
     parser.add_argument("--raw-bands", nargs="*", choices=("ap", "lf"), default=list(RAW_BANDS), help=f"Raw SpikeGLX bands to write. Default {' '.join(RAW_BANDS)}; AP is 40-50 GB per probe-hour compressed.")
-    parser.add_argument("--raw-folder", type=Path, help="Take the raw bands from this folder (for example clips from tank_lab_to_nwb.ephys.clip) instead of the raw run folder.")
+    # dest: the positional raw_folder is the recording the clock is built from, and this option must not replace it.
+    parser.add_argument("--raw-folder", dest="raw_from", type=Path, help="Take the raw bands from this folder (for example clips from tank_lab_to_nwb.ephys.clip) instead of the raw run folder.")
     parser.add_argument("--raw-max-seconds", type=float, help="Write only the first seconds of each raw stream (a stub).")
     parser.add_argument("--no-sync-edges", action="store_true", help="Leave out the table of every sync-line edge.")
     parser.add_argument("--dandiset", type=Path, help="Also name the file for DANDI under this folder and run dandi validate on it; a file dandi rejects is an error.")
-    arguments = parser.parse_args()
+    return parser
+
+
+def main():
+    import sys
+
+    if "--units-only" in sys.argv[1:]:
+        return main_units_only(sys.argv[1:])
+    arguments = session_parser().parse_args()
     print(convert(arguments.log, arguments.raw_folder, arguments.output, dict(arguments.sorted), session_date=arguments.date, name=arguments.name, probe_clock=arguments.probe_clock, iteration_time=arguments.iteration_time, allow_virmen_borrowed=arguments.allow_virmen_borrowed,
-                  raw_bands=arguments.raw_bands, raw_from=arguments.raw_folder, sync_edges=not arguments.no_sync_edges, raw_max_seconds=arguments.raw_max_seconds, dandiset=arguments.dandiset))
+                  raw_bands=arguments.raw_bands, raw_from=arguments.raw_from, sync_edges=not arguments.no_sync_edges, raw_max_seconds=arguments.raw_max_seconds, dandiset=arguments.dandiset))
 
 
 if __name__ == "__main__":

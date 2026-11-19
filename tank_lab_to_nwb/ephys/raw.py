@@ -383,3 +383,100 @@ def add_raw_ephys(nwbfile, sync, electrode_rows, raw_folder=None, bands=RAW_BAND
         table = add_sync_edges(nwbfile, [(recording.sync, sync_stream_clock(sync, recording.sync))], n_samples=n)
         notes[table.name] = f"{len(table)} edges"
     return notes
+
+
+# --- Reading back what was written ------------------------------------------------------------------------------------
+
+VERIFY_SECONDS = 1.0  # of each raw series, at its start, middle and end
+VERIFY_EDGE_SAMPLES = 1_000_000  # of each digital channel, at its start and end
+
+
+def _series_path(stream):
+    name = f"ElectricalSeries{stream.band.upper()}{stream.device.capitalize()}"
+    return f"processing/ecephys/LFP/{name}" if stream.is_catgt and stream.band == "lf" else f"acquisition/{name}"
+
+
+def _stored_times(group, start, stop):
+    if "timestamps" in group:
+        return group["timestamps"][start:stop]
+    return float(group["starting_time"][()]) + np.arange(start, stop) / float(group["starting_time"].attrs["rate"])
+
+
+def _word_from_edges(samples, bits, levels, first, n):
+    """The digital word of samples first..first+n, rebuilt from the edge rows alone."""
+    word = np.zeros(n, dtype=np.uint16)
+    at = first + np.arange(n)
+    for bit in np.unique(bits):
+        mine = bits == bit
+        position = np.searchsorted(samples[mine], at, side="right") - 1
+        level = np.where(position >= 0, levels[mine][np.clip(position, 0, None)], 0).astype(np.uint16)
+        word |= level << np.uint16(bit)
+    return word
+
+
+def verify_raw_ephys(nwbfile_path, sync, electrode_rows, raw_folder=None, bands=RAW_BANDS, sync_edges=True, max_seconds=None, compression=None):
+    """Raise RoundTripError unless what `add_raw_ephys` wrote, with the same options, equals the SpikeGLX files.
+
+    Reads the HDF5 directly. Each raw series: its shape and dtype, its electrode rows, and at its start, middle and end
+    (VERIFY_SECONDS each) every stored sample against the file's bytes and every time against the clock (exactly for
+    timestamps, within the writer's tolerance for starting_time + rate). The sync edges: every row's time against the
+    clock, and the digital word rebuilt from the rows alone against the file's bytes at the start and end of the stream.
+    Returns counts of what was checked. The whole of a 92 GB AP file isn't reread; the writer copies blocks without
+    changing them, so a fault would be in the block positions, which three windows across the file would show.
+    """
+    import h5py
+
+    from ..virmen.verify import RoundTripError
+    from .spikeglx_layout import find_recording
+
+    recording = find_recording(raw_folder or sync.sync_stream.bin_path.parent)
+    by_device = {p.device: p for p in recording.probes}
+    checked = dict(series=0, samples=0, edges=0)
+    with h5py.File(nwbfile_path, "r") as f:
+        for probe, rows in electrode_rows.items():
+            found = by_device[probe]
+            for band, stream in (("ap", found.ap), ("lf", found.lf)):
+                if band not in bands or stream is None:
+                    continue
+                path = _series_path(stream)
+                if path not in f:
+                    raise RoundTripError(f"{path}: not in the file, though {stream.bin_path.name} was to be written")
+                group, channels = f[path], stream.neural_channels
+                n = stream.n_samples if max_seconds is None else min(stream.n_samples, int(round(max_seconds * stream.sampling_rate)))
+                data = group["data"]
+                if data.shape != (n, channels.size) or data.dtype != np.int16:
+                    raise RoundTripError(f"{path}: {data.shape} {data.dtype} on disk, expected {(n, channels.size)} int16")
+                if not np.array_equal(group["electrodes"][:], np.asarray(rows)):
+                    raise RoundTripError(f"{path}: its electrode rows aren't the units' rows of {probe}, in channel order")
+                clock = probe_clock(sync, probe, stream, ap=found.ap)
+                block = max(1, min(n, int(stream.sampling_rate * VERIFY_SECONDS)))
+                tolerance = TIME_TOLERANCE_SAMPLES / stream.sampling_rate * 1.01 if "timestamps" not in group else 0.0
+                for start in sorted({0, (n - block) // 2, n - block}):
+                    if not np.array_equal(data[start : start + block], read_rows(stream, start, start + block)[:, channels[0] : channels[-1] + 1]):
+                        raise RoundTripError(f"{path}: samples {start} to {start + block} differ from {stream.bin_path.name}")
+                    expected = clock(stream.clip_start + np.arange(start, start + block))
+                    if np.max(np.abs(_stored_times(group, start, start + block) - expected)) > tolerance:
+                        raise RoundTripError(f"{path}: the times of samples {start} to {start + block} aren't the clock's")
+                    checked["samples"] += int(block * channels.size)
+                checked["series"] += 1
+        if sync_edges and recording.sync is not None:
+            stream = recording.sync
+            if "processing/ecephys/spikeglx_sync_edges" not in f:
+                raise RoundTripError("spikeglx_sync_edges: not in the file")
+            table = f["processing/ecephys/spikeglx_sync_edges"]
+            names = np.array([v.decode() if isinstance(v, bytes) else str(v) for v in table["stream"][:]])
+            labels = np.array([v.decode() if isinstance(v, bytes) else str(v) for v in table["channel"][:]])
+            samples, bits, levels, times = table["sample"][:], table["bit"][:], table["level"][:], table["time"][:]
+            if not np.array_equal(times, sync_stream_clock(sync, stream)(samples)):
+                raise RoundTripError("spikeglx_sync_edges: a row's time isn't the clock's time of its sample")
+            n = stream.n_samples if max_seconds is None else min(stream.n_samples, int(round(max_seconds * stream.sampling_rate)))
+            for label, channel in sync_channels(stream).items():
+                mine = (names == stream.bin_path.name) & (labels == label)
+                block = min(n, VERIFY_EDGE_SAMPLES)
+                for start in sorted({0, n - block}):
+                    word = read_rows(stream, start, start + block)[:, channel].copy().view(np.uint16)
+                    rebuilt = _word_from_edges(samples[mine], bits[mine], levels[mine], stream.clip_start + start, block)
+                    if not np.array_equal(rebuilt, word):
+                        raise RoundTripError(f"spikeglx_sync_edges: {label} of {stream.bin_path.name} rebuilt from its edges differs from the file near sample {start}")
+                checked["edges"] += int(mine.sum())
+    return checked

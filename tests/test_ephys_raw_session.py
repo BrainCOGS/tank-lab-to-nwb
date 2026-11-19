@@ -144,3 +144,59 @@ def test_convert_writes_raw_ap_on_the_units_clock_and_rows(session, monkeypatch,
         assert set(edges["channel"]) == {"XD0"}
     report = json.loads(path.with_suffix(".report.json").read_text())
     assert report["raw"]["imec0 lf"].startswith("No LF file")
+
+
+def test_raw_folder_option_does_not_replace_the_recording_folder():
+    """--raw-folder names where the raw bands come from; the clock is still built from the recording folder."""
+    import tank_lab_to_nwb.ephys.convert_session as cs
+    from pathlib import Path
+
+    arguments = cs.session_parser().parse_args(["log.mat", "recording", "out", "imec0=sorted", "--raw-folder", "clips"])
+    assert arguments.raw_folder == Path("recording")
+    assert arguments.raw_from == Path("clips")
+    arguments = cs.session_parser().parse_args(["log.mat", "recording", "out", "imec0=sorted"])
+    assert arguments.raw_folder == Path("recording") and arguments.raw_from is None
+
+
+def _converted_with_raw(session, monkeypatch):
+    import tank_lab_to_nwb.ephys.convert_session as cs
+    from tank_lab_to_nwb.ephys.session import build_session_sync
+
+    real = cs.build_session_sync
+    monkeypatch.setattr(cs, "build_session_sync", lambda raw, log, **kw: real(raw, session["log"], file="log.mat", **kw))
+    path = cs.convert(session["tmp"] / "log.mat", session["raw"], session["tmp"] / "out", {"imec0": session["sorter"].parent}, raw_bands=("ap",))
+    return path, build_session_sync(session["raw"], session["log"], file="log.mat")
+
+
+def test_convert_reads_the_raw_series_back(session, monkeypatch):  # noqa: F811
+    path, _ = _converted_with_raw(session, monkeypatch)
+    checked = json.loads(path.with_suffix(".report.json").read_text())["verified"]["raw"]
+    assert checked["series"] == 1 and checked["samples"] > 0 and checked["edges"] > 0
+
+
+@pytest.mark.parametrize("damage", ["sample", "time", "edge", "electrode"])
+def test_raw_read_back_catches_a_file_that_differs_from_its_sources(session, monkeypatch, damage):  # noqa: F811
+    import h5py
+
+    from tank_lab_to_nwb.ephys.raw import verify_raw_ephys
+    from tank_lab_to_nwb.virmen.verify import RoundTripError
+
+    path, sync = _converted_with_raw(session, monkeypatch)
+    with h5py.File(path, "r") as f:
+        rows = {"imec0": f["acquisition/ElectricalSeriesAPImec0/electrodes"][:]}
+    verify_raw_ephys(path, sync, rows, bands=("ap",))
+    with h5py.File(path, "r+") as f:
+        series = f["acquisition/ElectricalSeriesAPImec0"]
+        if damage == "sample":
+            series["data"][-1, 0] = series["data"][-1, 0] + 1
+        elif damage == "time":
+            if "timestamps" in series:
+                series["timestamps"][0] = series["timestamps"][0] + 1e-3
+            else:
+                series["starting_time"][()] = series["starting_time"][()] + 1e-3
+        elif damage == "edge":
+            f["processing/ecephys/spikeglx_sync_edges/sample"][5] += 1
+        else:
+            series["electrodes"][0], series["electrodes"][1] = series["electrodes"][1], series["electrodes"][0]
+    with pytest.raises(RoundTripError):
+        verify_raw_ephys(path, sync, rows, bands=("ap",))
