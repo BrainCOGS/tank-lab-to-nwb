@@ -12,7 +12,7 @@ from pynwb.misc import Units
 
 from ..virmen.convert import KEYWORDS, PLACEHOLDER_METADATA, build_nwbfile
 from . import pipeline_sync as ps
-from .probe import add_probe_electrodes, check_channel_positions
+from .probe import add_probe_electrodes, raw_channels
 from .sorting import read_sorting
 
 # Allen's term for the whole brain, the most these files can honestly claim; the pipeline's probe locations aren't used yet.
@@ -38,6 +38,7 @@ class ProbeUnits:
     counts: np.ndarray  # spikes per unit
     position_check: tuple
     electrodes_rate: float  # the AP file's imSampRate: one sample is the units' resolution
+    peak_channel: np.ndarray  # per unit, the saved AP channel of its peak
 
 
 def _compressed(data):
@@ -84,7 +85,9 @@ def prepare_units(nwbfile, sync, sorter_folders):
         sorted_probe = read_sorting(folder)
         how = check_sample_origin(sorted_probe, stream)
         electrodes = add_probe_electrodes(nwbfile, stream.bin_path, location=LOCATION)
-        position_check = check_channel_positions(electrodes, sorted_probe.channel_map, sorted_probe.channel_positions)
+        channels, channel_source, difference, offset = raw_channels(electrodes, sorted_probe.channel_map, sorted_probe.channel_positions)
+        position_check = (difference, offset, channel_source)
+        peak = channels[sorted_probe.peak_channel]
         counts = np.array([train.size for train in sorted_probe.spike_samples], dtype=np.int64)
         times = np.empty(int(counts.sum()), dtype="float64")
         stop = 0
@@ -93,7 +96,7 @@ def prepare_units(nwbfile, sync, sorter_folders):
             stop += train.size
         # The samples aren't needed once mapped; dropping them halves what a four-probe session holds.
         sorted_probe = replace(sorted_probe, spike_samples=[], n_spikes_read=int(counts.sum()))
-        prepared.append((ProbeUnits(name, sorted_probe, electrodes, times, counts, position_check, stream.rate), how))
+        prepared.append((ProbeUnits(name, sorted_probe, electrodes, times, counts, position_check, stream.rate, peak), how))
     return prepared
 
 
@@ -123,9 +126,9 @@ def add_units(nwbfile, prepared):
     resolution = 1 / min(probe.electrodes_rate for probe, _ in prepared) if prepared else -1.0
     counts = np.concatenate([probe.counts for probe, _ in prepared])
     flat = np.concatenate([probe.times for probe, _ in prepared])
-    peak = np.concatenate([probe.sorted.peak_channel for probe, _ in prepared])
-    rows = np.concatenate([probe.electrodes.rows[probe.sorted.peak_channel] for probe, _ in prepared])
-    groups = [nwbfile.electrode_groups[probe.electrodes.group_names[int(channel)]] for probe, _ in prepared for channel in probe.sorted.peak_channel]
+    peak = np.concatenate([probe.peak_channel for probe, _ in prepared])
+    rows = np.concatenate([probe.electrodes.rows[probe.peak_channel] for probe, _ in prepared])
+    groups = [nwbfile.electrode_groups[probe.electrodes.group_names[int(channel)]] for probe, _ in prepared for channel in probe.peak_channel]
     spike_times = VectorData(name="spike_times", description=TIME_MEANING, data=_compressed(flat))
     electrodes = DynamicTableRegion(name="electrodes", description="The electrode of the unit's peak channel.", data=rows, table=nwbfile.electrodes)
     columns = [
@@ -136,7 +139,7 @@ def add_units(nwbfile, prepared):
         VectorData(name="electrode_group", description="Electrode group (probe shank) of the peak channel.", data=groups),
         VectorData(name="probe", description="The probe this unit was sorted from: imec<N>, as in the SpikeGLX file names.", data=np.concatenate([np.full(probe.counts.size, probe.name, dtype=object) for probe, _ in prepared])),
         VectorData(name="cluster_id", description="The cluster's id in the sorter's spike_clusters.npy, unique within its probe.", data=np.concatenate([probe.sorted.unit_ids for probe, _ in prepared])),
-        VectorData(name="peak_channel", description="Saved AP channel (row of the sorter's channel_map.npy) where the unit's most frequent template has its largest peak-to-peak.", data=peak),
+        VectorData(name="peak_channel", description="Saved AP channel of the AP file (0-383) where the unit's most frequent template has its largest peak-to-peak. See sorting_<probe> channel_source for how sorter channels were matched to saved ones.", data=peak),
         *[VectorData(name=name, description=description, data=data) for name, description, data in _units_columns(prepared)],
     ]
     nwbfile.units = Units(
@@ -240,6 +243,7 @@ def _add_ecephys_tables(nwbfile, sync, prepared):
             ("n_spikes", str(int(probe.counts.sum())), "Spikes written."),
             ("channel_position_offset_um", json.dumps([float(v) for v in probe.position_check[1]]), "Constant offset of channel_positions.npy from the meta file's geometry, x and y; the shapes agree within channel_position_max_difference_um."),
             ("channel_position_max_difference_um", repr(probe.position_check[0]), "Largest difference after that offset."),
+            ("channel_source", probe.position_check[2], "How each sorter channel was matched to a saved AP channel."),
         ]
         rows += [(f"file.{name}", text, "A per-cluster table that was read, and its rows.") for name, text in s.files.items()]
         rows += [(f"note.{i}", note, "Something about the tables a reader should know.") for i, note in enumerate(s.notes, start=1)]

@@ -84,19 +84,40 @@ def add_probe_electrodes(nwbfile, ap_bin, location="unknown", interface=None):
     )
 
 
-def check_channel_positions(electrodes, channel_map, channel_positions, tolerance_um=0.5):
-    """Compare the sorter's channel map with the meta file's geometry. Returns (max difference, x and y offsets).
+def raw_channels(electrodes, channel_map, channel_positions, tolerance_um=0.5):
+    """(saved AP channel of each sorter channel, how it was found, max difference, x and y offset).
 
-    Kilosort's channel_map indexes the saved channels of the binary it read. Its positions come from the chanmap the
-    pipeline wrote, which may place the probe differently, by a constant offset per axis; anything else means the
-    sorting doesn't belong to this probe or this imro table.
+    Kilosort 4 writes `channel_map.npy` as saved channel numbers of the file it read. MATLAB Kilosort 2/3 (rezToPhy,
+    rezToPhy2) writes it as 0..N-1, indices into its own whitened `temp_wh.dat`, which holds only the chanmap's connected
+    channels: on S2 the reference channel 127 is left out, so from index 127 on the indices are one channel off.
+    `channel_positions.npy` is right in both. So the channel map is used when its positions match the meta file's
+    geometry up to one constant offset per axis (the lab's chanmaps place the probe 27 um over in x); otherwise, when channel_map.npy is exactly 0..N-1 (MATLAB's), every
+    sorter channel is placed on the one contact its position names, under one offset that places all of them.
     """
+    channel_map = np.asarray(channel_map, dtype=np.int64)
+    positions = np.asarray(channel_positions, dtype="float64")
+    geometry = electrodes.positions
+    if channel_map.size and channel_map.min() >= 0 and channel_map.max() < geometry.shape[0]:
+        offset = np.median(positions - geometry[channel_map], axis=0)
+        difference = np.max(np.abs(positions - geometry[channel_map] - offset)) if channel_map.size else 0.0
+        if difference <= tolerance_um:
+            return channel_map, "channel_map.npy", float(difference), offset
+    if not np.array_equal(channel_map, np.arange(channel_map.size)):
+        raise ProbeError(f"{electrodes.name}: channel_positions.npy differs from the meta file's geometry beyond a constant offset; is this sorting from another probe or imro table?")
+    for candidate in np.unique(np.round(positions[0] - geometry, 3), axis=0):
+        shifted = positions - candidate
+        distance = np.abs(shifted[:, None, :] - geometry[None, :, :]).max(axis=2)
+        nearest = distance.argmin(axis=1)
+        if distance[np.arange(nearest.size), nearest].max() <= tolerance_um and np.unique(nearest).size == nearest.size:
+            difference = float(distance[np.arange(nearest.size), nearest].max())
+            return nearest.astype(np.int64), "channel_positions.npy: channel_map.npy indexes the sorter's own whitened file, not the saved channels", difference, candidate
+    raise ProbeError(f"{electrodes.name}: channel_positions.npy doesn't match the meta file's geometry under any one offset; is this sorting from another probe or imro table?")
+
+
+def check_channel_positions(electrodes, channel_map, channel_positions, tolerance_um=0.5):
+    """(max difference, x and y offsets) of the sorter's positions from the meta geometry; ProbeError if they don't match."""
     channel_map = np.asarray(channel_map, dtype=np.int64)
     if channel_map.size and (channel_map.min() < 0 or channel_map.max() >= electrodes.rows.size):
         raise ProbeError(f"{electrodes.name}: channel_map.npy names channels up to {channel_map.max()}, but the meta file saves {electrodes.rows.size} AP channels")
-    expected = electrodes.positions[channel_map]
-    offset = np.median(np.asarray(channel_positions) - expected, axis=0)
-    difference = np.max(np.abs(np.asarray(channel_positions) - expected - offset)) if channel_map.size else 0.0
-    if difference > tolerance_um:
-        raise ProbeError(f"{electrodes.name}: channel_positions.npy differs from the meta file's geometry by up to {difference:.1f} um beyond a constant offset; is this sorting from another probe or imro table?")
-    return float(difference), offset
+    _, _, difference, offset = raw_channels(electrodes, channel_map, channel_positions, tolerance_um)
+    return difference, offset

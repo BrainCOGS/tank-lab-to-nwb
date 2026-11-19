@@ -75,3 +75,19 @@ def test_probe_sync_edges_through_spikeinterface_equal_the_direct_read(tmp_path)
     direct = sg.sync_edges(stream, windows)
     assert np.array_equal(through_library, direct)
     assert np.array_equal(direct, np.flatnonzero(np.diff((sync >> 6) & 1) == 1) + 1)
+
+
+def test_matlab_kilosort_channel_map_is_placed_by_position(tmp_path):
+    """MATLAB Kilosort numbers channels 0..N-1 within its own whitened file, which leaves out the reference channel."""
+    from tank_lab_to_nwb.ephys.probe import raw_channels
+
+    nwbfile = _nwbfile()
+    electrodes = add_probe_electrodes(nwbfile, imec_files(tmp_path / "run_g0", 0, "np2010.ap.meta"))
+    connected = np.delete(np.arange(384), [127])
+    positions = electrodes.positions[connected] + [27, 0]
+    channels, source, difference, offset = raw_channels(electrodes, np.arange(383), positions)
+    assert np.array_equal(channels, connected) and "whitened" in source
+    assert difference == 0 and np.array_equal(offset, [27, 0])
+    # Kilosort 4 numbers the same channels as saved ones, so its map is used as is.
+    channels, source, _, _ = raw_channels(electrodes, connected, positions)
+    assert np.array_equal(channels, connected) and source == "channel_map.npy"

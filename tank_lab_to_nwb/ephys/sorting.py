@@ -64,7 +64,7 @@ class SortedProbe:
     sample_rate_params: float  # params.py sample_rate, usually the nominal 30000; times use the meta's calibrated rate
     unit_ids: np.ndarray  # cluster ids, as in spike_clusters.npy
     spike_samples: list  # per unit, int64 sample indices
-    peak_channel: np.ndarray  # per unit, the raw channel (row of channel_map) of its main template's largest peak-to-peak
+    peak_channel: np.ndarray  # per unit, the sorter channel (index into channel_map.npy) of its main template's largest peak-to-peak
     channel_map: np.ndarray
     channel_positions: np.ndarray
     columns: list  # of Column, one value per unit
@@ -235,7 +235,7 @@ def _labels(values, name, path):
 
 
 def _peak_channels(folder, unit_ids, spike_clusters, spike_templates, channel_map):
-    """Per cluster, the raw channel of the largest peak-to-peak of its most frequent template."""
+    """Per cluster, the sorter channel (index into channel_map.npy) of the largest peak-to-peak of its most frequent template."""
     templates = np.load(folder / "templates.npy", mmap_mode="r")
     peak_to_peak = np.ptp(np.asarray(templates), axis=1)  # template x sorted channel
     order = np.argsort(spike_clusters, kind="stable")
@@ -245,7 +245,7 @@ def _peak_channels(folder, unit_ids, spike_clusters, spike_templates, channel_ma
     for i, unit in enumerate(unit_ids):
         start, stop = bounds[int(unit)]
         main = np.bincount(spike_templates[order[start:stop]]).argmax()
-        out[i] = channel_map[int(np.argmax(peak_to_peak[main]))]
+        out[i] = int(np.argmax(peak_to_peak[main]))
     return out
 
 

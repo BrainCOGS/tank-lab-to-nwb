@@ -43,7 +43,7 @@ def verify_ephys(sync, prepared, nwbfile_path):
                 stored = times[starts[row + i] : index[row + i]]
                 if stored.shape != expected.shape or not np.array_equal(stored, expected):
                     raise RoundTripError(f"{probe.name} cluster {cluster}: stored spike times differ from the sorter's samples on the clock")
-                channel = int(probe.sorted.peak_channel[i])
+                channel = int(probe.peak_channel[i])
                 if int(electrodes[row + i]) != int(probe.electrodes.rows[channel]):
                     raise RoundTripError(f"{probe.name} cluster {cluster}: electrode row {electrodes[row + i]}, expected {probe.electrodes.rows[channel]}")
                 checked["spikes"] += int(stored.size)
