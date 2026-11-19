@@ -70,10 +70,11 @@ class SortedProbe:
     columns: list  # of Column, one value per unit
     files: dict = field(default_factory=dict)  # name -> what was read from it, for the record
     notes: list = field(default_factory=list)
+    n_spikes_read: int | None = None  # kept when spike_samples is let go after mapping
 
     @property
     def n_spikes(self):
-        return int(sum(train.size for train in self.spike_samples))
+        return self.n_spikes_read if self.n_spikes_read is not None else int(sum(train.size for train in self.spike_samples))
 
 
 def _read_params(folder):
